@@ -1,0 +1,3 @@
+ALTER TABLE notes
+    ADD COLUMN IF NOT EXISTS embedding_failures INT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS embedding_failed_at TIMESTAMPTZ;

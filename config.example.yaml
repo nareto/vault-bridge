@@ -1,0 +1,119 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  log_level: "info"
+
+couchdb:
+  url: "https://example-couchdb.domain"
+  database: "mainvault"
+  username: "${COUCHDB_USER}"
+  password: "${COUCHDB_PASS}"
+  poll_interval_seconds: 5
+  feed_mode: "longpoll" # longpoll | continuous
+  encryption:
+    passphrase: "${LIVESYNC_PASSPHRASE:-}" # LiveSync E2EE passphrase; leave empty to disable decryption
+
+database:
+  url: "postgres://vault_bridge:${PG_PASS}@postgres:5432/vault_bridge" # local non-compose run: use localhost
+  max_connections: 10
+
+api_tokens:
+  # File-backed REST API tokens use the token filename stem as the token name.
+  # For example, .secrets/api/monitoring.token maps to monitoring here.
+  monitoring:
+    context: non_personal
+
+mcp_tokens:
+  # File-backed MCP tokens use the token filename stem as the token name.
+  # For example, .secrets/mcp/cloud-agent.token maps to cloud-agent here.
+  cloud-agent:
+    context: non_personal
+  work-agent:
+    context: work
+
+indexer:
+  debounce_seconds: 5
+  max_changes_per_batch: 128   # cap each ingest pass so API/MCP reads can interleave with sync work
+  max_link_context_chars: 250
+  hub_note_threshold: 20
+  hub_note_fanout: 6
+  hub_note_folders:
+    - "MOC/"
+    - "44MOC/"
+  chunk_staging_timeout_seconds: 60
+
+embedding:
+  mode: "local" # disabled | local | localai
+  localai:
+    url: "${LOCALAI_URL:-}" # required when mode is "localai", e.g. "http://localai-vm:8080/v1/embeddings"
+    model: "nomic-embed-text"
+  dimensions: 768
+  hnsw_m: 16                 # locked baseline from docs/hnsw_benchmark_results_2026-03-01.md
+  hnsw_ef_construction: 64   # locked baseline from docs/hnsw_benchmark_results_2026-03-01.md
+  batch_size: 32
+  poll_interval_seconds: 5
+  timeout_seconds: 30
+  note_chunk_bytes: 800      # byte cap per LocalAI note chunk to stay under backend token limits
+  block_chunk_bytes: 800     # byte target for heading-aware semantic chunks
+  block_chunk_overlap_sentences: 1
+
+contexts:
+  non_personal:
+    read:
+      - deny:
+          path_prefix: "66Journal/"
+      - deny:
+          tags_any: ["personal"]
+      - allow:
+          default: true
+    create:
+      - allow:
+          default: true
+        add_tags: ["ai-created"]
+        set_owner: true
+    edit:
+      - allow:
+          tags_any: ["ai-editable"]
+        preserve_tags: ["ai-editable"]
+      - allow:
+          tags_all: ["ai-created"]
+          owner: true
+        preserve_tags: ["ai-created"]
+
+  work:
+    read:
+      - allow:
+          path_prefix: "Work/"
+          tags_any: ["work"]
+    create:
+      - allow:
+          default: true
+        add_tags: ["ai-created", "work"]
+        set_owner: true
+    edit:
+      - allow:
+          tags_all: ["ai-editable", "work"]
+        preserve_tags: ["ai-editable", "work"]
+      - allow:
+          tags_all: ["ai-created", "work"]
+          owner: true
+        preserve_tags: ["ai-created", "work"]
+
+context_assembly:
+  default_max_tokens: 8000
+  max_max_tokens: 32000
+  default_max_depth: 2
+
+new_note:
+  base_path: "00New"
+  # Supported tokens: {base}, {date}, {slug}, {title}.
+  # {title} preserves spaces/case in a filesystem-safe filename segment.
+  # {slug} keeps the older lowercase hyphenated filename style.
+  path_template: "{base}/{date}-{slug}.md"
+  date_format: "%Y-%m-%d"
+  # Maximum generated title or slug segment length.
+  max_title_slug_length: 60
+
+audit:
+  enabled: true
+  retention_days: 90

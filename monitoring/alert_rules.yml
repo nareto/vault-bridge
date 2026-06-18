@@ -1,0 +1,35 @@
+groups:
+  - name: vault_bridge.rules
+    rules:
+      - alert: VaultBridgeSyncLagHigh
+        expr: vault_bridge_sync_behind_by > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Vault Bridge sync lag is high
+          description: >-
+            vault_bridge_sync_behind_by has exceeded 100 for 10 minutes.
+            Check CouchDB connectivity and Sync Worker health.
+
+      - alert: VaultBridgeEmbeddingBacklogStuck
+        expr: vault_bridge_pending_embeddings > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Vault Bridge embedding backlog is not draining
+          description: >-
+            vault_bridge_pending_embeddings has stayed above zero for 30 minutes.
+            Check LocalAI and Worker B throughput.
+
+      - alert: VaultBridgeChunkStagingStuck
+        expr: vault_bridge_pending_chunks > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Vault Bridge has stale chunk staging entries
+          description: >-
+            vault_bridge_pending_chunks has stayed above zero for 5 minutes.
+            Check Livesync chunk delivery and staging timeout behavior.

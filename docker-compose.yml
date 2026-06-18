@@ -1,0 +1,63 @@
+services:
+  vault-bridge:
+    build: .
+    command: ["--mode", "api"]
+    container_name: vault-bridge
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      CONFIG_PATH: /etc/vault-bridge/config.yaml
+      API_TOKEN_DIR: /var/run/vault-bridge-api
+      MCP_BEARER_TOKEN_DIR: /var/run/vault-bridge-mcp
+    volumes:
+      - ./config.yaml:/etc/vault-bridge/config.yaml:ro
+      - ./.secrets/api:/var/run/vault-bridge-api:ro
+      - ./.secrets/mcp:/var/run/vault-bridge-mcp:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - vault-bridge
+
+  vault-bridge-workers:
+    build: .
+    command: ["--mode", "workers"]
+    container_name: vault-bridge-workers
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CONFIG_PATH: /etc/vault-bridge/config.yaml
+    volumes:
+      - ./config.yaml:/etc/vault-bridge/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - vault-bridge
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: vault-bridge-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vault_bridge
+      POSTGRES_USER: vault_bridge
+      POSTGRES_PASSWORD: ${PG_PASS}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vault_bridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vault-bridge
+
+volumes:
+  pgdata:
+
+networks:
+  vault-bridge:
+    driver: bridge

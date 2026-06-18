@@ -1,0 +1,588 @@
+{
+  "_probe_metadata": {
+    "generated_at": "2026-02-26T23:14:39.838201Z",
+    "couchdb_url": "https://obsidianlivesync.guslomanich.uk",
+    "all_databases": [
+      "_global_changes",
+      "_replicator",
+      "_users",
+      "mainvault"
+    ],
+    "selected_database": "mainvault",
+    "purpose": "This file documents the CouchDB schema used by Obsidian Livesync. It serves as Appendix C of the Vault Bridge PRD and is the sole reference for implementing the livesync_decoder module. Content fields have been auto-redacted. REVIEW BEFORE SHARING \u2014 check that no personal text leaked into metadata fields."
+  },
+  "1_database_info": {
+    "db_name": "mainvault",
+    "doc_count": 152081,
+    "update_seq": "169047-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCeexAEmGBiD1HwiyMpiTGBhd63OBY...",
+    "disk_size": 503501240
+  },
+  "2_document_id_patterns": {
+    "total_documents": 152081,
+    "sampled": 500,
+    "categories": {
+      "other": {
+        "count": 500,
+        "examples": [
+          "f:00005899153379ef5c4cc6c14000c74cecd89cf8a4d62726b9d7c74ab96d4397",
+          "f:000477ecc2de42b4237c80f543d1f5bb42bd435c0a860d9c43a09a45844bde57",
+          "f:00334b8baa5b0f2f797b74ec996728a70a3b5dc546146d2562f80962bf859867",
+          "f:0036d2ebaf75c5b8f9bf6889d60bdc570e29abb37741fa526634f4d015144222",
+          "f:0049d734136ad3f91406d91bac292d48f9f8a7ca4ed3a83773fa0d2669a2b492"
+        ]
+      }
+    },
+    "note_to_developer": "Examine the categories above to understand how Livesync maps vault paths to CouchDB document IDs. The largest category of non-design docs is likely how notes are stored."
+  },
+  "3_sample_documents": {
+    "other": [
+      {
+        "doc_id": "f:00005899153379ef5c4cc6c14000c74cecd89cf8a4d62726b9d7c74ab96d4397",
+        "field_types": {
+          "children": "list (len=0)",
+          "path": "str (len=301)",
+          "ctime": "int = 0",
+          "mtime": "int = 0",
+          "size": "int = 0",
+          "type": "str (len=5)",
+          "eden": "dict (len=0)",
+          "deleted": "bool = True"
+        },
+        "raw_document": {
+          "_id": "f:00005899153379ef5c4cc6c14000c74cecd89cf8a4d62726b9d7c74ab96d4397",
+          "_rev": "2-1b16dde1f50645d6a58ed391e2bbc737",
+          "children": [],
+          "path": "[REDACTED \u2014 301 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {},
+          "deleted": true,
+          "_revs_info": [
+            {
+              "rev": "2-1b16dde1f50645d6a58ed391e2bbc737",
+              "status": "available"
+            },
+            {
+              "rev": "1-99a0fe7995a5d7c0e825c4b5b5729572",
+              "status": "missing"
+            }
+          ]
+        }
+      },
+      {
+        "doc_id": "f:000477ecc2de42b4237c80f543d1f5bb42bd435c0a860d9c43a09a45844bde57",
+        "field_types": {
+          "children": "list (len=0)",
+          "path": "str (len=697)",
+          "ctime": "int = 0",
+          "mtime": "int = 0",
+          "size": "int = 0",
+          "type": "str (len=5)",
+          "eden": "dict (len=0)",
+          "deleted": "bool = True"
+        },
+        "raw_document": {
+          "_id": "f:000477ecc2de42b4237c80f543d1f5bb42bd435c0a860d9c43a09a45844bde57",
+          "_rev": "2-5c6a8498d14f41329657d06668287326",
+          "children": [],
+          "path": "[REDACTED \u2014 697 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {},
+          "deleted": true,
+          "_revs_info": [
+            {
+              "rev": "2-5c6a8498d14f41329657d06668287326",
+              "status": "available"
+            },
+            {
+              "rev": "1-b04a91a1d3ef8b47de26f22e053250cd",
+              "status": "missing"
+            }
+          ]
+        }
+      },
+      {
+        "doc_id": "f:00334b8baa5b0f2f797b74ec996728a70a3b5dc546146d2562f80962bf859867",
+        "field_types": {
+          "children": "list (len=0)",
+          "path": "str (len=317)",
+          "ctime": "int = 0",
+          "mtime": "int = 0",
+          "size": "int = 0",
+          "type": "str (len=5)",
+          "eden": "dict (len=0)"
+        },
+        "raw_document": {
+          "_id": "f:00334b8baa5b0f2f797b74ec996728a70a3b5dc546146d2562f80962bf859867",
+          "_rev": "1-2b30ee90ddf69d59f3f8aef2443c1fce",
+          "children": [],
+          "path": "[REDACTED \u2014 317 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {},
+          "_revs_info": [
+            {
+              "rev": "1-2b30ee90ddf69d59f3f8aef2443c1fce",
+              "status": "available"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "4_changes_feed": {
+    "last_seq": "169039-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+    "events": [
+      {
+        "seq": "169047-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+yh3gtvc5jok0",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+yh3gtvc5jok0",
+          "_rev": "1-d8faf18202024f8cd892da20a971cfce",
+          "data": "[REDACTED \u2014 6082 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169047-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+mct5rv2r6jd5",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+mct5rv2r6jd5",
+          "_rev": "1-ed3c585cf145ad4e6d7cc3a604251237",
+          "data": "[REDACTED \u2014 9886 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169046-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+giyck9xd4zul",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+giyck9xd4zul",
+          "_rev": "1-f3a443c0600e7280fcafac2d8ff60772",
+          "data": "[REDACTED \u2014 3022 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169045-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+3r4kgvazxmhob",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+3r4kgvazxmhob",
+          "_rev": "1-e81fa5fb95f7e8477d585daf823354e3",
+          "data": "[REDACTED \u2014 19078 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169044-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+3u3ca1kxd590q",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+3u3ca1kxd590q",
+          "_rev": "1-538122417812ff86b41329127a80057d",
+          "data": "[REDACTED \u2014 1710 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169043-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+3oolpno8fwb6e",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+3oolpno8fwb6e",
+          "_rev": "1-a303b9f91872de90e2eefca2a566fabb",
+          "data": "[REDACTED \u2014 16246 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169042-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+3o02fvva3zm3w",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+3o02fvva3zm3w",
+          "_rev": "1-0d22ae7b4f9eac5ebc44561e89adff7a",
+          "data": "[REDACTED \u2014 3014 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169041-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+2s6fuan7i8n8k",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+2s6fuan7i8n8k",
+          "_rev": "1-cfd778d918527813edd7d065393ad67a",
+          "data": "[REDACTED \u2014 3318 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169040-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "h:+1hpiw44dyza4y",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "data",
+          "type",
+          "e_"
+        ],
+        "doc": {
+          "_id": "h:+1hpiw44dyza4y",
+          "_rev": "1-eae477058f8589681788763f46820c0d",
+          "data": "[REDACTED \u2014 1930 chars]",
+          "type": "leaf",
+          "e_": true
+        }
+      },
+      {
+        "seq": "169039-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "id": "f:81ab158489841c560592f86044d8ed8ee3c40083054d953c21dbfa7f063432c3",
+        "deleted": false,
+        "doc_field_names": [
+          "_id",
+          "_rev",
+          "children",
+          "path",
+          "ctime",
+          "mtime",
+          "size",
+          "type",
+          "eden"
+        ],
+        "doc": {
+          "_id": "f:81ab158489841c560592f86044d8ed8ee3c40083054d953c21dbfa7f063432c3",
+          "_rev": "6-eed919e6a7064fbfb6411c00382d246b",
+          "children": [],
+          "path": "[REDACTED \u2014 629 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {}
+        }
+      }
+    ]
+  },
+  "5_size_variance_analysis": {
+    "note_to_developer": "Compare the smallest and largest documents. If Livesync uses chunking, large notes may have a different field structure, or there may be separate chunk documents with IDs that reference the parent. Look for fields like 'children', 'chunks', 'type', 'seq', or numeric suffixes in document IDs.",
+    "smallest_documents": [
+      {
+        "doc_id": "f:0ebc600821469800fe16a2cf82601058b98cbcddbe4b5eb7d4dec1e7909f0673",
+        "serialized_size_bytes": 455,
+        "field_names": [
+          "_id",
+          "_rev",
+          "children",
+          "path",
+          "ctime",
+          "mtime",
+          "size",
+          "type",
+          "eden"
+        ],
+        "document": {
+          "_id": "f:0ebc600821469800fe16a2cf82601058b98cbcddbe4b5eb7d4dec1e7909f0673",
+          "_rev": "4-02897c5e34514718a8a1e2dd88aed8f9",
+          "children": [],
+          "path": "[REDACTED \u2014 237 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "newnote",
+          "eden": {}
+        }
+      },
+      {
+        "doc_id": "f:0a2e2f8157188d6dff9818586b305a52653d775a55e1c20256e47f10c4ab394e",
+        "serialized_size_bytes": 458,
+        "field_names": [
+          "_id",
+          "_rev",
+          "children",
+          "path",
+          "ctime",
+          "mtime",
+          "size",
+          "type",
+          "eden",
+          "deleted"
+        ],
+        "document": {
+          "_id": "f:0a2e2f8157188d6dff9818586b305a52653d775a55e1c20256e47f10c4ab394e",
+          "_rev": "6-cff3f1b7f2f547f2a8aef361d7656a97",
+          "children": [],
+          "path": "[REDACTED \u2014 225 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {},
+          "deleted": true
+        }
+      },
+      {
+        "doc_id": "f:08f5a3fb7d106bb41432c3e947646fac05a599c523c56ac3cd96ae2cb057ac6d",
+        "serialized_size_bytes": 466,
+        "field_names": [
+          "_id",
+          "_rev",
+          "children",
+          "path",
+          "ctime",
+          "mtime",
+          "size",
+          "type",
+          "eden",
+          "deleted"
+        ],
+        "document": {
+          "_id": "f:08f5a3fb7d106bb41432c3e947646fac05a599c523c56ac3cd96ae2cb057ac6d",
+          "_rev": "2-e8819cd009c74bf19ad9ec17dd71602a",
+          "children": [],
+          "path": "[REDACTED \u2014 233 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {},
+          "deleted": true
+        }
+      }
+    ],
+    "largest_documents": [
+      {
+        "doc_id": "f:065c8b30ff3b8e625cca3f8f74297a62f4a9e650dce71973ef2f8ebceaa1d053",
+        "serialized_size_bytes": 1046,
+        "field_names": [
+          "_id",
+          "_rev",
+          "children",
+          "path",
+          "ctime",
+          "mtime",
+          "size",
+          "type",
+          "eden",
+          "deleted"
+        ],
+        "document": {
+          "_id": "f:065c8b30ff3b8e625cca3f8f74297a62f4a9e650dce71973ef2f8ebceaa1d053",
+          "_rev": "2-5b4ef872ef974eef9ba2eb7bfb352fa7",
+          "children": [],
+          "path": "[REDACTED \u2014 813 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {},
+          "deleted": true
+        }
+      },
+      {
+        "doc_id": "f:0c2b83fdd7f866389e35586cf6bc1419042af168f6ba15a63688fb2ebc45c77a",
+        "serialized_size_bytes": 1046,
+        "field_names": [
+          "_id",
+          "_rev",
+          "children",
+          "path",
+          "ctime",
+          "mtime",
+          "size",
+          "type",
+          "eden",
+          "deleted"
+        ],
+        "document": {
+          "_id": "f:0c2b83fdd7f866389e35586cf6bc1419042af168f6ba15a63688fb2ebc45c77a",
+          "_rev": "2-a7be40d45d444b67bd85b6b36c705c58",
+          "children": [],
+          "path": "[REDACTED \u2014 813 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {},
+          "deleted": true
+        }
+      },
+      {
+        "doc_id": "f:03f68ac5c601b5dac6d41525192715f1b3e8fa57878d50041ac8b52e2656ad6b",
+        "serialized_size_bytes": 1081,
+        "field_names": [
+          "_id",
+          "_rev",
+          "children",
+          "path",
+          "ctime",
+          "mtime",
+          "size",
+          "type",
+          "eden"
+        ],
+        "document": {
+          "_id": "f:03f68ac5c601b5dac6d41525192715f1b3e8fa57878d50041ac8b52e2656ad6b",
+          "_rev": "9-62a290fcde5d443b837aeb67d7030015",
+          "children": [],
+          "path": "[REDACTED \u2014 865 chars]",
+          "ctime": 0,
+          "mtime": 0,
+          "size": 0,
+          "type": "plain",
+          "eden": {}
+        }
+      }
+    ]
+  },
+  "6_deletion_markers": {
+    "found": 1,
+    "samples": [
+      {
+        "id": "f:0a2e2f8157188d6dff9818586b305a52653d775a55e1c20256e47f10c4ab394e",
+        "seq": "169038-g1AAAACReJzLYWBgYMpgTmHgzcvPy09JdcjLz8gvLskBCScyJNX__...",
+        "deleted": true,
+        "doc": {
+          "_id": "f:0a2e2f8157188d6dff9818586b305a52653d775a55e1c20256e47f10c4ab394e",
+          "_rev": "6-cff3f1b7f2f547f2a8aef361d7656a97",
+          "_deleted": true
+        },
+        "annotation": "Concrete tombstone-shaped _changes sample: decoder must treat either top-level `deleted=true` or document-level `_deleted=true`/`deleted=true` as a delete operation."
+      }
+    ],
+    "note_to_developer": "Deletion events can be emitted either as top-level `_changes.deleted=true` or as document tombstones (`_deleted=true` / `deleted=true`). Keep decoder logic permissive across all three representations."
+  },
+  "7_decoder_field_contract": {
+    "purpose": "Field-level contract for implementing `livesync_decoder` without direct CouchDB access.",
+    "file_document": {
+      "required_for_decode": [
+        "_id",
+        "_rev",
+        "children",
+        "path",
+        "type"
+      ],
+      "optional_used_when_present": [
+        "deleted",
+        "ctime",
+        "mtime",
+        "size"
+      ],
+      "ignored_by_decoder": [
+        "eden",
+        "_revs_info"
+      ],
+      "notes": "Only markdown note file types are indexed (`plain`, `newnote`, `markdown`). Path is normalized and used as the canonical note ID."
+    },
+    "leaf_document": {
+      "required_for_decode": [
+        "_id",
+        "_rev",
+        "data",
+        "type"
+      ],
+      "optional_used_when_present": [
+        "e_"
+      ],
+      "ignored_by_decoder": [],
+      "notes": "`data` is an opaque string in probe output. Decoder first attempts JSON decoding for chunk metadata (`parent_id`, `chunk_index`, `chunk_count`, `content`) and falls back to single-chunk raw text mode."
+    },
+    "change_event": {
+      "required_for_decode": [
+        "id",
+        "seq"
+      ],
+      "optional_used_when_present": [
+        "deleted",
+        "doc"
+      ],
+      "ignored_by_decoder": [],
+      "notes": "Unknown document shapes are ignored safely. Sequence values are persisted as canonical strings."
+    },
+    "chunking_observations": {
+      "probe_limitations": "This probe sample did not expose explicit multi-chunk file metadata beyond `children` arrays and opaque `leaf.data` blobs.",
+      "decoder_strategy": [
+        "Use file `children` ordering for alias/path mapping when available.",
+        "Prefer chunk metadata from decoded leaf JSON payload when present.",
+        "Use a staging buffer keyed by parent note and revision; only index when all expected chunks are present.",
+        "Treat non-JSON `leaf.data` as complete single-chunk content."
+      ]
+    }
+  }
+}

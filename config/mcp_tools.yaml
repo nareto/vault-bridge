@@ -1,0 +1,278 @@
+# Source of truth for MCP tool discovery and MCP-visible instructions.
+# Any MCP-exposed descriptions/prompts should live here rather than being hardcoded in Rust.
+
+server:
+  id: vault_bridge_mcp
+  name: vault-bridge-mcp
+  instructions: >
+    Use this server when you need access to the user's Obsidian/Zettelkasten vault of notes.
+
+resources:
+  - id: tooling_catalog
+    uri: vault-bridge://catalog/tooling.json
+    name: Vault Bridge MCP Catalog
+    description: "Machine-readable catalog of the server instructions, tools, resources, and read/write boundaries. Read this first when you need to understand the MCP surface without probing individual tools."
+    mimeType: application/json
+
+  - id: openapi_schema
+    uri: vault-bridge://schemas/openapi.json
+    name: Vault Bridge OpenAPI Schema
+    description: "OpenAPI 3.1 schema for the underlying Vault Bridge REST API that backs these MCP tools. Use this when you need endpoint shapes, payload fields, and response schemas."
+    mimeType: application/json
+
+resourceTemplates:
+  - id: note_by_id
+    uriTemplate: vault-bridge://notes/{id}
+    name: Vault Note By ID
+    description: "Read a note by exact canonical vault-relative ID when you already know the path, for example `vault-bridge://notes/03Concepts/rust-phantom-types.md`. Returns the same sanitized note payload shape as `get_note(id=...)`."
+    mimeType: application/json
+
+
+tools:
+  - id: get_note
+    name: get_note
+    description: "Read one note by exact vault-relative `id` (preferred) or case-insensitive exact filename-derived `title`; if both are present, `id` wins. Example: `{ \"id\": \"03Concepts/rust-phantom-types.md\" }`, or `{ \"title\": \"rust-phantom-types\", \"raw\": true }` when you need unsanitized embedded image data. A 404 means the note is missing or not visible to this token; duplicate title matches resolve to the most recently updated visible note, so use IDs from search/list responses when possible. `heading_title` is display-only and not a lookup key."
+    inputSchema:
+      type: object
+      properties:
+        id:
+          type: string
+          description: "Exact note ID (vault-relative path, e.g. '03Concepts/rust-phantom-types.md')"
+        title:
+          type: string
+          description: "Case-insensitive exact note title derived from the filename stem"
+        raw:
+          type: boolean
+          default: false
+          description: "Return unsanitized content (skip embedded image data URI stripping)"
+
+  - id: recent_notes
+    name: recent_notes
+    description: "List visible notes ordered by stored update time. Example: `{ \"last_n_days\": 7, \"limit\": 20 }`; use `since` for an absolute RFC3339 cutoff, and `last_n_days` takes precedence if both are supplied. You can omit both for newest visible notes across history; limit defaults to 20 and caps at 500, so check `total` for more available results. Use returned `id` values with `get_note`."
+    inputSchema:
+      type: object
+      properties:
+        since:
+          type: string
+          format: date-time
+          description: "ISO 8601 timestamp — return notes whose stored updated_at is after this time"
+        last_n_days:
+          type: integer
+          minimum: 1
+          description: "Alternative to 'since' — compare against the same stored updated_at value over the last N days"
+        limit:
+          type: integer
+          default: 20
+          minimum: 0
+          maximum: 500
+          description: Return at most this many notes; maximum 500.
+
+  - id: query_notes
+    name: query_notes
+    description: "Filter and rank visible notes. Example: `{ \"tags_all\": [\"project\"], \"sort_by\": \"updated_at\", \"sort_order\": \"desc\" }` lists notes carrying the exact case-sensitive tag; add `text_query` and `search_mode: \"hybrid\"` for ranked search. Use `semantic`, `fulltext`, or `hybrid`, and combine tag/time/frontmatter/path/title filters. Empty `notes` means no visible matches after filters; limit defaults to 20 and caps at 500. Use result `id` with `get_note`, not `heading_title`."
+    inputSchema:
+      type: object
+      properties:
+        tags_all:
+          type: array
+          items:
+            type: string
+          description: Require every listed tag to be present
+        tags_any:
+          type: array
+          items:
+            type: string
+          description: Require at least one listed tag to be present
+        tags_none:
+          type: array
+          items:
+            type: string
+          description: Exclude notes containing any listed tag
+        created_after:
+          type: string
+          format: date-time
+          description: Keep notes created on or after this RFC3339 timestamp
+        created_before:
+          type: string
+          format: date-time
+          description: Keep notes created on or before this RFC3339 timestamp
+        updated_after:
+          type: string
+          format: date-time
+          description: Keep notes updated on or after this RFC3339 timestamp
+        updated_before:
+          type: string
+          format: date-time
+          description: Keep notes updated on or before this RFC3339 timestamp
+        has_frontmatter:
+          type: array
+          items:
+            type: string
+          description: Require all listed frontmatter keys to exist
+        missing_frontmatter:
+          type: array
+          items:
+            type: string
+          description: Require all listed frontmatter keys to be absent
+        path_prefix:
+          type: string
+          description: Restrict matches to note paths under this prefix
+        title_exact:
+          type: string
+          description: Require an exact note title match using the filename stem
+        text_query:
+          type: string
+          description: Optional text query for ranked search across the filtered candidates
+        search_mode:
+          type: string
+          enum: [semantic, fulltext, hybrid]
+          default: hybrid
+        sort_by:
+          type: string
+          enum: [relevance, updated_at, created_at, title]
+          description: Sort field; defaults to relevance when text_query is set, otherwise updated_at
+        sort_order:
+          type: string
+          enum: [asc, desc]
+          description: Sort direction; defaults depend on sort_by
+        limit:
+          type: integer
+          default: 20
+          minimum: 0
+          maximum: 500
+          description: Return at most this many notes; maximum 500.
+
+  - id: get_neighbors
+    name: get_neighbors
+    description: "Explore the visible graph around a note by BFS. Example: `{ \"id\": \"03Concepts/rust-phantom-types.md\", \"depth\": 2, \"direction\": \"both\" }`; depth accepts 1-5 with max depth 5, and direction can be `outgoing`, `incoming`, or `both`. A 404 means the center note is missing or not visible; filtered/private neighbors are omitted."
+    inputSchema:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Center note ID
+        depth:
+          type: integer
+          default: 1
+          minimum: 1
+          maximum: 5
+        direction:
+          type: string
+          enum: [outgoing, incoming, both]
+          default: both
+          description: Which link directions to traverse from the center note
+      required: [id]
+
+  - id: list_tags
+    name: list_tags
+    description: "List visible tag counts, optionally constrained by created/updated RFC3339 filters. Example: `{ \"updated_after\": \"2026-01-01T00:00:00Z\" }`; tags on non-visible notes are not counted, and an empty `tags` array means no visible notes matched the time filters."
+    inputSchema:
+      type: object
+      properties:
+        created_after:
+          type: string
+          format: date-time
+          description: Only count tags from notes created on or after this RFC3339 timestamp
+        created_before:
+          type: string
+          format: date-time
+          description: Only count tags from notes created on or before this RFC3339 timestamp
+        updated_after:
+          type: string
+          format: date-time
+          description: Only count tags from notes updated on or after this RFC3339 timestamp
+        updated_before:
+          type: string
+          format: date-time
+          description: Only count tags from notes updated on or before this RFC3339 timestamp
+
+  - id: new_note
+    name: new_note
+    description: "Create a note in the configured inbox path. Pass a normal human-readable `title`; the server generates a safe vault-relative path from its configured template and returns that path as `id`. Example: `{ \"title\": \"Sync notes\", \"content\": \"Body\", \"tags\": [\"project\"], \"metadata\": {\"source\": \"agent\"} }`; empty title, duplicate generated path, path policy failure, or denied create policy return errors. The server adds frontmatter, a created timestamp, and an H1 when needed."
+    inputSchema:
+      type: object
+      properties:
+        title:
+          type: string
+          description: "Human-readable note title. Do not slugify it; the server sanitizes the generated filename."
+        content:
+          type: string
+          description: Optional markdown content of the note
+        tags:
+          type: array
+          items:
+            type: string
+          description: Tags to apply
+        metadata:
+          type: object
+          description: Additional frontmatter metadata
+      required: [title]
+
+  - id: edit_note
+    name: edit_note
+    description: "Edit a visible note if policy allows it. Example: `{ \"id\": \"11New/sync-notes.md\", \"content_patch\": [{\"op\": \"replace\", \"old\": \"old text\", \"new\": \"new text\"}] }`; `content` and `content_patch` are mutually exclusive, patch anchors/old text must match exactly once after prior operations, and policy-denied edits return 403. Tags replace the tag set except preserved policy tags."
+    inputSchema:
+      type: object
+      properties:
+        id:
+          type: string
+          description: "Vault-relative note ID"
+        content:
+          type: string
+          description: "New markdown content (replaces existing body). Mutually exclusive with content_patch."
+        content_patch:
+          type: array
+          description: "Ordered body patch operations. Each exact-match operation must match exactly once after previous operations are applied; unmatched or ambiguous operations reject the whole edit."
+          items:
+            oneOf:
+              - type: object
+                required: [op, old, new]
+                properties:
+                  op:
+                    type: string
+                    const: replace
+                  old:
+                    type: string
+                    description: "Existing body text to replace; must occur exactly once."
+                  new:
+                    type: string
+                    description: Replacement text.
+              - type: object
+                required: [op, old]
+                properties:
+                  op:
+                    type: string
+                    const: delete
+                  old:
+                    type: string
+                    description: "Existing body text to delete; must occur exactly once."
+              - type: object
+                required: [op, anchor, text]
+                properties:
+                  op:
+                    type: string
+                    enum: [insert_before, insert_after]
+                  anchor:
+                    type: string
+                    description: "Existing body text used as the insertion anchor; must occur exactly once."
+                  text:
+                    type: string
+                    description: Text to insert.
+              - type: object
+                required: [op, text]
+                properties:
+                  op:
+                    type: string
+                    enum: [append, prepend]
+                  text:
+                    type: string
+                    description: Text to add at the end or beginning of the body.
+        tags:
+          type: array
+          items:
+            type: string
+          description: "New tag set (replaces existing tags; tags listed in the matched edit policy's preserve_tags are preserved)"
+        metadata:
+          type: object
+          description: "Frontmatter metadata keys to add or update"
+      required: [id]

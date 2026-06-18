@@ -1,0 +1,19 @@
+chief.db
+chief.example.yaml
+todos.example.yaml
+.env
+.env.*
+!.env.example
+.secrets/
+__pycache__/
+*.pyc
+
+
+# Added by cargo
+
+/target
+.chief/chief.db
+.chief/chief.example.yaml
+.chief/todos.example.yaml
+
+.serena

@@ -1,0 +1,5 @@
+candidate,write_rows,write_seconds,write_rows_per_second,rebuild_seconds,semantic_queries,semantic_total_seconds,semantic_avg_ms
+m16_ef64,8000,41.454938,192.98,7.248198,80,4.436257,55.453
+m16_ef96,8000,47.875190,167.10,9.289207,80,4.476946,55.962
+m24_ef96,8000,99.617833,80.31,14.696960,80,4.450513,55.631
+m32_ef128,8000,178.604836,44.79,23.201663,80,4.463292,55.791
