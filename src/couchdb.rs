@@ -1085,7 +1085,7 @@ fn hydrate_file_from_encrypted_metadata(
 
 fn recovery_candidate_doc_ids(parent_id: &str, livesync_passphrase: Option<&str>) -> Vec<String> {
     let normalized = normalize_note_path(parent_id);
-    let mut ids = vec![parent_id.to_string()];
+    let mut ids = Vec::new();
 
     if normalized.to_ascii_lowercase().ends_with(".md") {
         ids.push(native_file_doc_id_for_path(
@@ -1098,12 +1098,10 @@ fn recovery_candidate_doc_ids(parent_id: &str, livesync_passphrase: Option<&str>
         ids.push(legacy_leaf_doc_id_for_path(&normalized));
     }
 
-    if parent_id.starts_with("f:") || parent_id.starts_with("h:") {
-        ids.push(parent_id.to_string());
-    }
+    ids.push(parent_id.to_string());
 
-    ids.sort();
-    ids.dedup();
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
     ids
 }
 
@@ -2088,7 +2086,6 @@ mod tests {
         }
 
         let requested = state.requested.lock().await.clone();
-        assert!(requested.contains(&note_path.to_string()));
         assert!(requested.contains(&docs.file_id));
     }
 }

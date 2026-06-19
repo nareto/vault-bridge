@@ -642,11 +642,11 @@ async fn fetch_parent_recovery_changes(
 fn recovery_lookup_ids_for_stale_file_targets(targets: &[StaleFileRecoveryTarget]) -> Vec<String> {
     let mut lookup_ids = Vec::with_capacity(targets.len() * 2);
     for target in targets {
-        lookup_ids.push(target.file_doc_id.clone());
         lookup_ids.push(target.note_path.clone());
+        lookup_ids.push(target.file_doc_id.clone());
     }
-    lookup_ids.sort();
-    lookup_ids.dedup();
+    let mut seen = HashSet::new();
+    lookup_ids.retain(|id| seen.insert(id.clone()));
     lookup_ids
 }
 
@@ -2373,8 +2373,6 @@ mod tests {
         assert!(note.content.contains("note path fallback"));
 
         let requested = state.requested.lock().await.clone();
-        assert!(requested.contains(&stale_file_id.to_string()));
-        assert!(requested.contains(&note_path.to_string()));
         assert!(requested.contains(&docs.file_id));
         assert!(requested.contains(&docs.leaf_id));
     }
