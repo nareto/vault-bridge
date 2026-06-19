@@ -1,20 +1,91 @@
 # Vault Bridge
 
-Vault Bridge turns an Obsidian LiveSync vault into a self-hosted knowledge
-backend for AI agents, automations, dashboards, and local tools. It watches the
-LiveSync CouchDB, indexes notes into Postgres, builds search and graph metadata,
-and exposes the result through both a documented REST API and an embedded MCP
-endpoint.
+Vault Bridge turns an Obsidian LiveSync vault into a permissioned shared memory
+layer for agents.
 
-The goal is practical: give AI clients useful access to your notes without
-handing every client the raw vault, raw CouchDB credentials, or a one-size-fits-all
-view of private and public material.
+It lets Claude, Codex, n8n, scripts, and local tools read the right slice of
+your notes, search and follow links when useful, and write reviewable output
+back into Obsidian. The agent does not own the vault. Obsidian stays the editor,
+LiveSync stays the sync layer, and Vault Bridge provides controlled recall plus
+a guarded write path.
 
-## Status and Limitations
+**Scoped memory in. Reviewable note out.**
+
+## Why This Exists
+
+AI chat works well when the relevant context fits in the conversation. It works
+much worse when the context lives across notes, old decisions, project logs,
+constraints, drafts, and half-finished ideas.
+
+The useful part is not that an agent suddenly becomes brilliant. The useful part
+is that the cost of giving it the right context drops.
+
+Vault Bridge is built around that smaller move: keep the existing knowledge
+workflow, expose enough of it for agents to help with bounded jobs, and put the
+result back where review already happens.
+
+## The Loop
+
+A typical Vault Bridge workflow looks like this:
+
+1. Find the relevant notes with recency, tag, path, frontmatter, text, semantic,
+   or hybrid queries.
+2. Read and expand context through exact notes, links, backlinks, tags, or graph
+   neighbors.
+3. Ask the agent to produce a bounded draft, answer, plan, or recommendation.
+4. Write the result back as a normal Obsidian note that can be edited, linked,
+   split, deleted, or promoted.
+
+That loop is the point of the project. It is less interesting as "RAG for
+Obsidian" than as a permissioned interface between existing knowledge and
+agents.
+
+## What This Enables
+
+Example workflows:
+
+- **Daily Scout**: inspect recently changed notes, infer what you are working
+  on, search for relevant tools, papers, podcasts, or events, then create a new
+  note with the results.
+- **Thinking prompts**: start from a current note or recent work, follow related
+  material, and suggest what to examine next.
+- **Workout planning**: read exercise pools, previous sessions, equipment
+  constraints, and feedback, then draft a structured workout note.
+- **Note gardening**: find stale clusters, repeated themes, blindspots, and
+  candidate maps of content.
+
+The same pattern applies outside personal notes: take a messy workflow, expose
+the right context through a narrow interface, give agents bounded access, and
+put the output back where people already review work.
+
+## What It Is
+
+Vault Bridge is a Rust service that sits beside Obsidian LiveSync. Obsidian
+remains the editor. LiveSync stores note edits in CouchDB. Vault Bridge reads
+from that CouchDB source, indexes note content and metadata in Postgres,
+optionally stores embeddings with pgvector, and exposes the result through two
+surfaces:
+
+- **REST API** under `/api/v1` for scripts, apps, dashboards, monitoring, and
+  deterministic workflows.
+- **MCP endpoint** under `/mcp` and `/sse` for agents such as Claude, Codex,
+  n8n, and other MCP-capable clients.
+
+The MCP tools are deliberately small:
+
+- **Read**: `get_note`, `recent_notes`
+- **Retrieve**: `query_notes`, `get_neighbors`, `list_tags`
+- **Write**: `new_note`, `edit_note`
+
+Small tools are easier for agents to choose correctly and easier for humans to
+inspect. Non-agent software can use REST directly instead of pretending to be an
+MCP client.
+
+## Status and Scope
 
 Vault Bridge is alpha software and a productized personal project. It is useful
-for self-hosted agent workflows today, but it is not a general-purpose Obsidian
-backend or a generic note-sync abstraction.
+for self-hosted agent workflows today, but it is not a polished consumer app, a
+general-purpose Obsidian backend, or a generic note-sync abstraction.
 
 The supported shape is intentionally narrow:
 
@@ -33,27 +104,9 @@ against vaults you can back up and recover, keep tokens scoped to least-privileg
 contexts, and review access rules before exposing MCP or REST endpoints to any
 client you do not fully control.
 
-## What You Get
+## Architecture
 
-- **Obsidian-native ingestion** from the existing LiveSync CouchDB database,
-  including optional LiveSync E2EE decryption when a passphrase is configured.
-- **Fast retrieval over a real index** with metadata filters, full-text search,
-  semantic search, hybrid ranking, link graph traversal, backlinks, tags, and
-  REST context assembly.
-- **Config-defined access contexts** so cloud AI clients can see only the notes
-  you allow while trusted local agents can receive broader access.
-- **REST and MCP surfaces**: REST is the stable backend contract for apps,
-  scripts, monitoring, and generated clients; MCP is the agent-facing adapter for
-  Claude, Codex, n8n, and other MCP-capable clients.
-- **Write-through note creation and editing** with server-side path validation,
-  CouchDB synchronization, and extra MCP guardrails for agent-created or
-  explicitly editable notes.
-- **Self-hosted operations** with Docker Compose, Swagger UI, Prometheus metrics,
-  named API credentials, MCP bearer tokens, and separate API/worker modes.
-
-## How It Works
-
-Vault Bridge is intentionally split into a few small responsibilities:
+Vault Bridge is split into a few small responsibilities:
 
 | Layer | Role |
 |---|---|
@@ -63,14 +116,13 @@ Vault Bridge is intentionally split into a few small responsibilities:
 | REST API | Stable backend API under `/api/v1` with `X-Api-Key` context selection |
 | MCP endpoint | Agent-facing `/mcp` and `/sse` transports in the same app process |
 
-This split keeps the expensive and security-sensitive note logic in one backend
-while still giving agent clients a clean MCP interface. Non-agent software can
-use REST directly instead of pretending to be an MCP client.
+This split keeps the expensive and security-sensitive note logic in one backend.
 
-## Core Features
+## Feature Reference
 
 | Feature | Description |
 |---|---|
+| Obsidian-native ingestion | Reads from the existing LiveSync CouchDB database, including optional LiveSync E2EE decryption |
 | Context policy visibility | YAML contexts define allow/deny rules for every read and write |
 | Search | Supports full-text, semantic, and hybrid search modes |
 | Structured note queries | Filters by tags, paths, frontmatter, timestamps, exact titles, and text relevance |
@@ -80,38 +132,49 @@ use REST directly instead of pretending to be an MCP client.
 | MCP resources | Exposes a tooling catalog, OpenAPI schema, note resource templates, and primitive note/query/graph tools to agents |
 | Observability | Publishes status and Prometheus metrics for sync lag, embeddings, notes, links, tags, and context counts |
 
-## Contexts
+## Access Contexts
 
 Access is configured with named contexts in `config.yaml`. REST API token names
 and MCP bearer-token names point at a context. Each context has explicit `read`,
 `create`, and `edit` rule lists. Deny rules win, and a request with no matching
 allow rule is denied.
 
-```yaml
-api_tokens:
-  monitoring:
-    context: non_personal
+For example, a cloud-facing agent can read most notes but not journal notes or
+notes tagged `personal`. It can create new AI-tagged notes, but it can only edit
+notes that are explicitly marked editable:
 
+```yaml
 mcp_tokens:
-  claude-work:
-    context: work
+  cloud-agent:
+    context: non_personal
 
 contexts:
   non_personal:
     read:
       - deny:
-          path_prefix: "66Journal/"
+          path_prefix: "00Journal/"
       - deny:
           tags_any: ["personal"]
       - allow:
           default: true
-    create: []
-    edit: []
+    create:
+      - allow:
+          default: true
+        add_tags: ["ai-created"]
+    edit:
+      - allow:
+          tags_any: ["ai-editable"]
 ```
 
 No context names or token names are built in. Missing `api_tokens` or
 `mcp_tokens` sections mean no tokens of that type are configured. Use names that
-match your deployment and point each token at an explicit context.
+match your deployment and point each token at an explicit context. A local agent
+can use a broader context, while a work agent can use a context limited to a
+folder, tag, or owner.
+
+This is not magic privacy. Bad rules still produce bad access. It is still a
+better failure mode than telling an agent, in a prompt, not to read private
+notes.
 
 ## Runtime Surfaces
 
@@ -374,7 +437,7 @@ calling application deliberately uses the REST API.
 
 Cloud AI clients (Claude Desktop, Claude Code, Codex) should use tokens mapped
 to a restricted context.
-See [Contexts](#contexts) above for why.
+See [Access Contexts](#access-contexts) above for why.
 
 In the examples below, `non_personal` means the restricted cloud-agent view of
 your vault. Rename it to whatever fits your config.
