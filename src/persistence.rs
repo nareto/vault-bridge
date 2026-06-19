@@ -1008,6 +1008,22 @@ impl PostgresPersistence {
         Ok(orphan_leaf_parents.max(0) as usize)
     }
 
+    pub async fn stale_file_alias_count(&self) -> Result<usize, PersistenceError> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS stale_file_aliases
+            FROM file_aliases fa
+            LEFT JOIN notes n ON n.id = fa.note_path
+            WHERE n.id IS NULL
+               OR n.couchdb_rev <> fa.couchdb_rev
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let stale_file_aliases: i64 = row.try_get("stale_file_aliases")?;
+        Ok(stale_file_aliases.max(0) as usize)
+    }
+
     pub async fn quarantined_embedding_count(
         &self,
         max_failures: i32,

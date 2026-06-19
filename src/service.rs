@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tracing::info;
 
 use crate::authorization::AuthContext;
 use crate::context::{AssembleContextRequest, AssembleContextResponse};
@@ -11,8 +13,8 @@ use crate::new_note::{NewNoteRequest, UpdateNoteRequest, WriteError};
 use crate::search::{SearchMode, SearchResponse};
 use crate::store::{
     BacklinksResponse, NeighborDirection, NeighborsResponse, NewNoteResponse, NoteTimeFilter,
-    PathResponse, QueryNotesRequest, RecentNotesResponse, StatusResponse, TagsResponse,
-    UpdateNoteResponse, VaultStore,
+    NoteVisibility, PathResponse, QueryNotesRequest, RecentNotesResponse, StatusResponse,
+    TagsResponse, UpdateNoteResponse, VaultStore,
 };
 
 #[derive(Clone, Debug)]
@@ -31,10 +33,13 @@ impl VaultBridgeService {
         auth: &AuthContext,
         note_id: &NoteId,
     ) -> Result<Note, ServiceError> {
-        self.store
-            .get_note_for_policy(auth, note_id)
-            .await
-            .ok_or(ServiceError::NotFound)
+        if let Some(note) = self.store.get_note_for_policy(auth, note_id).await {
+            return Ok(note);
+        }
+
+        let visibility = self.store.note_visibility_for_policy(auth, note_id).await;
+        log_note_lookup_miss(auth, "id", note_id.as_str(), visibility);
+        Err(ServiceError::NotFound)
     }
 
     pub async fn get_note_by_title(
@@ -42,10 +47,13 @@ impl VaultBridgeService {
         auth: &AuthContext,
         title: &str,
     ) -> Result<Note, ServiceError> {
-        self.store
-            .get_note_by_title_for_policy(auth, title)
-            .await
-            .ok_or(ServiceError::NotFound)
+        if let Some(note) = self.store.get_note_by_title_for_policy(auth, title).await {
+            return Ok(note);
+        }
+
+        let visibility = self.store.title_visibility_for_policy(auth, title).await;
+        log_note_lookup_miss(auth, "title", title, visibility);
+        Err(ServiceError::NotFound)
     }
 
     pub async fn search(
@@ -186,6 +194,39 @@ impl VaultBridgeService {
     pub async fn status(&self) -> StatusResponse {
         self.store.status().await
     }
+}
+
+fn log_note_lookup_miss(
+    auth: &AuthContext,
+    lookup_kind: &'static str,
+    lookup_value: &str,
+    visibility: NoteVisibility,
+) {
+    info!(
+        context = auth.context.as_str(),
+        principal = auth.principal.as_str(),
+        lookup_kind,
+        lookup_hash = lookup_fingerprint(lookup_kind, lookup_value).as_str(),
+        visibility = note_visibility_label(visibility),
+        "note lookup returned not found"
+    );
+}
+
+fn note_visibility_label(visibility: NoteVisibility) -> &'static str {
+    match visibility {
+        NoteVisibility::Missing => "missing_index_row",
+        NoteVisibility::Accessible => "accessible",
+        NoteVisibility::Filtered => "filtered_by_policy",
+    }
+}
+
+fn lookup_fingerprint(kind: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b":");
+    hasher.update(value.trim().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    digest.chars().take(16).collect()
 }
 
 #[derive(Debug, Error)]

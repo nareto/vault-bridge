@@ -1035,8 +1035,7 @@ contexts:
     #[test]
     fn parses_database_host_for_diagnostics() {
         let cfg = super::DatabaseConfig {
-            url: "postgres://postgres:5432/vault_bridge?sslmode=disable"
-                .to_string(),
+            url: "postgres://postgres:5432/vault_bridge?sslmode=disable".to_string(),
             max_connections: 10,
         };
         assert_eq!(cfg.host_for_diagnostics().as_deref(), Some("postgres"));

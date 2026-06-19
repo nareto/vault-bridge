@@ -684,6 +684,7 @@ Metrics exposed by `GET /api/v1/metrics` include:
 - `vault_bridge_embedding_last_error_timestamp_seconds`
 - `vault_bridge_pending_chunks`
 - `vault_bridge_orphan_leaf_staging`
+- `vault_bridge_stale_file_aliases`
 - `vault_bridge_total_notes`
 - `vault_bridge_total_links`
 - `vault_bridge_total_tags`

@@ -39,6 +39,7 @@ pub fn spawn_sync_worker(
     let context_window = config.indexer.max_link_context_chars;
     let max_changes_per_batch = config.indexer.max_changes_per_batch.max(1);
     let chunk_timeout = Duration::from_secs(config.indexer.chunk_staging_timeout_seconds.max(1));
+    let stale_file_alias_recovery_interval = chunk_timeout.max(Duration::from_secs(60));
     let poll_interval = config.couchdb.poll_interval();
     let debounce_window = Duration::from_secs(config.indexer.debounce_seconds.max(1));
 
@@ -48,6 +49,7 @@ pub fn spawn_sync_worker(
         let mut pending = Vec::new();
         let mut pending_current_seq = String::new();
         let mut last_event_at: Option<Instant> = None;
+        let mut last_stale_file_alias_recovery_at = Instant::now();
 
         let flush_pending = |pending: &mut Vec<crate::livesync::ChangeEvent>,
                              pending_current_seq: &mut String,
@@ -256,6 +258,33 @@ pub fn spawn_sync_worker(
                                 "sync worker: idle chunk staging recovery completed"
                             );
                         }
+
+                        if last_stale_file_alias_recovery_at.elapsed()
+                            >= stale_file_alias_recovery_interval
+                        {
+                            last_stale_file_alias_recovery_at = Instant::now();
+                            let batch = recover_stale_file_aliases_cooperatively(
+                                &store,
+                                &couch,
+                                &current_seq,
+                                context_window,
+                                chunk_timeout,
+                                decryptor.as_deref(),
+                                max_changes_per_batch,
+                            )
+                            .await;
+                            if batch.indexed_notes > 0 || batch.deleted_notes > 0 {
+                                debug!(
+                                    indexed = batch.indexed_notes,
+                                    deleted = batch.deleted_notes,
+                                    pending_chunks = batch.pending_chunks,
+                                    purged_parent_count = batch.purged_parent_ids.len(),
+                                    recovery_parent_count = batch.recovery_parent_ids.len(),
+                                    orphan_leaf_parent_count = batch.orphan_leaf_parent_ids.len(),
+                                    "sync worker: idle stale file alias recovery completed"
+                                );
+                            }
+                        }
                     }
 
                     backoff = Duration::from_secs(1);
@@ -406,6 +435,70 @@ async fn recover_stale_chunk_staging_cooperatively(
     );
 
     let recovered = fetch_parent_recovery_changes(couch, &aggregate.recovery_parent_ids).await;
+    if recovered.is_empty() {
+        return aggregate;
+    }
+
+    let replay = ingest_changes_cooperatively(
+        store,
+        couch,
+        recovered,
+        current_seq,
+        context_window,
+        chunk_timeout,
+        decryptor,
+        max_changes_per_batch,
+    )
+    .await;
+
+    aggregate.indexed_notes += replay.indexed_notes;
+    aggregate.deleted_notes += replay.deleted_notes;
+    aggregate.pending_chunks = replay.pending_chunks;
+    append_unique_ids(&mut aggregate.purged_parent_ids, replay.purged_parent_ids);
+    append_unique_ids(
+        &mut aggregate.recovery_parent_ids,
+        replay.recovery_parent_ids,
+    );
+    append_unique_ids(
+        &mut aggregate.orphan_leaf_parent_ids,
+        replay.orphan_leaf_parent_ids,
+    );
+    if replay.last_seq.is_some() {
+        aggregate.last_seq = replay.last_seq;
+    }
+
+    aggregate
+}
+
+async fn recover_stale_file_aliases_cooperatively(
+    store: &VaultStore,
+    couch: &CouchDbClient,
+    current_seq: &str,
+    context_window: usize,
+    chunk_timeout: Duration,
+    decryptor: Option<&Decryptor>,
+    max_changes_per_batch: usize,
+) -> SyncBatchResult {
+    let stale_file_doc_ids = store.stale_file_doc_ids_for_recovery().await;
+    let mut aggregate = SyncBatchResult {
+        indexed_notes: 0,
+        deleted_notes: 0,
+        pending_chunks: 0,
+        purged_parent_ids: Vec::new(),
+        recovery_parent_ids: stale_file_doc_ids.clone(),
+        orphan_leaf_parent_ids: Vec::new(),
+        last_seq: None,
+    };
+    if stale_file_doc_ids.is_empty() {
+        return aggregate;
+    }
+
+    warn!(
+        stale_file_alias_count = stale_file_doc_ids.len(),
+        "sync worker: idle detected stale file aliases; queuing parent recovery"
+    );
+
+    let recovered = fetch_parent_recovery_changes(couch, &stale_file_doc_ids).await;
     if recovered.is_empty() {
         return aggregate;
     }
@@ -1402,8 +1495,9 @@ mod tests {
         LocalAiEmbeddingClient, aggregate_chunk_embeddings, detect_remote_stale_file_docs,
         embed_note_with_chunks, ingest_changes_cooperatively, normalize_localai_embedding_input,
         parse_localai_embeddings_for_test, queue_parent_recovery,
-        recover_stale_chunk_staging_cooperatively, sample_note_chunks_for_embedding,
-        should_flush_pending, spawn_embedding_worker, split_note_for_localai, take_change_batch,
+        recover_stale_chunk_staging_cooperatively, recover_stale_file_aliases_cooperatively,
+        sample_note_chunks_for_embedding, should_flush_pending, spawn_embedding_worker,
+        split_note_for_localai, take_change_batch,
     };
     use crate::authorization::{AccessPolicy, AuthContext, ContextName};
     use crate::config::{
@@ -2106,6 +2200,79 @@ mod tests {
                 .iter()
                 .any(|requested_id| requested_id == &docs.leaf_id)
         );
+    }
+
+    #[tokio::test]
+    async fn idle_file_alias_recovery_repairs_missing_note_row_without_staged_chunks() {
+        let store = VaultStore::new(20);
+        let note_path = "Public Notes/synthetic-hyphen draft 5.md";
+        let docs = build_livesync_note_documents(
+            note_path,
+            "# Synthetic Hyphen Draft 5\n\nRebuilt from a stale file alias.",
+        );
+        let mut file_doc = docs.file_doc.clone();
+        let mut leaf_doc = docs.leaf_doc.clone();
+        file_doc["_rev"] = serde_json::Value::String("2-file".to_string());
+        leaf_doc["_rev"] = serde_json::Value::String("2-leaf".to_string());
+
+        let stale_alias = store
+            .ingest_changes_batch_at(
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String("49-g1AAA".to_string()),
+                    id: docs.file_id.clone(),
+                    deleted: false,
+                    doc: Some(file_doc.clone()),
+                }],
+                "49-g1AAA",
+                250,
+                Duration::from_secs(60),
+                Utc::now(),
+                None,
+            )
+            .await;
+        assert_eq!(stale_alias.indexed_notes, 0);
+        assert_eq!(stale_alias.pending_chunks, 0);
+        assert_eq!(store.status().await.index.stale_file_aliases, 1);
+        assert_eq!(
+            store.stale_file_doc_ids_for_recovery().await,
+            vec![docs.file_id.clone()]
+        );
+        assert!(
+            get_local_note(&store, note_path).await.is_none(),
+            "file-only ingest should leave the note row missing"
+        );
+
+        let mut server_docs = HashMap::new();
+        server_docs.insert(docs.file_id.clone(), file_doc);
+        server_docs.insert(docs.leaf_id.clone(), leaf_doc);
+        let (url, state) = spawn_mock_couchdb(server_docs);
+        let couch = couchdb_client(url);
+
+        let recovered = recover_stale_file_aliases_cooperatively(
+            &store,
+            &couch,
+            "50-g1AAA",
+            250,
+            Duration::from_secs(60),
+            None,
+            64,
+        )
+        .await;
+
+        assert_eq!(recovered.indexed_notes, 1);
+        assert_eq!(recovered.pending_chunks, 0);
+        assert_eq!(store.status().await.index.stale_file_aliases, 0);
+        assert!(store.stale_file_doc_ids_for_recovery().await.is_empty());
+
+        let note = get_local_note(&store, note_path)
+            .await
+            .expect("idle stale alias recovery should materialize missing note row");
+        assert_eq!(note.id, NoteId::new(note_path));
+        assert!(note.content.contains("Rebuilt from a stale file alias."));
+
+        let requested = state.requested.lock().await.clone();
+        assert!(requested.contains(&docs.file_id));
+        assert!(requested.contains(&docs.leaf_id));
     }
 
     #[tokio::test]

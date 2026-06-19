@@ -977,6 +977,12 @@ fn render_prometheus_metrics(status: &StatusResponse) -> String {
             "vault_bridge_orphan_leaf_staging {}",
             status.index.orphan_leaf_staging_count
         ),
+        "# HELP vault_bridge_stale_file_aliases LiveSync file aliases whose indexed note row is missing or stale.".to_string(),
+        "# TYPE vault_bridge_stale_file_aliases gauge".to_string(),
+        format!(
+            "vault_bridge_stale_file_aliases {}",
+            status.index.stale_file_aliases
+        ),
         "# HELP vault_bridge_total_notes Total indexed notes.".to_string(),
         "# TYPE vault_bridge_total_notes gauge".to_string(),
         format!("vault_bridge_total_notes {}", status.index.total_notes),

@@ -396,6 +396,7 @@ pub struct IndexStats {
     pub quarantined_chunk_embeddings: usize,
     pub pending_chunks: usize,
     pub orphan_leaf_staging_count: usize,
+    pub stale_file_aliases: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1543,6 +1544,36 @@ impl VaultStore {
                     NoteVisibility::Filtered
                 }
             }
+        }
+    }
+
+    pub async fn title_visibility_for_policy(
+        &self,
+        auth: &AuthContext,
+        title: &str,
+    ) -> NoteVisibility {
+        self.prepare_cached_read("note title visibility lookup")
+            .await;
+        let guard = self.inner.read().await;
+        let title = title.trim();
+        let candidates = guard
+            .notes
+            .values()
+            .filter(|note| note.title.eq_ignore_ascii_case(title))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return NoteVisibility::Missing;
+        }
+
+        let config = self.authorization_config().await;
+        let now = Utc::now();
+        if candidates
+            .iter()
+            .any(|note| note_readable_for_policy_from_inner(&guard, &config, auth, &note.id, now))
+        {
+            NoteVisibility::Accessible
+        } else {
+            NoteVisibility::Filtered
         }
     }
 
@@ -2963,6 +2994,17 @@ impl VaultStore {
                     orphan_leaf_staging_count_locked(&guard)
                 }
             };
+            let stale_file_aliases = match persistence.stale_file_alias_count().await {
+                Ok(count) => count,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "failed postgres-backed stale file alias count; using in-memory fallback"
+                    );
+                    let guard = self.inner.read().await;
+                    stale_file_doc_ids_for_recovery_locked(&guard).len()
+                }
+            };
             let max_failures = self.settings.read().await.max_embedding_failures;
             let pending_embeddings = match persistence.pending_embedding_count().await {
                 Ok(count) => count,
@@ -3011,6 +3053,7 @@ impl VaultStore {
                 &guard,
                 pending_chunks,
                 orphan_leaf_staging_count,
+                stale_file_aliases,
                 &sync_state,
             );
             let auth_config = self.authorization_config().await;
@@ -3042,6 +3085,7 @@ impl VaultStore {
             &guard,
             guard.chunk_staging.pending_count(),
             orphan_leaf_staging_count_locked(&guard),
+            stale_file_doc_ids_for_recovery_locked(&guard).len(),
             &sync_state,
         );
         let auth_config = self.authorization_config().await;
@@ -4024,6 +4068,7 @@ fn status_from_inner(
     guard: &StoreInner,
     pending_chunks: usize,
     orphan_leaf_staging_count: usize,
+    stale_file_aliases: usize,
     sync_state: &RuntimeSyncState,
 ) -> StatusResponse {
     let total_notes = guard.notes.len();
@@ -4055,6 +4100,7 @@ fn status_from_inner(
             quarantined_chunk_embeddings: 0,
             pending_chunks,
             orphan_leaf_staging_count,
+            stale_file_aliases,
         },
         embedding: embedding_status_from_inner(
             guard,
@@ -5447,6 +5493,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_id_and_title_lookup_support_space_hyphen_path_shape() {
+        let now = Utc::now();
+        let store = VaultStore::new(20);
+        store.set_authorization_config(external_config()).await;
+        let note_id = NoteId::new("Public Notes/synthetic-hyphen draft 5.md");
+        store
+            .upsert_note(note_input(
+                note_id.as_str(),
+                "synthetic-hyphen draft 5",
+                vec!["shared"],
+                now,
+            ))
+            .await;
+
+        let by_id = store
+            .get_note_for_policy(&external_auth(), &note_id)
+            .await
+            .expect("visible note should resolve by exact id");
+        assert_eq!(by_id.id, note_id);
+
+        let by_title = store
+            .get_note_by_title_for_policy(&external_auth(), "SYNTHETIC-HYPHEN DRAFT 5")
+            .await
+            .expect("visible note should resolve by case-insensitive exact title");
+        assert_eq!(
+            by_title.id,
+            NoteId::new("Public Notes/synthetic-hyphen draft 5.md")
+        );
+    }
+
+    #[tokio::test]
     async fn query_notes_filters_visible_notes_by_exact_tag() {
         let now = Utc::now();
         let store = VaultStore::new(20);
@@ -5524,7 +5601,7 @@ mod tests {
         };
         let inner =
             store_inner_from_persisted_notes(persisted_notes_fixture(now), &settings, &sync_state);
-        let status = status_from_inner(&inner, 7, 0, &sync_state);
+        let status = status_from_inner(&inner, 7, 0, 0, &sync_state);
 
         assert_eq!(status.index.total_notes, 3);
         assert_eq!(status.index.total_links, 4);
@@ -5532,6 +5609,7 @@ mod tests {
         assert_eq!(status.index.pending_embeddings, 3);
         assert_eq!(status.index.pending_chunks, 7);
         assert_eq!(status.index.orphan_leaf_staging_count, 0);
+        assert_eq!(status.index.stale_file_aliases, 0);
         assert_eq!(status.sync.last_seq, "10");
         assert_eq!(status.sync.couchdb_current_seq, "15");
         assert_eq!(status.sync.behind_by, 5);
