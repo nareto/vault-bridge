@@ -8,6 +8,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant, sleep};
@@ -17,7 +18,7 @@ use crate::config::{AppConfig, EmbeddingConfig, EmbeddingMode};
 use crate::couchdb::{CouchDbClient, CouchDbError};
 use crate::encryption::Decryptor;
 use crate::livesync::{ChangeEvent, LivesyncDocument, is_deletion};
-use crate::store::{SyncBatchResult, VaultStore};
+use crate::store::{StaleFileRecoveryTarget, SyncBatchResult, VaultStore};
 
 const LOCALAI_HEALTH_PROBE_INPUT: &str = "vault bridge embedding health probe";
 
@@ -98,23 +99,28 @@ pub fn spawn_sync_worker(
             .await;
         }
 
-        let startup_stale_file_docs = store.stale_file_doc_ids_for_recovery().await;
+        let startup_stale_file_targets = store.stale_file_recovery_targets().await;
+        let startup_stale_file_docs = startup_stale_file_targets
+            .iter()
+            .map(|target| target.file_doc_id.clone())
+            .collect::<Vec<_>>();
         let startup_remote_drift_file_docs = detect_remote_stale_file_docs(&store, &couch).await;
-        let mut startup_recovery_file_docs = startup_stale_file_docs.clone();
-        startup_recovery_file_docs.extend(startup_remote_drift_file_docs.iter().cloned());
-        startup_recovery_file_docs.sort();
-        startup_recovery_file_docs.dedup();
+        let mut startup_recovery_lookup_ids =
+            recovery_lookup_ids_for_stale_file_targets(&startup_stale_file_targets);
+        startup_recovery_lookup_ids.extend(startup_remote_drift_file_docs.iter().cloned());
+        startup_recovery_lookup_ids.sort();
+        startup_recovery_lookup_ids.dedup();
 
-        if !startup_recovery_file_docs.is_empty() {
+        if !startup_recovery_lookup_ids.is_empty() {
             warn!(
                 stale_file_doc_count = startup_stale_file_docs.len(),
                 remote_drift_file_doc_count = startup_remote_drift_file_docs.len(),
-                recovery_file_doc_count = startup_recovery_file_docs.len(),
+                recovery_lookup_count = startup_recovery_lookup_ids.len(),
                 "sync worker: startup detected stale file aliases or remote drift; queuing parent recovery"
             );
             queue_parent_recovery(
                 &couch,
-                &startup_recovery_file_docs,
+                &startup_recovery_lookup_ids,
                 &mut pending,
                 &mut pending_current_seq,
                 &mut last_event_at,
@@ -479,7 +485,11 @@ async fn recover_stale_file_aliases_cooperatively(
     decryptor: Option<&Decryptor>,
     max_changes_per_batch: usize,
 ) -> SyncBatchResult {
-    let stale_file_doc_ids = store.stale_file_doc_ids_for_recovery().await;
+    let stale_file_targets = store.stale_file_recovery_targets().await;
+    let stale_file_doc_ids = stale_file_targets
+        .iter()
+        .map(|target| target.file_doc_id.clone())
+        .collect::<Vec<_>>();
     let mut aggregate = SyncBatchResult {
         indexed_notes: 0,
         deleted_notes: 0,
@@ -493,12 +503,14 @@ async fn recover_stale_file_aliases_cooperatively(
         return aggregate;
     }
 
+    let recovery_lookup_ids = recovery_lookup_ids_for_stale_file_targets(&stale_file_targets);
     warn!(
         stale_file_alias_count = stale_file_doc_ids.len(),
+        recovery_lookup_count = recovery_lookup_ids.len(),
         "sync worker: idle detected stale file aliases; queuing parent recovery"
     );
 
-    let recovered = fetch_parent_recovery_changes(couch, &stale_file_doc_ids).await;
+    let recovered = fetch_parent_recovery_changes(couch, &recovery_lookup_ids).await;
     if recovered.is_empty() {
         return aggregate;
     }
@@ -617,7 +629,7 @@ async fn fetch_parent_recovery_changes(
                 }
             }
             Err(error) => warn!(
-                parent_id = %parent_id,
+                recovery_lookup_hash = recovery_lookup_fingerprint(parent_id).as_str(),
                 error = %error,
                 "sync worker: failed to refetch stale chunk parent from couchdb"
             ),
@@ -625,6 +637,24 @@ async fn fetch_parent_recovery_changes(
     }
 
     recovered
+}
+
+fn recovery_lookup_ids_for_stale_file_targets(targets: &[StaleFileRecoveryTarget]) -> Vec<String> {
+    let mut lookup_ids = Vec::with_capacity(targets.len() * 2);
+    for target in targets {
+        lookup_ids.push(target.file_doc_id.clone());
+        lookup_ids.push(target.note_path.clone());
+    }
+    lookup_ids.sort();
+    lookup_ids.dedup();
+    lookup_ids
+}
+
+fn recovery_lookup_fingerprint(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.trim().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    digest.chars().take(16).collect()
 }
 
 async fn detect_remote_stale_file_docs(store: &VaultStore, couch: &CouchDbClient) -> Vec<String> {
@@ -2271,6 +2301,80 @@ mod tests {
         assert!(note.content.contains("Rebuilt from a stale file alias."));
 
         let requested = state.requested.lock().await.clone();
+        assert!(requested.contains(&docs.file_id));
+        assert!(requested.contains(&docs.leaf_id));
+    }
+
+    #[tokio::test]
+    async fn idle_file_alias_recovery_uses_note_path_when_stored_file_doc_is_missing() {
+        let store = VaultStore::new(20);
+        let note_path = "Public Notes/synthetic-rekeyed draft 5.md";
+        let docs = build_livesync_note_documents(
+            note_path,
+            "# Synthetic Rekeyed Draft 5\n\nRecovered through the note path fallback.",
+        );
+        let stale_file_id = "f:stale-synthetic-rekeyed-draft-5";
+        let mut stale_file_doc = docs.file_doc.clone();
+        stale_file_doc["_id"] = serde_json::Value::String(stale_file_id.to_string());
+        stale_file_doc["_rev"] = serde_json::Value::String("2-stale-file".to_string());
+
+        let stale_alias = store
+            .ingest_changes_batch_at(
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String("49-g1AAA".to_string()),
+                    id: stale_file_id.to_string(),
+                    deleted: false,
+                    doc: Some(stale_file_doc),
+                }],
+                "49-g1AAA",
+                250,
+                Duration::from_secs(60),
+                Utc::now(),
+                None,
+            )
+            .await;
+        assert_eq!(stale_alias.indexed_notes, 0);
+        assert_eq!(store.status().await.index.stale_file_aliases, 1);
+        assert_eq!(
+            store.stale_file_doc_ids_for_recovery().await,
+            vec![stale_file_id.to_string()]
+        );
+
+        let mut file_doc = docs.file_doc.clone();
+        let mut leaf_doc = docs.leaf_doc.clone();
+        file_doc["_rev"] = serde_json::Value::String("3-current-file".to_string());
+        leaf_doc["_rev"] = serde_json::Value::String("3-current-leaf".to_string());
+
+        let mut server_docs = HashMap::new();
+        server_docs.insert(docs.file_id.clone(), file_doc);
+        server_docs.insert(docs.leaf_id.clone(), leaf_doc);
+        let (url, state) = spawn_mock_couchdb(server_docs);
+        let couch = couchdb_client(url);
+
+        let recovered = recover_stale_file_aliases_cooperatively(
+            &store,
+            &couch,
+            "50-g1AAA",
+            250,
+            Duration::from_secs(60),
+            None,
+            64,
+        )
+        .await;
+
+        assert_eq!(recovered.indexed_notes, 1);
+        assert_eq!(store.status().await.index.stale_file_aliases, 0);
+        assert!(store.stale_file_doc_ids_for_recovery().await.is_empty());
+
+        let note = get_local_note(&store, note_path)
+            .await
+            .expect("path fallback should materialize missing note row");
+        assert_eq!(note.id, NoteId::new(note_path));
+        assert!(note.content.contains("note path fallback"));
+
+        let requested = state.requested.lock().await.clone();
+        assert!(requested.contains(&stale_file_id.to_string()));
+        assert!(requested.contains(&note_path.to_string()));
         assert!(requested.contains(&docs.file_id));
         assert!(requested.contains(&docs.leaf_id));
     }

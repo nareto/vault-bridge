@@ -474,6 +474,12 @@ pub enum NoteVisibility {
     Filtered,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleFileRecoveryTarget {
+    pub file_doc_id: String,
+    pub note_path: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct AccessLogEntry {
     pub timestamp: DateTime<Utc>,
@@ -1185,7 +1191,12 @@ impl VaultStore {
                 if let Some(note_path) = file_document_note_id(&file) {
                     let persisted_alias = persisted_file_alias_from_file(&file, &note_path);
                     let child_ids = persisted_alias.children.clone();
-                    register_file_aliases_locked(&mut guard, &file, note_path.clone());
+                    let removed_file_aliases =
+                        register_file_aliases_locked(&mut guard, &file, note_path.clone());
+                    for removed_file_alias in removed_file_aliases {
+                        file_alias_upserts.remove(&removed_file_alias);
+                        file_alias_deletes.insert(removed_file_alias);
+                    }
                     let rehomed_notes = rehome_staged_chunks_locked(
                         &mut guard,
                         &note_path,
@@ -3137,8 +3148,16 @@ impl VaultStore {
     }
 
     pub async fn stale_file_doc_ids_for_recovery(&self) -> Vec<String> {
+        self.stale_file_recovery_targets()
+            .await
+            .into_iter()
+            .map(|target| target.file_doc_id)
+            .collect()
+    }
+
+    pub async fn stale_file_recovery_targets(&self) -> Vec<StaleFileRecoveryTarget> {
         let guard = self.inner.read().await;
-        stale_file_doc_ids_for_recovery_locked(&guard)
+        stale_file_recovery_targets_locked(&guard)
     }
 
     pub async fn tracked_file_doc_revs(&self) -> Vec<(String, String)> {
@@ -4802,7 +4821,13 @@ fn rehome_staged_chunks_locked(
     indexed_notes
 }
 
-fn register_file_aliases_locked(guard: &mut StoreInner, file: &FileDocument, note_path: String) {
+fn register_file_aliases_locked(
+    guard: &mut StoreInner,
+    file: &FileDocument,
+    note_path: String,
+) -> Vec<String> {
+    let removed_file_aliases =
+        unregister_file_aliases_for_note_path_locked(guard, &note_path, Some(&file.id));
     unregister_file_aliases_locked(guard, &file.id);
     guard
         .file_doc_paths
@@ -4820,7 +4845,7 @@ fn register_file_aliases_locked(guard: &mut StoreInner, file: &FileDocument, not
 
     let children = extract_child_doc_ids_ordered(&file.children);
     if children.is_empty() {
-        return;
+        return removed_file_aliases;
     }
 
     let chunk_count = children.len();
@@ -4842,6 +4867,7 @@ fn register_file_aliases_locked(guard: &mut StoreInner, file: &FileDocument, not
         }
     }
     guard.file_children.insert(file.id.clone(), children);
+    removed_file_aliases
 }
 
 fn hydrate_file_from_encrypted_metadata(
@@ -4982,6 +5008,27 @@ fn unregister_file_aliases_locked(guard: &mut StoreInner, file_id: &str) {
     }
 }
 
+fn unregister_file_aliases_for_note_path_locked(
+    guard: &mut StoreInner,
+    note_path: &str,
+    except_file_id: Option<&str>,
+) -> Vec<String> {
+    let file_doc_ids = guard
+        .file_doc_paths
+        .iter()
+        .filter(|(file_doc_id, existing_note_path)| {
+            existing_note_path.as_str() == note_path && except_file_id != Some(file_doc_id.as_str())
+        })
+        .map(|(file_doc_id, _)| file_doc_id.clone())
+        .collect::<Vec<_>>();
+
+    for file_doc_id in &file_doc_ids {
+        unregister_file_aliases_locked(guard, file_doc_id);
+    }
+
+    file_doc_ids
+}
+
 fn dedupe_links_locked(guard: &mut StoreInner) {
     let mut unique = HashMap::<(NoteId, NoteId), LinkRecord>::new();
     for link in guard.links.drain(..) {
@@ -5039,7 +5086,14 @@ fn parse_child_doc_id(value: &Value) -> Option<String> {
 }
 
 fn stale_file_doc_ids_for_recovery_locked(guard: &StoreInner) -> Vec<String> {
-    let mut stale_file_doc_ids = Vec::new();
+    stale_file_recovery_targets_locked(guard)
+        .into_iter()
+        .map(|target| target.file_doc_id)
+        .collect()
+}
+
+fn stale_file_recovery_targets_locked(guard: &StoreInner) -> Vec<StaleFileRecoveryTarget> {
+    let mut stale_file_targets = Vec::new();
 
     for (file_doc_id, note_path) in &guard.file_doc_paths {
         let Some(file_doc_rev) = guard.file_doc_revs.get(file_doc_id) else {
@@ -5051,13 +5105,20 @@ fn stale_file_doc_ids_for_recovery_locked(guard: &StoreInner) -> Vec<String> {
             .get(&NoteId::new(note_path))
             .is_none_or(|note| note.couchdb_rev != *file_doc_rev);
         if note_is_stale {
-            stale_file_doc_ids.push(file_doc_id.clone());
+            stale_file_targets.push(StaleFileRecoveryTarget {
+                file_doc_id: file_doc_id.clone(),
+                note_path: note_path.clone(),
+            });
         }
     }
 
-    stale_file_doc_ids.sort();
-    stale_file_doc_ids.dedup();
-    stale_file_doc_ids
+    stale_file_targets.sort_by(|a, b| {
+        a.file_doc_id
+            .cmp(&b.file_doc_id)
+            .then_with(|| a.note_path.cmp(&b.note_path))
+    });
+    stale_file_targets.dedup();
+    stale_file_targets
 }
 
 fn classify_purged_chunk_staging_locked(
