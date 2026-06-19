@@ -718,7 +718,7 @@ impl CouchDbClient {
         &self,
         parent_id: &str,
     ) -> Result<Vec<ChangeEvent>, CouchDbError> {
-        let mut queue = VecDeque::from(recovery_candidate_doc_ids(parent_id));
+        let mut queue = VecDeque::from(self.recovery_candidate_doc_ids(parent_id));
         let mut visited = HashSet::new();
         let mut queued_ids = HashSet::new();
         let mut emitted = HashSet::new();
@@ -783,7 +783,7 @@ impl CouchDbClient {
                 }
                 Some(LivesyncDocument::Leaf(leaf)) => {
                     if let Ok(chunk) = decode_leaf_chunk(&leaf, Utc::now()) {
-                        for candidate in recovery_candidate_doc_ids(&chunk.parent_id) {
+                        for candidate in self.recovery_candidate_doc_ids(&chunk.parent_id) {
                             if visited.contains(&candidate) || !queued_ids.insert(candidate.clone())
                             {
                                 continue;
@@ -798,6 +798,10 @@ impl CouchDbClient {
 
         events.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(events)
+    }
+
+    fn recovery_candidate_doc_ids(&self, parent_id: &str) -> Vec<String> {
+        recovery_candidate_doc_ids(parent_id, self.livesync_passphrase.as_deref())
     }
 }
 
@@ -1079,11 +1083,15 @@ fn hydrate_file_from_encrypted_metadata(
     Ok(())
 }
 
-fn recovery_candidate_doc_ids(parent_id: &str) -> Vec<String> {
+fn recovery_candidate_doc_ids(parent_id: &str, livesync_passphrase: Option<&str>) -> Vec<String> {
     let normalized = normalize_note_path(parent_id);
     let mut ids = vec![parent_id.to_string()];
 
     if normalized.to_ascii_lowercase().ends_with(".md") {
+        ids.push(native_file_doc_id_for_path(
+            &normalized,
+            livesync_passphrase,
+        ));
         ids.push(file_doc_id_for_path(&normalized));
         ids.push(legacy_file_doc_id_for_path(&normalized));
         ids.push(leaf_doc_id_for_path(&normalized));
@@ -1240,7 +1248,7 @@ mod tests {
         build_livesync_note_documents_with_crypto, build_native_encrypted_livesync_note_documents,
         decode_changes_body,
     };
-    use crate::config::{CouchDbConfig, FeedMode};
+    use crate::config::{CouchDbConfig, EncryptionConfig, FeedMode};
     use crate::encryption::Decryptor;
 
     #[derive(Clone, Default)]
@@ -1386,6 +1394,22 @@ mod tests {
             password: "pass".to_string(),
             poll_interval_seconds: 1,
             feed_mode: FeedMode::Longpoll,
+            ..Default::default()
+        })
+        .expect("build couchdb client")
+    }
+
+    fn client_for_with_passphrase(base_url: String, passphrase: &str) -> CouchDbClient {
+        CouchDbClient::new(&CouchDbConfig {
+            url: base_url,
+            database: "mainvault".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            poll_interval_seconds: 1,
+            feed_mode: FeedMode::Longpoll,
+            encryption: EncryptionConfig {
+                passphrase: passphrase.to_string(),
+            },
             ..Default::default()
         })
         .expect("build couchdb client")
@@ -2018,5 +2042,53 @@ mod tests {
         for (leaf_id, _) in &docs.leaf_docs {
             assert!(ids.contains(leaf_id));
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_parent_recovery_changes_resolves_native_encrypted_path_with_passphrase() {
+        let passphrase = "test-passphrase";
+        let note_path = "11New/native-encrypted-path-recovery.md";
+        let decryptor = Arc::new(Decryptor::new(passphrase, &[0x42u8; 32]));
+        let docs = build_native_encrypted_livesync_note_documents(
+            note_path,
+            &"B".repeat(10_000),
+            &decryptor,
+            Some(passphrase),
+        )
+        .expect("native encrypted docs");
+        let leaf_count = docs.leaf_docs.len();
+
+        let mut file_doc = docs.file_doc.clone();
+        file_doc["_rev"] = Value::String("1-file".to_string());
+
+        let mut db_docs = HashMap::new();
+        db_docs.insert(docs.file_id.clone(), file_doc);
+        for (index, (leaf_id, mut leaf_doc)) in docs.leaf_docs.iter().cloned().enumerate() {
+            leaf_doc["_rev"] = Value::String(format!("1-leaf-{index}"));
+            db_docs.insert(leaf_id, leaf_doc);
+        }
+
+        let (url, state) = spawn_mock_couchdb(db_docs);
+        let client =
+            client_for_with_passphrase(url, passphrase).with_livesync_crypto(Some(decryptor));
+
+        let events = client
+            .fetch_parent_recovery_changes(note_path)
+            .await
+            .expect("fetch parent recovery changes");
+
+        assert_eq!(events.len(), 1 + leaf_count);
+        let ids = events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&docs.file_id));
+        for (leaf_id, _) in &docs.leaf_docs {
+            assert!(ids.contains(leaf_id));
+        }
+
+        let requested = state.requested.lock().await.clone();
+        assert!(requested.contains(&note_path.to_string()));
+        assert!(requested.contains(&docs.file_id));
     }
 }
