@@ -167,7 +167,7 @@ pub fn spawn_sync_worker(
                 max_changes_per_batch,
             )
             .await;
-            debug!(
+            info!(
                 indexed = batch.indexed_notes,
                 deleted = batch.deleted_notes,
                 pending_chunks = batch.pending_chunks,
@@ -302,7 +302,7 @@ pub fn spawn_sync_worker(
                             )
                             .await;
                             if batch.indexed_notes > 0 || batch.deleted_notes > 0 {
-                                debug!(
+                                info!(
                                     indexed = batch.indexed_notes,
                                     deleted = batch.deleted_notes,
                                     pending_chunks = batch.pending_chunks,
@@ -848,7 +848,7 @@ async fn fetch_path_scan_recovery_changes(
                     "sync worker: stale alias path scan found no file documents"
                 );
             } else {
-                debug!(
+                info!(
                     stale_file_alias_count = targets.len(),
                     note_path_count = note_paths.len(),
                     recovered_events = events.len(),
@@ -890,7 +890,7 @@ async fn queue_path_scan_recovery(
 
     *pending_current_seq = current_seq.to_string();
     *last_event_at = Some(Instant::now());
-    debug!(
+    info!(
         stale_file_alias_count = targets.len(),
         recovered_events = recovered_count,
         "sync worker: queued scanned stale alias file documents for reprocessing"
@@ -1781,12 +1781,20 @@ mod tests {
             .get("limit")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(500);
-        let startkey_docid = query.get("startkey_docid");
+        let startkey = query
+            .get("startkey")
+            .and_then(|value| serde_json::from_str::<String>(value).ok());
+        let skip = query
+            .get("skip")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
 
         let mut keys = state.docs.keys().cloned().collect::<Vec<_>>();
         keys.sort();
-        let start_index = startkey_docid
+        let start_index = startkey
+            .as_ref()
             .and_then(|start| keys.iter().position(|key| key == start))
+            .map(|index| index.saturating_add(skip))
             .unwrap_or(0);
 
         let docs = keys

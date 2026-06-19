@@ -467,13 +467,17 @@ impl CouchDbClient {
 
         let mut found = HashMap::new();
         let page_size = 500usize;
-        let mut startkey_docid: Option<String> = None;
+        let mut startkey: Option<String> = None;
 
         loop {
             let limit = page_size.to_string();
             let mut query = vec![("include_docs", "true".to_string()), ("limit", limit)];
-            if let Some(start) = startkey_docid.as_ref() {
-                query.push(("startkey_docid", start.clone()));
+            if let Some(start) = startkey.as_ref() {
+                query.push((
+                    "startkey",
+                    serde_json::to_string(start).expect("document ID should serialize as JSON"),
+                ));
+                query.push(("skip", "1".to_string()));
             }
 
             let response = self
@@ -494,21 +498,9 @@ impl CouchDbClient {
                 return Ok(found);
             }
 
-            let mut rows = page.rows.into_iter();
-            if let Some(start) = startkey_docid.as_ref()
-                && rows
-                    .next()
-                    .as_ref()
-                    .is_some_and(|row| row.id.as_str() != start.as_str())
-            {
-                return Err(CouchDbError::InvalidResponse(
-                    "unexpected _all_docs pagination boundary".to_string(),
-                ));
-            }
-
             let mut last_seen_id = None;
 
-            for row in rows {
+            for row in page.rows {
                 last_seen_id = Some(row.id.clone());
                 let Some(doc) = row.doc else {
                     continue;
@@ -540,7 +532,7 @@ impl CouchDbClient {
             let Some(last_id) = last_seen_id else {
                 return Ok(found);
             };
-            startkey_docid = Some(last_id);
+            startkey = Some(last_id);
         }
     }
 
