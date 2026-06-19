@@ -847,6 +847,46 @@ impl CouchDbClient {
         Ok(events)
     }
 
+    pub async fn fetch_documents_as_changes(
+        &self,
+        document_ids: &[String],
+    ) -> Result<Vec<ChangeEvent>, CouchDbError> {
+        if document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let documents = self.fetch_existing_documents(document_ids).await?;
+        let mut events = Vec::new();
+        let mut emitted = HashSet::new();
+
+        for doc_id in document_ids {
+            let Some(doc) = documents.get(doc_id) else {
+                continue;
+            };
+            let resolved_id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or(doc_id.as_str())
+                .to_string();
+            if !emitted.insert(resolved_id.clone()) {
+                continue;
+            }
+            let deleted = doc
+                .get("deleted")
+                .or_else(|| doc.get("_deleted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            events.push(ChangeEvent {
+                seq: Value::String(String::new()),
+                id: resolved_id,
+                deleted,
+                doc: Some(doc.clone()),
+            });
+        }
+
+        Ok(events)
+    }
+
     fn recovery_candidate_doc_ids(&self, parent_id: &str) -> Vec<String> {
         recovery_candidate_doc_ids(parent_id, self.livesync_passphrase.as_deref())
     }

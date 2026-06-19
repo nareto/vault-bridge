@@ -110,17 +110,29 @@ pub fn spawn_sync_worker(
         startup_recovery_lookup_ids.extend(startup_remote_drift_file_docs.iter().cloned());
         startup_recovery_lookup_ids.sort();
         startup_recovery_lookup_ids.dedup();
+        let startup_recovery_child_ids =
+            recovery_child_doc_ids_for_stale_file_targets(&startup_stale_file_targets);
 
-        if !startup_recovery_lookup_ids.is_empty() {
+        if !startup_recovery_lookup_ids.is_empty() || !startup_recovery_child_ids.is_empty() {
             warn!(
                 stale_file_doc_count = startup_stale_file_docs.len(),
                 remote_drift_file_doc_count = startup_remote_drift_file_docs.len(),
                 recovery_lookup_count = startup_recovery_lookup_ids.len(),
+                recovery_child_count = startup_recovery_child_ids.len(),
                 "sync worker: startup detected stale file aliases or remote drift; queuing parent recovery"
             );
             queue_parent_recovery(
                 &couch,
                 &startup_recovery_lookup_ids,
+                &mut pending,
+                &mut pending_current_seq,
+                &mut last_event_at,
+                &startup_current_seq,
+            )
+            .await;
+            queue_exact_recovery(
+                &couch,
+                &startup_recovery_child_ids,
                 &mut pending,
                 &mut pending_current_seq,
                 &mut last_event_at,
@@ -504,13 +516,17 @@ async fn recover_stale_file_aliases_cooperatively(
     }
 
     let recovery_lookup_ids = recovery_lookup_ids_for_stale_file_targets(&stale_file_targets);
+    let recovery_child_doc_ids = recovery_child_doc_ids_for_stale_file_targets(&stale_file_targets);
     warn!(
         stale_file_alias_count = stale_file_doc_ids.len(),
         recovery_lookup_count = recovery_lookup_ids.len(),
+        recovery_child_count = recovery_child_doc_ids.len(),
         "sync worker: idle detected stale file aliases; queuing parent recovery"
     );
 
-    let recovered = fetch_parent_recovery_changes(couch, &recovery_lookup_ids).await;
+    let mut recovered = fetch_parent_recovery_changes(couch, &recovery_lookup_ids).await;
+    let child_recovered = fetch_exact_recovery_changes(couch, &recovery_child_doc_ids).await;
+    append_missing_changes(&mut recovered, child_recovered);
     if recovered.is_empty() {
         return aggregate;
     }
@@ -650,6 +666,18 @@ fn recovery_lookup_ids_for_stale_file_targets(targets: &[StaleFileRecoveryTarget
     lookup_ids
 }
 
+fn recovery_child_doc_ids_for_stale_file_targets(
+    targets: &[StaleFileRecoveryTarget],
+) -> Vec<String> {
+    let mut child_doc_ids = Vec::new();
+    for target in targets {
+        child_doc_ids.extend(target.child_doc_ids.iter().cloned());
+    }
+    let mut seen = HashSet::new();
+    child_doc_ids.retain(|id| seen.insert(id.clone()));
+    child_doc_ids
+}
+
 fn recovery_lookup_fingerprint(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.trim().as_bytes());
@@ -731,6 +759,51 @@ async fn queue_parent_recovery(
         recovered_events = recovered_count,
         purged_parent_count = purged_parent_ids.len(),
         "sync worker: queued refetched stale chunk parents for reprocessing"
+    );
+}
+
+async fn fetch_exact_recovery_changes(
+    couch: &CouchDbClient,
+    document_ids: &[String],
+) -> Vec<ChangeEvent> {
+    if document_ids.is_empty() {
+        return Vec::new();
+    }
+
+    match couch.fetch_documents_as_changes(document_ids).await {
+        Ok(events) => events,
+        Err(error) => {
+            warn!(
+                recovery_lookup_count = document_ids.len(),
+                error = %error,
+                "sync worker: failed to refetch exact recovery documents from couchdb"
+            );
+            Vec::new()
+        }
+    }
+}
+
+async fn queue_exact_recovery(
+    couch: &CouchDbClient,
+    document_ids: &[String],
+    pending: &mut Vec<crate::livesync::ChangeEvent>,
+    pending_current_seq: &mut String,
+    last_event_at: &mut Option<Instant>,
+    current_seq: &str,
+) {
+    let recovered = fetch_exact_recovery_changes(couch, document_ids).await;
+    if recovered.is_empty() {
+        return;
+    }
+
+    let recovered_count = recovered.len();
+    append_missing_changes(pending, recovered);
+    *pending_current_seq = current_seq.to_string();
+    *last_event_at = Some(Instant::now());
+    debug!(
+        recovered_events = recovered_count,
+        recovery_lookup_count = document_ids.len(),
+        "sync worker: queued refetched exact recovery documents for reprocessing"
     );
 }
 
@@ -2377,6 +2450,71 @@ mod tests {
             .expect("path fallback should materialize missing note row");
         assert_eq!(note.id, NoteId::new(note_path));
         assert!(note.content.contains("note path fallback"));
+
+        let requested = state.requested.lock().await.clone();
+        assert!(requested.contains(&docs.file_id));
+        assert!(requested.contains(&docs.leaf_id));
+    }
+
+    #[tokio::test]
+    async fn idle_file_alias_recovery_uses_persisted_children_when_file_doc_lookup_misses() {
+        let store = VaultStore::new(20);
+        let note_path = "Public Notes/synthetic-child-recovery draft 5.md";
+        let docs = build_livesync_note_documents(
+            note_path,
+            "# Synthetic Child Recovery Draft 5\n\nRecovered through persisted child IDs.",
+        );
+        let mut file_doc = docs.file_doc.clone();
+        let mut leaf_doc = docs.leaf_doc.clone();
+        file_doc["_rev"] = serde_json::Value::String("2-file".to_string());
+        leaf_doc["_rev"] = serde_json::Value::String("2-leaf".to_string());
+
+        let stale_alias = store
+            .ingest_changes_batch_at(
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String("49-g1AAA".to_string()),
+                    id: docs.file_id.clone(),
+                    deleted: false,
+                    doc: Some(file_doc),
+                }],
+                "49-g1AAA",
+                250,
+                Duration::from_secs(60),
+                Utc::now(),
+                None,
+            )
+            .await;
+        assert_eq!(stale_alias.indexed_notes, 0);
+        assert_eq!(
+            store.stale_file_doc_ids_for_recovery().await,
+            vec![docs.file_id.clone()]
+        );
+
+        let mut server_docs = HashMap::new();
+        server_docs.insert(docs.leaf_id.clone(), leaf_doc);
+        let (url, state) = spawn_mock_couchdb(server_docs);
+        let couch = couchdb_client(url);
+
+        let recovered = recover_stale_file_aliases_cooperatively(
+            &store,
+            &couch,
+            "50-g1AAA",
+            250,
+            Duration::from_secs(60),
+            None,
+            64,
+        )
+        .await;
+
+        assert_eq!(recovered.indexed_notes, 1);
+        assert_eq!(store.status().await.index.stale_file_aliases, 0);
+        assert!(store.stale_file_doc_ids_for_recovery().await.is_empty());
+
+        let note = get_local_note(&store, note_path)
+            .await
+            .expect("persisted child fallback should materialize missing note row");
+        assert_eq!(note.id, NoteId::new(note_path));
+        assert!(note.content.contains("persisted child IDs"));
 
         let requested = state.requested.lock().await.clone();
         assert!(requested.contains(&docs.file_id));

@@ -478,6 +478,7 @@ pub enum NoteVisibility {
 pub struct StaleFileRecoveryTarget {
     pub file_doc_id: String,
     pub note_path: String,
+    pub child_doc_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -5108,6 +5109,11 @@ fn stale_file_recovery_targets_locked(guard: &StoreInner) -> Vec<StaleFileRecove
             stale_file_targets.push(StaleFileRecoveryTarget {
                 file_doc_id: file_doc_id.clone(),
                 note_path: note_path.clone(),
+                child_doc_ids: guard
+                    .file_children
+                    .get(file_doc_id)
+                    .cloned()
+                    .unwrap_or_default(),
             });
         }
     }
