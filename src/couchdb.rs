@@ -47,6 +47,8 @@ struct BulkAllDocsRow {
     #[serde(default)]
     value: Option<BulkAllDocsValue>,
     #[serde(default)]
+    doc: Option<Value>,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -397,6 +399,47 @@ impl CouchDbClient {
         Ok(revisions)
     }
 
+    async fn fetch_existing_documents(
+        &self,
+        document_ids: &[String],
+    ) -> Result<HashMap<String, Value>, CouchDbError> {
+        if document_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut documents = HashMap::new();
+
+        for chunk in document_ids.chunks(500) {
+            let response = self
+                .send_request_with_timeout(
+                    self.http
+                        .post(format!("{}/_all_docs", self.db_base_url()))
+                        .basic_auth(&self.username, Some(&self.password))
+                        .json(&serde_json::json!({
+                            "keys": chunk,
+                            "include_docs": true
+                        })),
+                    COUCHDB_REQUEST_TIMEOUT,
+                )
+                .await?
+                .error_for_status()?;
+            let page: BulkAllDocsPage = self
+                .read_json_with_timeout(response, COUCHDB_REQUEST_TIMEOUT)
+                .await?;
+            for row in page.rows {
+                if row.error.is_some() {
+                    continue;
+                }
+                let Some(doc) = row.doc else {
+                    continue;
+                };
+                documents.insert(row.id.unwrap_or(row.key), doc);
+            }
+        }
+
+        Ok(documents)
+    }
+
     pub async fn find_file_document_by_note_path(
         &self,
         note_path: &str,
@@ -733,7 +776,11 @@ impl CouchDbClient {
                 continue;
             }
 
-            let Some(doc) = self.get_document(&doc_id).await? else {
+            let Some(doc) = self
+                .fetch_existing_documents(std::slice::from_ref(&doc_id))
+                .await?
+                .remove(&doc_id)
+            else {
                 continue;
             };
 
@@ -1323,30 +1370,39 @@ mod tests {
         Path(_db): Path<String>,
         Json(body): Json<Value>,
     ) -> Json<Value> {
+        let include_docs = body
+            .get("include_docs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let keys = body
             .get("keys")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let docs = state.docs.lock().await;
-        let rows = keys
+        let key_strings = keys
             .into_iter()
-            .map(|key| {
-                let key_string = key.as_str().unwrap_or_default().to_string();
-                match docs
-                    .get(&key_string)
-                    .and_then(|doc| doc.get("_rev"))
-                    .and_then(Value::as_str)
-                {
-                    Some(rev) => serde_json::json!({
+            .map(|key| key.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        state.requested.lock().await.extend(key_strings.clone());
+        let docs = state.docs.lock().await;
+        let rows = key_strings
+            .into_iter()
+            .map(|key_string| match docs.get(&key_string) {
+                Some(doc) => {
+                    let rev = doc.get("_rev").and_then(Value::as_str).unwrap_or("");
+                    let mut row = serde_json::json!({
                         "key": key_string,
                         "value": { "rev": rev }
-                    }),
-                    None => serde_json::json!({
-                        "key": key_string,
-                        "error": "not_found"
-                    }),
+                    });
+                    if include_docs {
+                        row["doc"] = doc.clone();
+                    }
+                    row
                 }
+                None => serde_json::json!({
+                    "key": key_string,
+                    "error": "not_found"
+                }),
             })
             .collect::<Vec<_>>();
         Json(serde_json::json!({ "rows": rows }))

@@ -1570,6 +1570,8 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct MockAllDocsRequest {
         keys: Vec<String>,
+        #[serde(default)]
+        include_docs: bool,
     }
 
     async fn mock_all_docs(
@@ -1585,11 +1587,15 @@ mod tests {
             .into_iter()
             .map(|key| {
                 if let Some(doc) = state.docs.get(&key) {
-                    serde_json::json!({
+                    let mut row = serde_json::json!({
                         "id": key,
                         "key": key,
                         "value": { "rev": doc.get("_rev").and_then(|value| value.as_str()).unwrap_or_default() }
-                    })
+                    });
+                    if request.include_docs {
+                        row["doc"] = doc.clone();
+                    }
+                    row
                 } else {
                     serde_json::json!({
                         "key": key,
