@@ -139,6 +139,16 @@ pub fn spawn_sync_worker(
                 &startup_current_seq,
             )
             .await;
+            queue_path_scan_recovery(
+                &couch,
+                &startup_stale_file_targets,
+                decryptor.as_deref(),
+                &mut pending,
+                &mut pending_current_seq,
+                &mut last_event_at,
+                &startup_current_seq,
+            )
+            .await;
         }
 
         if !pending.is_empty() {
@@ -527,6 +537,9 @@ async fn recover_stale_file_aliases_cooperatively(
     let mut recovered = fetch_parent_recovery_changes(couch, &recovery_lookup_ids).await;
     let child_recovered = fetch_exact_recovery_changes(couch, &recovery_child_doc_ids).await;
     append_missing_changes(&mut recovered, child_recovered);
+    let path_recovered =
+        fetch_path_scan_recovery_changes(couch, &stale_file_targets, decryptor).await;
+    append_missing_changes(&mut recovered, path_recovered);
     if recovered.is_empty() {
         return aggregate;
     }
@@ -804,6 +817,83 @@ async fn queue_exact_recovery(
         recovered_events = recovered_count,
         recovery_lookup_count = document_ids.len(),
         "sync worker: queued refetched exact recovery documents for reprocessing"
+    );
+}
+
+async fn fetch_path_scan_recovery_changes(
+    couch: &CouchDbClient,
+    targets: &[StaleFileRecoveryTarget],
+    decryptor: Option<&Decryptor>,
+) -> Vec<ChangeEvent> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let mut note_paths = targets
+        .iter()
+        .map(|target| target.note_path.clone())
+        .collect::<Vec<_>>();
+    note_paths.sort();
+    note_paths.dedup();
+
+    match couch
+        .find_file_document_changes_by_note_paths(&note_paths, decryptor)
+        .await
+    {
+        Ok(events) => {
+            if events.is_empty() {
+                debug!(
+                    stale_file_alias_count = targets.len(),
+                    note_path_count = note_paths.len(),
+                    "sync worker: stale alias path scan found no file documents"
+                );
+            } else {
+                debug!(
+                    stale_file_alias_count = targets.len(),
+                    note_path_count = note_paths.len(),
+                    recovered_events = events.len(),
+                    "sync worker: stale alias path scan recovered file documents"
+                );
+            }
+            events
+        }
+        Err(error) => {
+            warn!(
+                stale_file_alias_count = targets.len(),
+                note_path_count = note_paths.len(),
+                error = %error,
+                "sync worker: failed to scan file documents for stale alias recovery"
+            );
+            Vec::new()
+        }
+    }
+}
+
+async fn queue_path_scan_recovery(
+    couch: &CouchDbClient,
+    targets: &[StaleFileRecoveryTarget],
+    decryptor: Option<&Decryptor>,
+    pending: &mut Vec<crate::livesync::ChangeEvent>,
+    pending_current_seq: &mut String,
+    last_event_at: &mut Option<Instant>,
+    current_seq: &str,
+) {
+    let recovered = fetch_path_scan_recovery_changes(couch, targets, decryptor).await;
+    if recovered.is_empty() {
+        return;
+    }
+
+    let recovered_count = append_missing_changes(pending, recovered);
+    if recovered_count == 0 {
+        return;
+    }
+
+    *pending_current_seq = current_seq.to_string();
+    *last_event_at = Some(Instant::now());
+    debug!(
+        stale_file_alias_count = targets.len(),
+        recovered_events = recovered_count,
+        "sync worker: queued scanned stale alias file documents for reprocessing"
     );
 }
 
@@ -1585,7 +1675,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::body::Bytes;
-    use axum::extract::{Path, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
     use axum::routing::{get, post};
     use axum::{Json, Router};
@@ -1680,13 +1770,56 @@ mod tests {
         Json(serde_json::json!({ "rows": rows }))
     }
 
+    async fn mock_all_docs_scan(
+        State(state): State<MockCouchState>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let include_docs = query
+            .get("include_docs")
+            .is_some_and(|value| value == "true");
+        let limit = query
+            .get("limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(500);
+        let startkey_docid = query.get("startkey_docid");
+
+        let mut keys = state.docs.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let start_index = startkey_docid
+            .and_then(|start| keys.iter().position(|key| key == start))
+            .unwrap_or(0);
+
+        let docs = keys
+            .into_iter()
+            .skip(start_index)
+            .take(limit)
+            .filter_map(|key| {
+                let doc = state.docs.get(&key)?;
+                let mut row = serde_json::json!({
+                    "id": key,
+                    "key": key,
+                    "value": { "rev": doc.get("_rev").and_then(|value| value.as_str()).unwrap_or_default() }
+                });
+                if include_docs {
+                    row["doc"] = doc.clone();
+                }
+                Some(row)
+            })
+            .collect::<Vec<_>>();
+
+        Json(serde_json::json!({ "rows": docs }))
+    }
+
     fn spawn_mock_couchdb(docs: HashMap<String, serde_json::Value>) -> (String, MockCouchState) {
         let state = MockCouchState {
             docs: Arc::new(docs),
             requested: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
-            .route("/{db}/_all_docs", post(mock_all_docs))
+            .route(
+                "/{db}/_all_docs",
+                get(mock_all_docs_scan).post(mock_all_docs),
+            )
             .route("/{db}/{doc_id}", get(mock_get_document))
             .with_state(state.clone());
 
@@ -2518,6 +2651,81 @@ mod tests {
 
         let requested = state.requested.lock().await.clone();
         assert!(requested.contains(&docs.file_id));
+        assert!(requested.contains(&docs.leaf_id));
+    }
+
+    #[tokio::test]
+    async fn idle_file_alias_recovery_scans_by_path_when_alias_id_and_children_are_stale() {
+        let store = VaultStore::new(20);
+        let note_path = "Public Notes/synthetic-scan-recovery draft 5.md";
+        let docs = build_livesync_note_documents(
+            note_path,
+            "# Synthetic Scan Recovery Draft 5\n\nRecovered through a path scan.",
+        );
+        let stale_file_id = "f:stale-synthetic-scan-recovery";
+        let current_file_id = "f:current-synthetic-scan-recovery";
+        let mut stale_file_doc = docs.file_doc.clone();
+        stale_file_doc["_id"] = serde_json::Value::String(stale_file_id.to_string());
+        stale_file_doc["_rev"] = serde_json::Value::String("2-stale-file".to_string());
+        stale_file_doc["children"] = serde_json::json!(["h:stale-child-a", "h:stale-child-b"]);
+
+        let stale_alias = store
+            .ingest_changes_batch_at(
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String("49-g1AAA".to_string()),
+                    id: stale_file_id.to_string(),
+                    deleted: false,
+                    doc: Some(stale_file_doc),
+                }],
+                "49-g1AAA",
+                250,
+                Duration::from_secs(60),
+                Utc::now(),
+                None,
+            )
+            .await;
+        assert_eq!(stale_alias.indexed_notes, 0);
+        assert_eq!(
+            store.stale_file_doc_ids_for_recovery().await,
+            vec![stale_file_id.to_string()]
+        );
+
+        let mut current_file_doc = docs.file_doc.clone();
+        let mut current_leaf_doc = docs.leaf_doc.clone();
+        current_file_doc["_id"] = serde_json::Value::String(current_file_id.to_string());
+        current_file_doc["_rev"] = serde_json::Value::String("3-current-file".to_string());
+        current_leaf_doc["_rev"] = serde_json::Value::String("3-current-leaf".to_string());
+
+        let mut server_docs = HashMap::new();
+        server_docs.insert(current_file_id.to_string(), current_file_doc);
+        server_docs.insert(docs.leaf_id.clone(), current_leaf_doc);
+        let (url, state) = spawn_mock_couchdb(server_docs);
+        let couch = couchdb_client(url);
+
+        let recovered = recover_stale_file_aliases_cooperatively(
+            &store,
+            &couch,
+            "50-g1AAA",
+            250,
+            Duration::from_secs(60),
+            None,
+            64,
+        )
+        .await;
+
+        assert_eq!(recovered.indexed_notes, 1);
+        assert_eq!(store.status().await.index.stale_file_aliases, 0);
+        assert!(store.stale_file_doc_ids_for_recovery().await.is_empty());
+
+        let note = get_local_note(&store, note_path)
+            .await
+            .expect("path scan fallback should materialize stale alias note");
+        assert_eq!(note.id, NoteId::new(note_path));
+        assert!(note.content.contains("path scan"));
+
+        let requested = state.requested.lock().await.clone();
+        assert!(requested.contains(&stale_file_id.to_string()));
+        assert!(requested.contains(&current_file_id.to_string()));
         assert!(requested.contains(&docs.leaf_id));
     }
 

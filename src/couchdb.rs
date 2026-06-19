@@ -445,7 +445,27 @@ impl CouchDbClient {
         note_path: &str,
         decryptor: Option<&Decryptor>,
     ) -> Result<Option<Value>, CouchDbError> {
-        let target = normalize_note_path(note_path);
+        let note_paths = vec![note_path.to_string()];
+        let mut documents = self
+            .find_file_documents_by_note_paths(&note_paths, decryptor)
+            .await?;
+        Ok(documents.remove(&normalize_note_path(note_path)))
+    }
+
+    pub async fn find_file_documents_by_note_paths(
+        &self,
+        note_paths: &[String],
+        decryptor: Option<&Decryptor>,
+    ) -> Result<HashMap<String, Value>, CouchDbError> {
+        let targets = note_paths
+            .iter()
+            .map(|path| normalize_note_path(path))
+            .collect::<HashSet<_>>();
+        if targets.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut found = HashMap::new();
         let page_size = 500usize;
         let mut startkey_docid: Option<String> = None;
 
@@ -471,7 +491,7 @@ impl CouchDbClient {
                 .await?;
             let row_count = page.rows.len();
             if row_count == 0 {
-                return Ok(None);
+                return Ok(found);
             }
 
             let mut rows = page.rows.into_iter();
@@ -505,16 +525,20 @@ impl CouchDbClient {
                     };
                     file.path = decrypted_path;
                 }
-                if normalize_note_path(&file.path) == target {
-                    return Ok(Some(doc));
+                let normalized_path = normalize_note_path(&file.path);
+                if targets.contains(&normalized_path) {
+                    found.entry(normalized_path).or_insert(doc);
+                    if found.len() == targets.len() {
+                        return Ok(found);
+                    }
                 }
             }
 
             if row_count < page_size {
-                return Ok(None);
+                return Ok(found);
             }
             let Some(last_id) = last_seen_id else {
-                return Ok(None);
+                return Ok(found);
             };
             startkey_docid = Some(last_id);
         }
@@ -884,6 +908,46 @@ impl CouchDbClient {
             });
         }
 
+        Ok(events)
+    }
+
+    pub async fn find_file_document_changes_by_note_paths(
+        &self,
+        note_paths: &[String],
+        decryptor: Option<&Decryptor>,
+    ) -> Result<Vec<ChangeEvent>, CouchDbError> {
+        let documents = self
+            .find_file_documents_by_note_paths(note_paths, decryptor)
+            .await?;
+        if documents.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut events = Vec::new();
+        let mut emitted = HashSet::new();
+        for doc in documents.into_values() {
+            let resolved_id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !emitted.insert(resolved_id.clone()) {
+                continue;
+            }
+            let deleted = doc
+                .get("deleted")
+                .or_else(|| doc.get("_deleted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            events.push(ChangeEvent {
+                seq: Value::String(String::new()),
+                id: resolved_id,
+                deleted,
+                doc: Some(doc),
+            });
+        }
+
+        events.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(events)
     }
 
