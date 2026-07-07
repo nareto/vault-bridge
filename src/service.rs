@@ -150,9 +150,8 @@ impl VaultBridgeService {
             .map_err(ServiceError::Write)?;
 
         if let Some(couchdb) = self.couchdb.as_ref() {
-            let markdown = request.to_markdown(now);
             couchdb
-                .write_livesync_note(&path, &markdown)
+                .write_livesync_note(&path, &request.content)
                 .await
                 .map_err(ServiceError::CouchDbWrite)?;
         }

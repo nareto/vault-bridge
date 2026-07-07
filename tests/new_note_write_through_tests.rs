@@ -144,8 +144,7 @@ async fn create_note_with_couchdb_configured_is_immediately_readable() {
 
     let payload = json!({
         "title": "Write Through Only",
-        "content": "Created via API in CouchDB mode.",
-        "tags": ["integration"]
+        "content": "---\ntags: [integration]\n---\n\n# Write Through Only\n\nCreated via API in CouchDB mode."
     });
 
     let create = app
@@ -213,7 +212,7 @@ async fn create_note_with_couchdb_configured_is_immediately_readable() {
         .expect("leaf data should be raw markdown");
     assert!(
         payload.contains("Write Through Only"),
-        "leaf payload should include the generated title heading"
+        "leaf payload should include the supplied title heading"
     );
 }
 
@@ -239,8 +238,7 @@ async fn create_note_with_couchdb_duplicate_path_returns_conflict() {
 
     let payload = json!({
         "title": "Duplicate Through CouchDB",
-        "content": "Created via API in CouchDB mode.",
-        "tags": ["integration"]
+        "content": "---\ntags: [integration]\n---\n\n# Duplicate Through CouchDB\n\nCreated via API in CouchDB mode."
     });
 
     let first = app
@@ -315,8 +313,7 @@ async fn create_note_with_couchdb_unavailable_returns_retryable_transient_error(
 
     let payload = json!({
         "title": "Unavailable CouchDB",
-        "content": "Created via API in CouchDB mode.",
-        "tags": ["integration"]
+        "content": "---\ntags: [integration]\n---\n\n# Unavailable CouchDB\n\nCreated via API in CouchDB mode."
     });
 
     let response = app
@@ -373,8 +370,7 @@ async fn create_note_with_encrypted_couchdb_writes_hkdf_payloads() {
 
     let payload = json!({
         "title": "Encrypted Write Through",
-        "content": "Created via API in encrypted CouchDB mode.",
-        "tags": ["integration"]
+        "content": "---\ntags: [integration]\n---\n\n# Encrypted Write Through\n\nCreated via API in encrypted CouchDB mode."
     });
 
     let create = app

@@ -461,12 +461,7 @@ async fn live_mcp_external_context_tool_flow_matches_prd_surface() {
             "new_note",
             json!({
                 "title": title,
-                "content": "Created from live MCP validation test.",
-                "tags": ["mcp-validation", "integration"],
-                "metadata": {
-                    "source": "live-mcp-validation-tests",
-                    "confidence": 1.0
-                }
+                "content": format!("---\ntags: [mcp-validation, integration]\nsource: live-mcp-validation-tests\nconfidence: 1.0\n---\n\n# {title}\n\nCreated from live MCP validation test.")
             }),
         )
         .await

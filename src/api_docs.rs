@@ -363,23 +363,35 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "NewNoteRequest": {
                     "type": "object",
-                    "required": ["title"],
+                    "required": ["title", "content"],
                     "properties": {
                         "title": {
                             "type": "string",
-                            "description": "Human-readable note title. The server sanitizes this into the configured generated path; clients should not slugify it."
+                            "description": "Human-readable title for filename generation. Do not include a folder or extension."
                         },
-                        "content": {"type": "string"},
-                        "tags": {"type": "array", "items": {"type": "string"}, "default": []},
-                        "metadata": {"default": {}}
+                        "content": {
+                            "type": "string",
+                            "description": "Complete raw file content. For Markdown, server policy may add managed frontmatter such as tags, owner, or created."
+                        },
+                        "template_id": {
+                            "type": "string",
+                            "description": "Optional exact vault-relative template path used to produce this content."
+                        },
+                        "file_type": {
+                            "type": "string",
+                            "enum": ["md", "base"],
+                            "default": "md"
+                        }
                     }
                 },
                 "NewNoteResponse": {
                     "type": "object",
-                    "required": ["id", "status"],
+                    "required": ["id", "status", "file_type", "indexed_as_note"],
                     "properties": {
                         "id": {"type": "string"},
-                        "status": {"type": "string"}
+                        "status": {"type": "string"},
+                        "file_type": {"type": "string", "enum": ["md", "base"]},
+                        "indexed_as_note": {"type": "boolean"}
                     }
                 },
                 "ContentPatchOperation": {
@@ -824,7 +836,7 @@ pub(crate) fn openapi_spec() -> Value {
             "/api/v1/notes": {
                 "post": {
                     "tags": ["vault_bridge"],
-                    "summary": "Create a new note",
+                    "summary": "Create a new vault file",
                     "security": [{"api_key": []}],
                     "requestBody": {
                         "required": true,
@@ -835,7 +847,7 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     },
                     "responses": {
-                        "200": json_response("#/components/schemas/NewNoteResponse", "Note created"),
+                        "200": json_response("#/components/schemas/NewNoteResponse", "File created"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid note payload"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "403": json_response("#/components/schemas/ApiError", "Write path not allowed for context"),

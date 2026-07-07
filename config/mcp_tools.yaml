@@ -188,25 +188,25 @@ tools:
 
   - id: new_note
     name: new_note
-    description: "Create a note in the configured inbox path. Pass a normal human-readable `title`; the server generates a safe vault-relative path from its configured template and returns that path as `id`. Example: `{ \"title\": \"Sync notes\", \"content\": \"Body\", \"tags\": [\"project\"], \"metadata\": {\"source\": \"agent\"} }`; empty title, duplicate generated path, path policy failure, or denied create policy return errors. The server adds frontmatter, a created timestamp, and an H1 when needed."
+    description: "Create a new vault file in the configured new-note location. The server generates the path from `title` and `file_type`; `content` is complete file content, not a body fragment. Example: `{ \"title\": \"Sync Notes\", \"content\": \"# Sync Notes\\n\\nBody\" }`."
     inputSchema:
       type: object
       properties:
         title:
           type: string
-          description: "Human-readable note title. Do not slugify it; the server sanitizes the generated filename."
+          description: "Human-readable title for filename generation. Do not include a folder or extension."
         content:
           type: string
-          description: Optional markdown content of the note
-        tags:
-          type: array
-          items:
-            type: string
-          description: Tags to apply
-        metadata:
-          type: object
-          description: Additional frontmatter metadata
-      required: [title]
+          description: "Complete raw file content. For `md`, include the full Markdown file, including YAML frontmatter if needed; server policy may add managed frontmatter such as tags/owner/created. For `base`, provide the full Bases file content."
+        template_id:
+          type: string
+          description: "Optional exact vault-relative template path used to produce this content. Read the template first; do not guess."
+        file_type:
+          type: string
+          enum: [md, base]
+          default: md
+          description: "File extension/type to create. Defaults to `md`; use `base` for Obsidian Bases files."
+      required: [title, content]
 
   - id: edit_note
     name: edit_note

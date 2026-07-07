@@ -109,6 +109,7 @@ new_note:
   # Supported tokens: {base}, {date}, {slug}, {title}.
   # {title} preserves spaces/case in a filesystem-safe filename segment.
   # {slug} keeps the older lowercase hyphenated filename style.
+  # The create request's file_type controls the final extension (`md` or `base`).
   path_template: "{base}/{date}-{slug}.md"
   date_format: "%Y-%m-%d"
   # Maximum generated title or slug segment length.

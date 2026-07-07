@@ -2026,8 +2026,12 @@ mod tests {
         assert!(list_tags.description.contains("non-visible"));
 
         let new_note = tool_named("new_note");
-        assert!(new_note.description.contains("duplicate generated path"));
-        assert!(new_note.description.contains("denied create policy"));
+        assert!(
+            new_note
+                .description
+                .contains("configured new-note location")
+        );
+        assert!(new_note.description.contains("complete file content"));
 
         let edit_note = tool_named("edit_note");
         assert!(edit_note.description.contains("mutually exclusive"));

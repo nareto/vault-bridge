@@ -4,7 +4,9 @@ use serde_json::Value;
 use slug::slugify;
 use thiserror::Error;
 
+use crate::authorization::{add_unique_tag, set_owner_metadata};
 use crate::config::NewNoteConfig;
+use crate::markdown::{extract_frontmatter_tags, parse_frontmatter};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewNotePathSettings {
     pub base_path: String,
@@ -35,15 +37,40 @@ impl From<&NewNoteConfig> for NewNotePathSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NewNoteFileType {
+    Md,
+    Base,
+}
+
+impl Default for NewNoteFileType {
+    fn default() -> Self {
+        Self::Md
+    }
+}
+
+impl NewNoteFileType {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Md => "md",
+            Self::Base => "base",
+        }
+    }
+
+    pub fn is_markdown(self) -> bool {
+        matches!(self, Self::Md)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewNoteRequest {
     pub title: String,
-    #[serde(default)]
     pub content: String,
     #[serde(default)]
-    pub tags: Vec<String>,
+    pub template_id: Option<String>,
     #[serde(default)]
-    pub metadata: Value,
+    pub file_type: NewNoteFileType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +106,10 @@ pub enum WriteError {
     AlreadyExists { path: String },
     #[error("note not found: {path}")]
     NotFound { path: String },
+    #[error("invalid create: {reason}")]
+    InvalidCreate { reason: String },
+    #[error("template not found or not visible: {path}")]
+    TemplateNotFound { path: String },
     #[error("invalid update: {reason}")]
     InvalidUpdate { reason: String },
     #[error("{operation} denied for '{path}': {reason}")]
@@ -127,12 +158,9 @@ impl NewNoteRequest {
         let mut rendered = rendered.trim().trim_start_matches('/').to_string();
 
         if rendered.is_empty() {
-            rendered = format!("{base}/{date}-{slug}.md");
+            rendered = format!("{base}/{date}-{slug}");
         }
-        if !rendered.to_ascii_lowercase().ends_with(".md") {
-            rendered.push_str(".md");
-        }
-        rendered
+        with_file_type_extension(&rendered, self.file_type)
     }
 
     pub fn validate_write(&self) -> Result<String, WriteError> {
@@ -161,7 +189,8 @@ impl NewNoteRequest {
 
         let path = self.generate_path_with_settings_at(now, settings);
         let configured_prefix = format!("{}/", normalize_base_path(&settings.base_path));
-        let allowed = path.starts_with(&configured_prefix) && is_safe_new_note_path(&path);
+        let allowed =
+            path.starts_with(&configured_prefix) && is_safe_new_file_path(&path, self.file_type);
 
         if !allowed {
             return Err(WriteError::PathNotAllowed { path });
@@ -170,58 +199,43 @@ impl NewNoteRequest {
         Ok(path)
     }
 
-    pub fn to_markdown(&self, created_at: DateTime<Utc>) -> String {
-        let mut fm = serde_yaml::Mapping::new();
-
-        if let Some(source) = self.metadata.get("source").and_then(|v| v.as_str()) {
-            fm.insert(
-                serde_yaml::Value::String("source".to_string()),
-                serde_yaml::Value::String(source.to_string()),
-            );
+    pub fn apply_markdown_create_metadata(
+        &mut self,
+        created_at: DateTime<Utc>,
+        add_tags: &[String],
+        owner_principal: Option<&str>,
+    ) -> Result<(), WriteError> {
+        if !self.file_type.is_markdown() {
+            return Ok(());
         }
 
-        fm.insert(
-            serde_yaml::Value::String("created".to_string()),
-            serde_yaml::Value::String(created_at.to_rfc3339()),
+        let (frontmatter, body) = parse_frontmatter(&self.content);
+        if !frontmatter.is_object() {
+            return Err(WriteError::InvalidCreate {
+                reason: "markdown frontmatter must be a YAML mapping".to_string(),
+            });
+        }
+
+        let mut frontmatter = frontmatter;
+        let Some(map) = frontmatter.as_object_mut() else {
+            return Err(WriteError::InvalidCreate {
+                reason: "markdown frontmatter must be a YAML mapping".to_string(),
+            });
+        };
+        map.insert(
+            "created".to_string(),
+            Value::String(created_at.to_rfc3339()),
         );
 
-        if let Some(metadata_obj) = self.metadata.as_object() {
-            for (k, v) in metadata_obj {
-                // These fields are owned by the server-side formatter and are
-                // intentionally not overrideable by caller-supplied metadata.
-                if matches!(k.as_str(), "source" | "created" | "tags") {
-                    continue;
-                }
-                if let Ok(value) = serde_yaml::to_value(v) {
-                    fm.insert(serde_yaml::Value::String(k.clone()), value);
-                }
-            }
+        if !add_tags.is_empty() {
+            add_tags_to_frontmatter(&mut frontmatter, add_tags);
+        }
+        if let Some(principal) = owner_principal {
+            set_owner_metadata(&mut frontmatter, principal);
         }
 
-        if !self.tags.is_empty() {
-            fm.insert(
-                serde_yaml::Value::String("tags".to_string()),
-                serde_yaml::Value::Sequence(
-                    self.tags
-                        .iter()
-                        .map(|t| serde_yaml::Value::String(t.clone()))
-                        .collect(),
-                ),
-            );
-        }
-
-        let yaml = serde_yaml::to_string(&fm).unwrap_or_default();
-        let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
-        let content = self.content.trim();
-        let body = if content.is_empty() {
-            format!("# {}", self.title.trim())
-        } else if content_starts_with_h1(content) {
-            content.to_string()
-        } else {
-            format!("# {}\n\n{}", self.title.trim(), content)
-        };
-
-        format!("---\n{}---\n\n{}\n", yaml, body)
+        self.content = markdown_with_frontmatter(&frontmatter, &body)?;
+        Ok(())
     }
 }
 
@@ -375,11 +389,42 @@ fn invalid_patch(reason: impl Into<String>) -> WriteError {
     }
 }
 
-fn content_starts_with_h1(content: &str) -> bool {
-    content
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| line.trim_start().starts_with("# "))
+fn markdown_with_frontmatter(frontmatter: &Value, body: &str) -> Result<String, WriteError> {
+    let Some(frontmatter_obj) = frontmatter.as_object() else {
+        return Err(WriteError::InvalidCreate {
+            reason: "markdown frontmatter must be a YAML mapping".to_string(),
+        });
+    };
+    let yaml_mapping: serde_yaml::Mapping = frontmatter_obj
+        .iter()
+        .filter_map(|(k, v)| {
+            let yaml_value = serde_yaml::to_value(v).ok()?;
+            Some((serde_yaml::Value::String(k.clone()), yaml_value))
+        })
+        .collect();
+    let yaml = serde_yaml::to_string(&yaml_mapping).unwrap_or_default();
+    let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
+    let mut markdown = format!("---\n{}---\n\n{}", yaml, body);
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+    Ok(markdown)
+}
+
+fn add_tags_to_frontmatter(frontmatter: &mut Value, tags: &[String]) {
+    let mut merged_tags = extract_frontmatter_tags(frontmatter);
+    for tag in tags {
+        add_unique_tag(&mut merged_tags, tag);
+    }
+    merged_tags.sort();
+    merged_tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+    if let Some(map) = frontmatter.as_object_mut() {
+        map.insert(
+            "tags".to_string(),
+            Value::Array(merged_tags.into_iter().map(Value::String).collect()),
+        );
+    }
 }
 
 fn slug_with_limit(title: &str, max_len: usize) -> String {
@@ -457,8 +502,27 @@ fn trim_filename_segment(segment: String) -> String {
         .to_string()
 }
 
-fn is_safe_new_note_path(path: &str) -> bool {
-    if path.starts_with('/') || !path.to_ascii_lowercase().ends_with(".md") {
+fn with_file_type_extension(path: &str, file_type: NewNoteFileType) -> String {
+    let extension = format!(".{}", file_type.extension());
+    let lower = path.to_ascii_lowercase();
+    for existing_extension in [".md", ".base"] {
+        if lower.ends_with(existing_extension) {
+            return format!(
+                "{}{}",
+                &path[..path.len() - existing_extension.len()],
+                extension
+            );
+        }
+    }
+    format!("{path}{extension}")
+}
+
+fn is_safe_new_file_path(path: &str, file_type: NewNoteFileType) -> bool {
+    if path.starts_with('/')
+        || !path
+            .to_ascii_lowercase()
+            .ends_with(&format!(".{}", file_type.extension()))
+    {
         return false;
     }
 
@@ -522,14 +586,14 @@ fn normalized_template(path_template: &str) -> String {
 mod tests {
     use chrono::{TimeZone, Utc};
 
-    use super::{NewNotePathSettings, NewNoteRequest, WriteError};
+    use super::{NewNoteFileType, NewNotePathSettings, NewNoteRequest, WriteError};
 
     fn request(title: &str) -> NewNoteRequest {
         NewNoteRequest {
             title: title.to_string(),
             content: String::new(),
-            tags: Vec::new(),
-            metadata: serde_json::Value::Null,
+            template_id: None,
+            file_type: NewNoteFileType::Md,
         }
     }
 
@@ -588,6 +652,24 @@ mod tests {
             .expect("unsafe title characters should be sanitized");
 
         assert_eq!(path, "00New/C Notes Agent Draft v1.md");
+    }
+
+    #[test]
+    fn base_file_type_replaces_configured_markdown_extension() {
+        let settings = NewNotePathSettings {
+            base_path: "00New".to_string(),
+            path_template: "{base}/{title}.md".to_string(),
+            date_format: "%Y-%m-%d".to_string(),
+            max_title_slug_length: 60,
+        };
+
+        let mut request = request("Project Dashboard");
+        request.file_type = NewNoteFileType::Base;
+        let path = request
+            .validate_write_with_settings_at(fixed_now(), &settings)
+            .expect("valid base path");
+
+        assert_eq!(path, "00New/Project Dashboard.base");
     }
 
     #[test]

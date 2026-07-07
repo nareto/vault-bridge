@@ -160,7 +160,16 @@ fn write_error_metadata(error: &WriteError) -> ErrorMetadata {
             "The requested note is not visible or not editable in this context",
         )
         .with_http_status(404),
-        WriteError::EmptyTitle | WriteError::InvalidUpdate { .. } => ErrorMetadata::new(
+        WriteError::TemplateNotFound { .. } => ErrorMetadata::new(
+            ErrorCategory::Business,
+            false,
+            "resource not found",
+            error.to_string(),
+        )
+        .with_http_status(404),
+        WriteError::EmptyTitle
+        | WriteError::InvalidCreate { .. }
+        | WriteError::InvalidUpdate { .. } => ErrorMetadata::new(
             ErrorCategory::Validation,
             false,
             "write validation failed",

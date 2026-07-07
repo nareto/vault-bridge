@@ -243,7 +243,8 @@ of the configured file-backed API tokens.
 - Configure `new_note.path_template` for server-generated create paths.
   Supported tokens are `{base}`, `{date}`, `{slug}`, and `{title}`. Use
   `{title}` for human-readable filenames that preserve spaces and capitalization
-  after safety cleanup, or `{slug}` for lowercase hyphenated filenames.
+  after safety cleanup, or `{slug}` for lowercase hyphenated filenames. Create
+  requests choose the final extension with `file_type` (`md` or `base`).
 
 - Choose an embedding mode. Default `config.example.yaml` uses local CPU embeddings:
 

@@ -11,7 +11,7 @@ use tracing::warn;
 
 use crate::authorization::{
     AccessRule, AuthContext, AuthorizationConfig, ContextName, PolicyNote, add_unique_tag,
-    owner_from_frontmatter, set_owner_metadata,
+    owner_from_frontmatter,
 };
 use crate::config::EmbeddingConfig;
 use crate::context::{
@@ -24,11 +24,13 @@ use crate::livesync::{
     sequence_to_string,
 };
 use crate::markdown::{
-    breadcrumb_prefix, first_h1_title, markdown_plain_text, parse_markdown,
-    split_into_semantic_blocks,
+    breadcrumb_prefix, extract_frontmatter_tags, extract_tags, first_h1_title, markdown_plain_text,
+    parse_frontmatter, parse_markdown, split_into_semantic_blocks,
 };
 use crate::model::{Note, NoteId, UnscopedNote};
-use crate::new_note::{NewNotePathSettings, NewNoteRequest, UpdateNoteRequest, WriteError};
+use crate::new_note::{
+    NewNoteFileType, NewNotePathSettings, NewNoteRequest, UpdateNoteRequest, WriteError,
+};
 use crate::persistence::{
     BlockEmbeddingStats, BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias,
     PersistedLinkRecord, PersistedNoteRecord, PersistedSearchNote, PersistedStagedChunk,
@@ -377,6 +379,8 @@ impl BacklinksResponse {
 pub struct NewNoteResponse {
     pub id: NoteId,
     pub status: &'static str,
+    pub file_type: NewNoteFileType,
+    pub indexed_as_note: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -600,6 +604,7 @@ fn persisted_sync_state_is_newer(
 pub struct StoreInner {
     notes: HashMap<NoteId, StoredNote>,
     links: Vec<LinkRecord>,
+    created_file_paths: HashSet<String>,
     file_doc_paths: HashMap<String, String>,
     file_doc_revs: HashMap<String, String>,
     file_children: HashMap<String, Vec<String>>,
@@ -703,6 +708,7 @@ impl VaultStore {
             inner: Arc::new(RwLock::new(StoreInner {
                 notes: HashMap::new(),
                 links: Vec::new(),
+                created_file_paths: HashSet::new(),
                 file_doc_paths: HashMap::new(),
                 file_doc_revs: HashMap::new(),
                 file_children: HashMap::new(),
@@ -2466,7 +2472,8 @@ impl VaultStore {
             }
         }
 
-        if self.inner.read().await.notes.contains_key(&note_id) {
+        let guard = self.inner.read().await;
+        if guard.notes.contains_key(&note_id) || guard.created_file_paths.contains(&path) {
             return Err(WriteError::AlreadyExists { path });
         }
 
@@ -2480,19 +2487,11 @@ impl VaultStore {
         path: &str,
         now: DateTime<Utc>,
     ) -> Result<NewNoteRequest, WriteError> {
-        let owner = request
-            .metadata
-            .as_object()
-            .and_then(|_| owner_from_frontmatter(&request.metadata))
-            .map(str::to_string);
-        let note = PolicyNote {
-            path: path.to_string(),
-            title: request.title.trim().to_string(),
-            tags: request.tags.clone(),
-            created_at: Some(now),
-            updated_at: now,
-            owner,
-        };
+        validate_create_template_reference(&request)?;
+        if request.file_type == NewNoteFileType::Base {
+            validate_base_file_content(&request.content)?;
+        }
+        let note = policy_note_from_create_request(&request, path, now)?;
         let config = self.authorization_config().await;
         let Some(decision) = policy_decision_for(&config, auth, "create", &note, now) else {
             return Err(WriteError::PolicyDenied {
@@ -2502,25 +2501,12 @@ impl VaultStore {
             });
         };
 
-        for tag in decision.add_tags {
-            add_unique_tag(&mut request.tags, &tag);
-        }
-        request.tags.sort();
-        request.tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        let owner_principal = decision.set_owner.then_some(auth.principal.as_str());
+        request.apply_markdown_create_metadata(now, &decision.add_tags, owner_principal)?;
+        self.validate_create_template_content(auth, &request)
+            .await?;
 
-        if decision.set_owner {
-            set_owner_metadata(&mut request.metadata, &auth.principal);
-        }
-
-        let owner = owner_from_frontmatter(&request.metadata).map(str::to_string);
-        let note = PolicyNote {
-            path: path.to_string(),
-            title: request.title.trim().to_string(),
-            tags: request.tags.clone(),
-            created_at: Some(now),
-            updated_at: now,
-            owner,
-        };
+        let note = policy_note_from_create_request(&request, path, now)?;
         if !policy_allows(&config, auth, "create", &note, now) {
             return Err(WriteError::PolicyDenied {
                 operation: "create",
@@ -2534,15 +2520,52 @@ impl VaultStore {
         Ok(request)
     }
 
+    async fn validate_create_template_content(
+        &self,
+        auth: &AuthContext,
+        request: &NewNoteRequest,
+    ) -> Result<(), WriteError> {
+        let Some(template_id) = request.template_id.as_deref() else {
+            return Ok(());
+        };
+
+        match request.file_type {
+            NewNoteFileType::Md => {
+                let template = self
+                    .get_note_for_policy(auth, &NoteId::new(template_id.to_string()))
+                    .await
+                    .ok_or_else(|| WriteError::TemplateNotFound {
+                        path: template_id.to_string(),
+                    })?;
+                validate_markdown_content_against_template(&request.content, &template.frontmatter)
+            }
+            NewNoteFileType::Base => validate_base_file_content(&request.content),
+        }
+    }
+
     pub async fn create_note_at(
         &self,
         request: NewNoteRequest,
         now: DateTime<Utc>,
     ) -> Result<NewNoteResponse, WriteError> {
         let path = self.validate_new_note_write_at(&request, now).await?;
+
+        if !request.file_type.is_markdown() {
+            self.inner
+                .write()
+                .await
+                .created_file_paths
+                .insert(path.clone());
+            return Ok(NewNoteResponse {
+                id: NoteId::new(path),
+                status: "created",
+                file_type: request.file_type,
+                indexed_as_note: false,
+            });
+        }
+
         let max_link_context_chars = self.settings.read().await.max_link_context_chars;
-        let markdown = request.to_markdown(now);
-        let parsed = parse_markdown(&markdown, max_link_context_chars);
+        let parsed = parse_markdown(&request.content, max_link_context_chars);
 
         let links = parsed
             .links
@@ -2554,8 +2577,7 @@ impl VaultStore {
             })
             .collect::<Vec<_>>();
 
-        let mut tags = request.tags;
-        tags.extend(parsed.tags);
+        let mut tags = parsed.tags;
         tags.sort();
         tags.dedup();
 
@@ -2574,10 +2596,17 @@ impl VaultStore {
         };
 
         self.upsert_note(input).await;
+        self.inner
+            .write()
+            .await
+            .created_file_paths
+            .insert(path.clone());
 
         Ok(NewNoteResponse {
             id: NoteId::new(path),
             status: "created",
+            file_type: request.file_type,
+            indexed_as_note: true,
         })
     }
 
@@ -3588,6 +3617,7 @@ fn store_inner_from_persisted_notes(
     StoreInner {
         notes,
         links,
+        created_file_paths: HashSet::new(),
         file_doc_paths: HashMap::new(),
         file_doc_revs: HashMap::new(),
         file_children: HashMap::new(),
@@ -4005,6 +4035,134 @@ fn note_readable_for_policy_from_inner(
         return false;
     };
     policy_allows(config, auth, "read", &policy_note_from_stored(note), now)
+}
+
+fn policy_note_from_create_request(
+    request: &NewNoteRequest,
+    path: &str,
+    now: DateTime<Utc>,
+) -> Result<PolicyNote, WriteError> {
+    let (tags, owner) = create_request_tags_and_owner(request)?;
+    Ok(PolicyNote {
+        path: path.to_string(),
+        title: request.title.trim().to_string(),
+        tags,
+        created_at: Some(now),
+        updated_at: now,
+        owner,
+    })
+}
+
+fn create_request_tags_and_owner(
+    request: &NewNoteRequest,
+) -> Result<(Vec<String>, Option<String>), WriteError> {
+    if !request.file_type.is_markdown() {
+        return Ok((Vec::new(), None));
+    }
+
+    let (frontmatter, body) = parse_frontmatter(&request.content);
+    if !frontmatter.is_object() {
+        return Err(WriteError::InvalidCreate {
+            reason: "markdown frontmatter must be a YAML mapping".to_string(),
+        });
+    }
+    let mut tags = extract_tags(&body);
+    tags.extend(extract_frontmatter_tags(&frontmatter));
+    tags.sort();
+    tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    let owner = owner_from_frontmatter(&frontmatter).map(str::to_string);
+
+    Ok((tags, owner))
+}
+
+fn validate_create_template_reference(request: &NewNoteRequest) -> Result<(), WriteError> {
+    let Some(template_id) = request.template_id.as_deref() else {
+        return Ok(());
+    };
+    if !is_safe_template_id(template_id) {
+        return Err(WriteError::InvalidCreate {
+            reason: format!("template_id '{template_id}' is not a safe vault-relative path"),
+        });
+    }
+    let expected_suffix = format!(".{}", request.file_type.extension());
+    if !template_id.to_ascii_lowercase().ends_with(&expected_suffix) {
+        return Err(WriteError::InvalidCreate {
+            reason: format!("template_id must end with '{expected_suffix}' for this file_type"),
+        });
+    }
+    Ok(())
+}
+
+fn is_safe_template_id(template_id: &str) -> bool {
+    let template_id = template_id.trim();
+    !template_id.is_empty()
+        && !template_id.starts_with('/')
+        && template_id
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+fn validate_markdown_content_against_template(
+    content: &str,
+    template_frontmatter: &Value,
+) -> Result<(), WriteError> {
+    let Some(template_obj) = template_frontmatter.as_object() else {
+        return Ok(());
+    };
+    let (frontmatter, _) = parse_frontmatter(content);
+    let Some(content_obj) = frontmatter.as_object() else {
+        return Err(WriteError::InvalidCreate {
+            reason: "markdown content must have YAML mapping frontmatter when the template does"
+                .to_string(),
+        });
+    };
+
+    for (key, template_value) in template_obj {
+        if matches!(key.as_str(), "created" | "created_by" | "tags") {
+            continue;
+        }
+        let Some(content_value) = content_obj.get(key) else {
+            return Err(WriteError::InvalidCreate {
+                reason: format!("content is missing template frontmatter key '{key}'"),
+            });
+        };
+        if json_type_name(template_value) != json_type_name(content_value) {
+            return Err(WriteError::InvalidCreate {
+                reason: format!(
+                    "content frontmatter key '{key}' has type {}, expected {} from template",
+                    json_type_name(content_value),
+                    json_type_name(template_value)
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_base_file_content(content: &str) -> Result<(), WriteError> {
+    let value = serde_yaml::from_str::<serde_yaml::Value>(content).map_err(|error| {
+        WriteError::InvalidCreate {
+            reason: format!("base content is not valid YAML: {error}"),
+        }
+    })?;
+    if !matches!(value, serde_yaml::Value::Mapping(_)) {
+        return Err(WriteError::InvalidCreate {
+            reason: "base content must be a YAML mapping".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 #[derive(Debug, Default)]

@@ -174,7 +174,7 @@ async fn rest_permission_errors_are_structured() {
             "research-token",
             json!({
                 "title": "Denied Create",
-                "content": "This context has no create policy."
+                "content": "# Denied Create\n\nThis context has no create policy."
             }),
         ))
         .await
@@ -312,6 +312,82 @@ async fn custom_context_names_are_first_class() {
 }
 
 #[tokio::test]
+async fn create_note_with_template_id_rejects_missing_template_frontmatter() {
+    let app = test_app(test_config()).await;
+
+    let template = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/notes",
+            "external-dev-token",
+            json!({
+                "title": "Template Source",
+                "content": "---\nstatus: draft\n---\n\n# Template Source\n\nTemplate body."
+            }),
+        ))
+        .await
+        .expect("template create response");
+    assert_eq!(template.status(), StatusCode::OK);
+    let template = response_json(template).await;
+    let template_id = template["id"].as_str().expect("template id");
+
+    let create = app
+        .oneshot(post(
+            "/api/v1/notes",
+            "external-dev-token",
+            json!({
+                "title": "Template Consumer",
+                "template_id": template_id,
+                "content": "# Template Consumer\n\nMissing required frontmatter."
+            }),
+        ))
+        .await
+        .expect("create response");
+
+    assert_eq!(create.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(create).await;
+    assert!(
+        body["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("status"),
+        "template validation should report the missing key: {body}"
+    );
+}
+
+#[tokio::test]
+async fn create_base_file_uses_base_extension_without_indexing_note() {
+    let app = test_app(test_config()).await;
+
+    let create = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/notes",
+            "external-dev-token",
+            json!({
+                "title": "Project Dashboard",
+                "file_type": "base",
+                "content": "views:\n  - type: table\n    name: Dashboard\n"
+            }),
+        ))
+        .await
+        .expect("create response");
+
+    assert_eq!(create.status(), StatusCode::OK);
+    let created = response_json(create).await;
+    let id = created["id"].as_str().expect("created id");
+    assert!(id.ends_with("project-dashboard.base"));
+    assert_eq!(created["file_type"], "base");
+    assert_eq!(created["indexed_as_note"], false);
+
+    let read = app
+        .oneshot(get(&format!("/api/v1/notes/{id}"), "external-dev-token"))
+        .await
+        .expect("read response");
+    assert_eq!(read.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn create_note_applies_context_write_mutations() {
     let app = test_app(test_config()).await;
 
@@ -322,8 +398,7 @@ async fn create_note_applies_context_write_mutations() {
             "external-dev-token",
             json!({
                 "title": "Context Created Note",
-                "content": "Created through the context policy.",
-                "tags": ["custom"]
+                "content": "---\ntags: [custom]\n---\n\n# Context Created Note\n\nCreated through the context policy."
             }),
         ))
         .await
