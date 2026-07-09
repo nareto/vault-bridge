@@ -310,11 +310,7 @@ fn lookup_fingerprint(kind: &str, value: &str) -> String {
     digest.chars().take(16).collect()
 }
 
-fn log_vault_file_lookup_miss(
-    auth: &AuthContext,
-    lookup_value: &str,
-    visibility: NoteVisibility,
-) {
+fn log_vault_file_lookup_miss(auth: &AuthContext, lookup_value: &str, visibility: NoteVisibility) {
     info!(
         context = auth.context.as_str(),
         principal = auth.principal.as_str(),

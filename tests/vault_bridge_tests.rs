@@ -425,7 +425,10 @@ async fn create_base_file_uses_base_extension_without_indexing_note() {
 
     // Vault-files API returns the raw content.
     let read = app
-        .oneshot(get(&format!("/api/v1/vault-files/{id}"), "external-dev-token"))
+        .oneshot(get(
+            &format!("/api/v1/vault-files/{id}"),
+            "external-dev-token",
+        ))
         .await
         .expect("vault file read response");
     assert_eq!(read.status(), StatusCode::OK);

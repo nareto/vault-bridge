@@ -9,7 +9,7 @@ Use this when validating PRD Phase 4 MCP requirements:
 - Tool discovery (`tools/list`)
 - Tool-call flow for the PRD tool surface
 - Context behavior across external/local MCP tokens
-- End-to-end `new_note` creation through MCP
+- End-to-end `create_vault_file` creation through MCP
 
 ## Tests covered
 
@@ -86,11 +86,11 @@ After a passing live run:
 1. Configure Claude Code with the tested MCP endpoint (`/sse`).
 2. In a single session, execute:
    - `query_notes`
-   - `get_note`
+   - `get_vault_file`
    - `get_neighbors`
    - `list_tags`
-   - `new_note`
-3. Verify the created note appears in Obsidian under `11New/`.
+   - `create_vault_file`
+3. Verify the created file appears in Obsidian under `11New/`.
 4. If both contexts are available, verify:
    - external MCP cannot read the configured personal note
    - local MCP can read the same personal note

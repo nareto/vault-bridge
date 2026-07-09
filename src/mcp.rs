@@ -9,7 +9,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
 use core::convert::Infallible;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -43,19 +42,16 @@ const TOOL_DEFINITIONS_YAML: &str = include_str!("../config/mcp_tools.yaml");
 const EMBEDDED_IMAGE_BASE64_MIN_CHARS: usize = 512;
 const TOOLING_CATALOG_URI: &str = "vault-bridge://catalog/tooling.json";
 const OPENAPI_SCHEMA_URI: &str = "vault-bridge://schemas/openapi.json";
-const NOTE_RESOURCE_PREFIX: &str = "vault-bridge://notes/";
 const VAULT_FILE_RESOURCE_PREFIX: &str = "vault-bridge://files/";
 const READ_TOOL_NAMES: &[&str] = &[
-    "get_note",
     "get_vault_file",
-    "recent_notes",
     "query_notes",
     "query_base",
     "get_neighbors",
     "list_tags",
 ];
-const CREATE_TOOL_NAMES: &[&str] = &["new_note", "create_vault_file"];
-const EDIT_TOOL_NAMES: &[&str] = &["edit_note", "edit_vault_file"];
+const CREATE_TOOL_NAMES: &[&str] = &["create_vault_file"];
+const EDIT_TOOL_NAMES: &[&str] = &["edit_vault_file"];
 
 static EMBEDDED_IMAGE_DATA_URI_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!(
@@ -720,57 +716,6 @@ async fn read_resource_contents(
                 "text": serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string())
             })])
         }
-        _ if uri.starts_with(NOTE_RESOURCE_PREFIX) => {
-            let encoded_note_id = &uri[NOTE_RESOURCE_PREFIX.len()..];
-            let decoded_note_id = urlencoding::decode(encoded_note_id).map_err(|_| {
-                ErrorMetadata::new(
-                    ErrorCategory::Validation,
-                    false,
-                    "invalid note resource uri",
-                    format!(
-                        "note resource uri '{}' contains invalid percent-encoding in the note id",
-                        uri
-                    ),
-                )
-            })?;
-            let note_id = decoded_note_id.trim();
-            if note_id.is_empty() {
-                return Err(ErrorMetadata::new(
-                    ErrorCategory::Validation,
-                    false,
-                    "note id is required",
-                    "note resource URIs must include a non-empty canonical note id after vault-bridge://notes/",
-                ));
-            }
-
-            let response = state
-                .service
-                .get_note(auth, &NoteId::new(note_id))
-                .await
-                .map_err(|error| service_error_metadata(&error, Some("resources/read")))?;
-            let response = serde_json::to_value(response).map_err(|error| {
-                ErrorMetadata::new(
-                    ErrorCategory::Business,
-                    false,
-                    "serialization failed",
-                    format!("Failed to serialize note resource response: {error}"),
-                )
-            })?;
-            let (response, _) =
-                sanitize_tool_response("get_note", &json!({ "id": note_id }), response).map_err(
-                    |error| {
-                        error
-                            .with_tool("get_note")
-                            .to_error_metadata(Some("resources/read"))
-                    },
-                )?;
-
-            Ok(vec![json!({
-                "uri": uri,
-                "mimeType": "application/json",
-                "text": serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-            })])
-        }
         _ if uri.starts_with(VAULT_FILE_RESOURCE_PREFIX) => {
             let encoded_file_id = &uri[VAULT_FILE_RESOURCE_PREFIX.len()..];
             let decoded_file_id = urlencoding::decode(encoded_file_id).map_err(|_| {
@@ -1011,33 +956,6 @@ async fn execute_tool_call(
     arguments: &Value,
 ) -> Result<Value, McpError> {
     match tool_name {
-        "get_note" => {
-            let note = match optional_string(arguments, "id")?
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-            {
-                Some(id) => state
-                    .service
-                    .get_note(auth, &NoteId::new(id))
-                    .await
-                    .map_err(McpError::Service)?,
-                None => {
-                    let title = optional_string(arguments, "title")?
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| McpError::InvalidArguments {
-                            tool: tool_name.to_string(),
-                            message: "id or title is required".to_string(),
-                        })?;
-                    state
-                        .service
-                        .get_note_by_title(auth, &title)
-                        .await
-                        .map_err(McpError::Service)?
-                }
-            };
-            to_tool_value(note)
-        }
         "get_vault_file" => {
             let id = required_string(arguments, "id")?;
             let file = state
@@ -1046,33 +964,6 @@ async fn execute_tool_call(
                 .await
                 .map_err(McpError::Service)?;
             to_tool_value(file)
-        }
-        "recent_notes" => {
-            let since = match optional_string(arguments, "since")? {
-                Some(value) if !value.trim().is_empty() => Some(parse_datetime(&value)?),
-                _ => Some(
-                    DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
-                        .expect("static timestamp")
-                        .with_timezone(&Utc),
-                ),
-            };
-            let last_n_days = optional_usize(arguments, "last_n_days")?
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| McpError::InvalidArguments {
-                    tool: tool_name.to_string(),
-                    message: "last_n_days is too large".to_string(),
-                })?;
-            let since = if last_n_days.is_some() { None } else { since };
-            let limit = optional_usize(arguments, "limit")?;
-            validate_optional_usize_range(tool_name, "limit", limit, 0, MAX_NOTE_LIST_LIMIT)?;
-            let limit = limit.unwrap_or(20);
-            let response = state
-                .service
-                .recent_notes(auth, since, last_n_days, limit)
-                .await
-                .map_err(McpError::Service)?;
-            to_tool_value(response)
         }
         "query_notes" => {
             let request = deserialize_arguments::<QueryNotesRequest>(tool_name, arguments)?;
@@ -1128,7 +1019,7 @@ async fn execute_tool_call(
             let filter = deserialize_arguments::<NoteTimeFilter>(tool_name, arguments)?;
             to_tool_value(state.service.list_tags(auth, filter).await)
         }
-        "new_note" | "create_vault_file" => {
+        "create_vault_file" => {
             let request = deserialize_arguments::<NewNoteRequest>(tool_name, arguments)?;
             let response = state
                 .service
@@ -1137,28 +1028,19 @@ async fn execute_tool_call(
                 .map_err(McpError::Service)?;
             to_tool_value(response)
         }
-        "edit_note" | "edit_vault_file" => {
+        "edit_vault_file" => {
             let note_id = required_string(arguments, "id")?;
             let mut update_body = arguments.clone();
             if let Some(map) = update_body.as_object_mut() {
                 map.remove("id");
             }
             let request = deserialize_arguments::<UpdateNoteRequest>(tool_name, &update_body)?;
-            if tool_name == "edit_vault_file" {
-                let response = state
-                    .service
-                    .edit_vault_file(auth, &NoteId::new(note_id), request)
-                    .await
-                    .map_err(McpError::Service)?;
-                to_tool_value(response)
-            } else {
-                let response = state
-                    .service
-                    .update_note(auth, &NoteId::new(note_id), request)
-                    .await
-                    .map_err(McpError::Service)?;
-                to_tool_value(response)
-            }
+            let response = state
+                .service
+                .edit_vault_file(auth, &NoteId::new(note_id), request)
+                .await
+                .map_err(McpError::Service)?;
+            to_tool_value(response)
         }
         _ => Err(McpError::UnknownTool(tool_name.to_string())),
     }
@@ -1189,15 +1071,6 @@ where
     T: Serialize,
 {
     serde_json::to_value(value).map_err(McpError::Serialization)
-}
-
-fn parse_datetime(value: &str) -> Result<DateTime<Utc>, McpError> {
-    DateTime::parse_from_rfc3339(value.trim())
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(|_| McpError::InvalidArguments {
-            tool: "unknown".to_string(),
-            message: "datetime values must be RFC3339 timestamps".to_string(),
-        })
 }
 
 fn respond_with_log(
@@ -1763,16 +1636,12 @@ fn load_mcp_definition_file() -> McpDefinitionFile {
 fn supported_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "get_note"
-            | "get_vault_file"
-            | "recent_notes"
+        "get_vault_file"
             | "query_notes"
             | "query_base"
             | "get_neighbors"
             | "list_tags"
-            | "new_note"
             | "create_vault_file"
-            | "edit_note"
             | "edit_vault_file"
     )
 }
@@ -2082,17 +1951,6 @@ mod tests {
 
     #[test]
     fn tool_descriptions_call_out_key_edge_cases() {
-        let get_note = tool_named("get_note");
-        assert!(get_note.description.contains("404"));
-        assert!(get_note.description.contains("duplicate title"));
-        assert!(get_note.description.contains("raw"));
-        assert!(get_note.description.contains("heading_title"));
-
-        let recent_notes = tool_named("recent_notes");
-        assert!(recent_notes.description.contains("last_n_days"));
-        assert!(recent_notes.description.contains("takes precedence"));
-        assert!(recent_notes.description.contains("caps at 500"));
-
         let query_notes = tool_named("query_notes");
         assert!(query_notes.description.contains("semantic"));
         assert!(query_notes.description.contains("fulltext"));
@@ -2116,20 +1974,8 @@ mod tests {
         assert!(list_tags.description.contains("empty `tags`"));
         assert!(list_tags.description.contains("non-visible"));
 
-        let new_note = tool_named("new_note");
-        assert!(
-            new_note
-                .description
-                .contains("DEPRECATED")
-        );
-        assert!(new_note.description.contains("vault"));
-
         let create_vault_file = tool_named("create_vault_file");
-        assert!(
-            create_vault_file
-                .description
-                .contains("indexed_as_note")
-        );
+        assert!(create_vault_file.description.contains("indexed_as_note"));
         assert!(create_vault_file.description.contains("file_type"));
 
         let get_vault_file = tool_named("get_vault_file");
@@ -2140,21 +1986,10 @@ mod tests {
         assert!(edit_vault_file.description.contains("mutually exclusive"));
         assert!(edit_vault_file.description.contains("403"));
         assert!(edit_vault_file.description.contains("YAML"));
-
-        let edit_note = tool_named("edit_note");
-        assert!(edit_note.description.contains("mutually exclusive"));
-        assert!(edit_note.description.contains("match exactly once"));
-        assert!(edit_note.description.contains("403"));
     }
 
     #[test]
     fn tool_schema_caps_match_runtime_clamps() {
-        let recent_notes = tool_named("recent_notes");
-        assert_eq!(
-            recent_notes.input_schema["properties"]["limit"]["maximum"],
-            json!(MAX_NOTE_LIST_LIMIT)
-        );
-
         let query_notes = tool_named("query_notes");
         assert_eq!(
             query_notes.input_schema["properties"]["limit"]["maximum"],
@@ -2201,17 +2036,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {name} tool definition"))
         };
 
-        let recent_notes = find_tool("recent_notes");
-        assert_eq!(
-            recent_notes.input_schema["properties"]["limit"]["maximum"],
-            json!(MAX_NOTE_LIST_LIMIT)
-        );
-        assert_eq!(
-            recent_notes.input_schema["properties"]["limit"]["minimum"],
-            json!(0)
-        );
-        assert!(recent_notes.description.contains("500"));
-
         let query_notes = find_tool("query_notes");
         assert_eq!(
             query_notes.input_schema["properties"]["limit"]["maximum"],
@@ -2247,16 +2071,6 @@ mod tests {
     }
 
     #[test]
-    fn recent_notes_schema_is_client_compatible() {
-        let tool = tool_named("recent_notes");
-
-        assert!(tool.input_schema.get("anyOf").is_none());
-        assert!(tool.description.contains("omit both"));
-        assert!(tool.description.contains("Use returned `id` values"));
-        assert_eq!(tool.input_schema["properties"]["last_n_days"]["minimum"], 1);
-    }
-
-    #[test]
     fn query_notes_schema_exposes_structured_filters() {
         let tool = tool_named("query_notes");
 
@@ -2276,7 +2090,10 @@ mod tests {
             tool.input_schema["properties"]["title_exact"]["type"],
             "string"
         );
-        assert!(tool.description.contains("Use result `id` with `get_note`"));
+        assert!(
+            tool.description
+                .contains("Use result `id` with `get_vault_file`")
+        );
         assert!(tool.description.contains("heading_title"));
     }
 
@@ -2297,17 +2114,8 @@ mod tests {
     }
 
     #[test]
-    fn get_note_schema_clarifies_filename_title_lookup() {
-        let tool = tool_named("get_note");
-
-        assert!(tool.description.contains("filename-derived `title`"));
-        assert!(tool.description.contains("duplicate title matches"));
-        assert!(tool.description.contains("heading_title"));
-    }
-
-    #[test]
-    fn get_note_schema_exposes_raw_toggle() {
-        let tool = tool_named("get_note");
+    fn get_vault_file_schema_exposes_raw_toggle() {
+        let tool = tool_named("get_vault_file");
 
         assert_eq!(tool.input_schema["properties"]["raw"]["type"], "boolean");
         assert_eq!(tool.input_schema["properties"]["raw"]["default"], false);
@@ -2319,7 +2127,7 @@ mod tests {
         let content = format!("before ![img](data:image/png;base64,{payload}) after");
 
         let (sanitized, report) = sanitize_tool_response(
-            "get_note",
+            "get_vault_file",
             &json!({}),
             json!({ "content": content.clone() }),
         )
@@ -2342,7 +2150,7 @@ mod tests {
         let content = format!("![img](data:image/png;base64,{payload})");
 
         let (sanitized, report) = sanitize_tool_response(
-            "get_note",
+            "get_vault_file",
             &json!({"raw": true}),
             json!({ "content": content.clone() }),
         )
@@ -2355,7 +2163,7 @@ mod tests {
     #[test]
     fn sanitizer_rejects_non_boolean_raw_flag() {
         let error = sanitize_tool_response(
-            "get_note",
+            "get_vault_file",
             &json!({"raw": "true"}),
             json!({ "content": "x" }),
         )
@@ -2364,7 +2172,7 @@ mod tests {
         assert!(matches!(
             error,
             McpError::InvalidArguments { ref tool, ref message }
-                if tool == "get_note" && message.contains("raw must be a boolean")
+                if tool == "get_vault_file" && message.contains("raw must be a boolean")
         ));
     }
 
@@ -2383,7 +2191,7 @@ mod tests {
             log_request_outcome(
                 "/mcp",
                 "tools/call",
-                Some("get_note"),
+                Some("get_vault_file"),
                 StatusCode::NO_CONTENT,
                 true,
             );
@@ -2392,7 +2200,7 @@ mod tests {
         let output = logs.output();
         assert!(output.contains("endpoint=\"/mcp\""));
         assert!(output.contains("rpc_method=\"tools/call\""));
-        assert!(output.contains("tool_name=\"get_note\""));
+        assert!(output.contains("tool_name=\"get_vault_file\""));
         assert!(output.contains("status=204"));
     }
 }

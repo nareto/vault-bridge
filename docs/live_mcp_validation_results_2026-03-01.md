@@ -39,6 +39,6 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 ## Manual Claude Code Validation Checklist
 
 - [ ] Configure Claude Code to use the external MCP endpoint (`/sse`) under test.
-- [ ] In one session, confirm tool discovery and execute: `query_notes`, `get_note`, `get_neighbors`, `list_tags`, and `new_note`.
-- [ ] Verify `new_note` appears in Obsidian under `11New/` after sync.
+- [ ] In one session, confirm tool discovery and execute: `query_notes`, `get_vault_file`, `get_neighbors`, `list_tags`, and `create_vault_file`.
+- [ ] Verify `create_vault_file` output appears in Obsidian under `11New/` after sync.
 - [ ] If local MCP endpoint is configured, confirm a personal note is hidden from external context but readable from local context.

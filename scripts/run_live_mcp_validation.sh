@@ -96,8 +96,8 @@ mkdir -p "$(dirname "$REPORT_PATH")"
   echo "## Manual Claude Code Validation Checklist"
   echo
   echo "- [ ] Configure Claude Code to use the external MCP endpoint (\`/sse\`) under test."
-  echo "- [ ] In one session, confirm tool discovery and execute: \`query_notes\`, \`get_note\`, \`get_neighbors\`, \`list_tags\`, and \`new_note\`."
-  echo "- [ ] Verify \`new_note\` appears in Obsidian under \`11New/\` after sync."
+  echo "- [ ] In one session, confirm tool discovery and execute: \`query_notes\`, \`get_vault_file\`, \`get_neighbors\`, \`list_tags\`, and \`create_vault_file\`."
+  echo "- [ ] Verify \`create_vault_file\` output appears in Obsidian under \`11New/\` after sync."
   echo "- [ ] If a local-context MCP token is configured, confirm a personal note is hidden from external context but readable from local context."
 } > "$REPORT_PATH"
 

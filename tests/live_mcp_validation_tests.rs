@@ -230,18 +230,18 @@ async fn call_tool_expect_error(
         .to_string())
 }
 
-async fn wait_for_note_read(
+async fn wait_for_vault_file_read(
     client: &reqwest::Client,
     base_url: &str,
-    note_id: &str,
+    file_id: &str,
     timeout_after: Duration,
 ) -> Result<Value, String> {
     let deadline = Instant::now() + timeout_after;
     let mut last_error = String::new();
 
     while Instant::now() < deadline {
-        match call_tool(client, base_url, "get_note", json!({ "id": note_id })).await {
-            Ok(note) => return Ok(note),
+        match call_tool(client, base_url, "get_vault_file", json!({ "id": file_id })).await {
+            Ok(file) => return Ok(file),
             Err(error) => {
                 last_error = error;
                 sleep(Duration::from_secs(1)).await;
@@ -250,7 +250,7 @@ async fn wait_for_note_read(
     }
 
     Err(format!(
-        "timed out waiting for get_note success: {last_error}"
+        "timed out waiting for get_vault_file success: {last_error}"
     ))
 }
 
@@ -383,24 +383,6 @@ async fn live_mcp_external_context_tool_flow_matches_prd_surface() {
         );
     }
 
-    if tools.contains("recent_notes") {
-        let recent = call_tool(
-            &client,
-            &config.external_url,
-            "recent_notes",
-            json!({
-                "last_n_days": 14,
-                "limit": 5
-            }),
-        )
-        .await
-        .expect("recent_notes should succeed");
-        assert!(
-            recent.get("notes").is_some(),
-            "recent response should contain notes"
-        );
-    }
-
     if tools.contains("query_notes") {
         let queried = call_tool(
             &client,
@@ -434,58 +416,58 @@ async fn live_mcp_external_context_tool_flow_matches_prd_surface() {
         assert_eq!(status.get("status").and_then(Value::as_str), Some("ok"));
     }
 
-    if tools.contains("get_note")
+    if tools.contains("get_vault_file")
         && let Some(public_note_id) = config.public_note_id.as_deref()
     {
-        let public_note = call_tool(
+        let public_file = call_tool(
             &client,
             &config.external_url,
-            "get_note",
+            "get_vault_file",
             json!({ "id": public_note_id }),
         )
         .await
         .expect("configured public note id should be readable from external context");
-        assert_eq!(public_note["id"].as_str(), Some(public_note_id));
+        assert_eq!(public_file["id"].as_str(), Some(public_note_id));
     }
 
-    if tools.contains("new_note") && tools.contains("get_note") {
+    if tools.contains("create_vault_file") && tools.contains("get_vault_file") {
         let suffix = format!(
             "{}-{}",
             Utc::now().timestamp(),
             Utc::now().timestamp_subsec_nanos()
         );
         let title = format!("Live MCP Validation {suffix}");
-        let new_note = call_tool(
+        let new_file = call_tool(
             &client,
             &config.external_url,
-            "new_note",
+            "create_vault_file",
             json!({
                 "title": title,
                 "content": format!("---\ntags: [mcp-validation, integration]\nsource: live-mcp-validation-tests\nconfidence: 1.0\n---\n\n# {title}\n\nCreated from live MCP validation test.")
             }),
         )
         .await
-        .expect("new_note should succeed");
-        let created_id = new_note["id"]
+        .expect("create_vault_file should succeed");
+        let created_id = new_file["id"]
             .as_str()
-            .expect("new_note should return id")
+            .expect("create_vault_file should return id")
             .to_string();
 
-        let indexed_note = wait_for_note_read(
+        let indexed_file = wait_for_vault_file_read(
             &client,
             &config.external_url,
             &created_id,
             Duration::from_secs(60),
         )
         .await
-        .expect("created note should become readable through MCP");
-        assert_eq!(indexed_note["id"].as_str(), Some(created_id.as_str()));
+        .expect("created file should become readable through MCP");
+        assert_eq!(indexed_file["id"].as_str(), Some(created_id.as_str()));
         assert!(
-            indexed_note["content"]
+            indexed_file["content"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("Created from live MCP validation test."),
-            "indexed note content mismatch"
+            "raw file content mismatch"
         );
 
         if tools.contains("get_neighbors") {
@@ -571,14 +553,14 @@ async fn live_mcp_context_opacity_blocks_personal_notes_for_external_context() {
     let local_tools = discovered_tool_names(&local_client, local_url)
         .await
         .expect("local tools/list should succeed");
-    if !external_tools.contains("get_note") || !local_tools.contains("get_note") {
+    if !external_tools.contains("get_vault_file") || !local_tools.contains("get_vault_file") {
         return;
     }
 
     let external_error = call_tool_expect_error(
         &external_client,
         &config.external_url,
-        "get_note",
+        "get_vault_file",
         json!({ "id": personal_note_id }),
     )
     .await
@@ -591,13 +573,13 @@ async fn live_mcp_context_opacity_blocks_personal_notes_for_external_context() {
         "unexpected external read error: {external_error}"
     );
 
-    let local_note = call_tool(
+    let local_file = call_tool(
         &local_client,
         local_url,
-        "get_note",
+        "get_vault_file",
         json!({ "id": personal_note_id }),
     )
     .await
     .expect("local context should read personal note");
-    assert_eq!(local_note["id"].as_str(), Some(personal_note_id));
+    assert_eq!(local_file["id"].as_str(), Some(personal_note_id));
 }

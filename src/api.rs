@@ -451,7 +451,10 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/notes", post(create_note))
         .route("/api/v1/notes/{*id}", get(get_note).put(update_note))
         .route("/api/v1/vault-files", post(create_vault_file_endpoint))
-        .route("/api/v1/vault-files/{*id}", get(get_vault_file_endpoint).put(edit_vault_file_endpoint))
+        .route(
+            "/api/v1/vault-files/{*id}",
+            get(get_vault_file_endpoint).put(edit_vault_file_endpoint),
+        )
         .route("/api/v1/search", get(search_notes))
         .route("/api/v1/neighbors/{*id}", get(get_neighbors))
         .route("/api/v1/backlinks/{*id}", get(get_backlinks))

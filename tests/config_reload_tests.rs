@@ -271,7 +271,11 @@ async fn mcp_tool_discovery_reloads_context_capabilities() {
     assert_eq!(before.status(), StatusCode::OK);
     let before_payload = response_json(before).await;
     let before_tools = mcp_tool_names(&before_payload);
-    assert!(before_tools.contains(&"get_note".to_string()));
+    assert!(before_tools.contains(&"get_vault_file".to_string()));
+    assert!(!before_tools.contains(&"create_vault_file".to_string()));
+    assert!(!before_tools.contains(&"edit_vault_file".to_string()));
+    assert!(!before_tools.contains(&"get_note".to_string()));
+    assert!(!before_tools.contains(&"recent_notes".to_string()));
     assert!(!before_tools.contains(&"new_note".to_string()));
     assert!(!before_tools.contains(&"edit_note".to_string()));
 
@@ -291,9 +295,13 @@ async fn mcp_tool_discovery_reloads_context_capabilities() {
     assert_eq!(after.status(), StatusCode::OK);
     let after_payload = response_json(after).await;
     let after_tools = mcp_tool_names(&after_payload);
-    assert!(after_tools.contains(&"get_note".to_string()));
-    assert!(after_tools.contains(&"new_note".to_string()));
-    assert!(after_tools.contains(&"edit_note".to_string()));
+    assert!(after_tools.contains(&"get_vault_file".to_string()));
+    assert!(after_tools.contains(&"create_vault_file".to_string()));
+    assert!(after_tools.contains(&"edit_vault_file".to_string()));
+    assert!(!after_tools.contains(&"get_note".to_string()));
+    assert!(!after_tools.contains(&"recent_notes".to_string()));
+    assert!(!after_tools.contains(&"new_note".to_string()));
+    assert!(!after_tools.contains(&"edit_note".to_string()));
 }
 
 #[tokio::test]

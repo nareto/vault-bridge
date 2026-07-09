@@ -183,6 +183,41 @@ async fn assemble_context_is_not_exposed_as_mcp_tool() {
 }
 
 #[tokio::test]
+async fn removed_legacy_mcp_tools_are_unknown() {
+    let (state, _dir) = test_state("external").await;
+    let app = app_router(state);
+
+    for (index, tool_name) in ["get_note", "recent_notes", "new_note", "edit_note"]
+        .into_iter()
+        .enumerate()
+    {
+        let response = app
+            .clone()
+            .oneshot(authorized_request(mcp_call(
+                json!(index + 1),
+                "tools/call",
+                json!({
+                    "name": tool_name,
+                    "arguments": {}
+                }),
+            )))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["error"]["message"], json!("unknown tool"));
+        assert!(
+            !payload["error"]["data"]["details"]["availableTools"]
+                .as_array()
+                .expect("available tools")
+                .contains(&json!(tool_name)),
+            "{tool_name} should not be advertised in unknown-tool metadata"
+        );
+    }
+}
+
+#[tokio::test]
 async fn tools_list_hides_mutation_tools_for_read_only_context() {
     let (state, _dir) = test_state("read-only").await;
     let app = app_router(state);
@@ -199,8 +234,11 @@ async fn tools_list_hides_mutation_tools_for_read_only_context() {
     assert_eq!(response.status(), StatusCode::OK);
     let payload = response_json(response).await;
     let tools = tool_names(&payload);
-    assert!(tools.contains(&"get_note".to_string()));
-    assert!(tools.contains(&"recent_notes".to_string()));
+    assert!(tools.contains(&"get_vault_file".to_string()));
+    assert!(!tools.contains(&"create_vault_file".to_string()));
+    assert!(!tools.contains(&"edit_vault_file".to_string()));
+    assert!(!tools.contains(&"get_note".to_string()));
+    assert!(!tools.contains(&"recent_notes".to_string()));
     assert!(!tools.contains(&"new_note".to_string()));
     assert!(!tools.contains(&"edit_note".to_string()));
 }
@@ -239,14 +277,15 @@ async fn tooling_catalog_reflects_read_only_context_capabilities() {
         json!(false)
     );
     assert_eq!(catalog["boundaries"]["capabilities"]["edit"], json!(false));
-    assert!(tools.contains(&"get_note".to_string()));
-    assert!(!tools.contains(&"new_note".to_string()));
+    assert!(tools.contains(&"get_vault_file".to_string()));
+    assert!(!tools.contains(&"create_vault_file".to_string()));
     assert!(
         catalog["boundaries"]["unavailableTools"]
             .as_array()
             .expect("unavailable tools")
             .iter()
-            .any(|entry| entry["name"] == "new_note" && entry["requiredCapability"] == "create")
+            .any(|entry| entry["name"] == "create_vault_file"
+                && entry["requiredCapability"] == "create")
     );
 }
 
@@ -260,8 +299,8 @@ async fn tool_call_rejects_unavailable_tool_for_context_before_service_policy() 
             Value::from(1),
             "tools/call",
             json!({
-                "name": "new_note",
-                "arguments": {"title": "Should not be created"}
+                "name": "create_vault_file",
+                "arguments": {"title": "Should not be created", "content": "# Should not be created\n"}
             }),
         )))
         .await
@@ -285,8 +324,8 @@ async fn tool_call_rejects_unavailable_tool_for_context_before_service_policy() 
     let available = payload["result"]["structuredContent"]["details"]["availableTools"]
         .as_array()
         .expect("available tools");
-    assert!(available.contains(&json!("get_note")));
-    assert!(!available.contains(&json!("new_note")));
+    assert!(available.contains(&json!("get_vault_file")));
+    assert!(!available.contains(&json!("create_vault_file")));
 }
 
 #[tokio::test]
@@ -300,7 +339,7 @@ async fn tool_call_uses_token_context_permissions() {
             Value::from(1),
             "tools/call",
             json!({
-                "name": "get_note",
+                "name": "get_vault_file",
                 "arguments": {"id": "03Concepts/rust-phantom-types.md"}
             }),
         )))
@@ -318,7 +357,7 @@ async fn tool_call_uses_token_context_permissions() {
             Value::from(2),
             "tools/call",
             json!({
-                "name": "get_note",
+                "name": "get_vault_file",
                 "arguments": {"id": "00Journal/private.md"}
             }),
         )))
@@ -337,11 +376,6 @@ async fn tool_call_rejects_arguments_outside_advertised_caps() {
     let (state, _dir) = test_state("external").await;
     let app = app_router(state);
     let cases = [
-        (
-            "recent_notes",
-            json!({"limit": MAX_NOTE_LIST_LIMIT + 1}),
-            format!("limit must be between 0 and {MAX_NOTE_LIST_LIMIT}"),
-        ),
         (
             "query_notes",
             json!({"limit": MAX_NOTE_LIST_LIMIT + 1}),

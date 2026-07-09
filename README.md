@@ -73,9 +73,9 @@ surfaces:
 
 The MCP tools are deliberately small:
 
-- **Read**: `get_note`, `recent_notes`
+- **Read**: `get_vault_file`
 - **Retrieve**: `query_notes`, `query_base`, `get_neighbors`, `list_tags`
-- **Write**: `new_note`, `edit_note`
+- **Write**: `create_vault_file`, `edit_vault_file`
 
 Small tools are easier for agents to choose correctly and easier for humans to
 inspect. Non-agent software can use REST directly instead of pretending to be an
@@ -241,7 +241,7 @@ of the configured file-backed API tokens.
   created/updated time. Created notes can receive policy-driven tags and owner
   metadata; editable notes can preserve configured tags such as `ai-editable`.
 
-- Configure `new_note.path_template` for server-generated create paths.
+- Configure `new_note.path_template` for server-generated vault-file create paths.
   Supported tokens are `{base}`, `{date}`, `{slug}`, and `{title}`. Use
   `{title}` for human-readable filenames that preserve spaces and capitalization
   after safety cleanup, or `{slug}` for lowercase hyphenated filenames. Create
@@ -425,14 +425,14 @@ retrieval:
    it is returned as not found or not visible.
 2. Use REST `POST /api/v1/assemble-context` with public seed notes, a search
    query, and graph expansion enabled to show combined search and graph context.
-3. Use the MCP `query_notes`, `get_note`, and `get_neighbors` tools from the
-   same restricted context to show the agent-facing read surface.
-4. Use MCP `new_note` to create a controlled demo note, then use `edit_note`
-   only if the note matches the configured edit policy.
+3. Use the MCP `query_notes`, `get_vault_file`, and `get_neighbors` tools from
+   the same restricted context to show the agent-facing read surface.
+4. Use MCP `create_vault_file` to create a controlled demo note, then use
+   `edit_vault_file` only if the note matches the configured edit policy.
 5. Confirm the created or edited note syncs through CouchDB into Obsidian.
 
 `assemble_context` is intentionally a REST endpoint rather than an MCP tool.
-MCP clients should compose the smaller note, query, and graph tools unless the
+MCP clients should compose the smaller file, query, and graph tools unless the
 calling application deliberately uses the REST API.
 
 ## C) Add MCP Server to Claude Desktop, Claude Code, and Codex

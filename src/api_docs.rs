@@ -94,16 +94,16 @@ pub(crate) fn openapi_spec() -> Value {
                     "properties": {
                         "id": {
                             "type": "string",
-                            "description": "Canonical vault-relative note ID. Pass this unchanged to `get_note(id=...)`."
+                            "description": "Canonical vault-relative note ID. Pass this unchanged to `get_vault_file(id=...)` when exact file content is needed."
                         },
                         "path": {"type": "string"},
                         "title": {
                             "type": "string",
-                            "description": "Exact filename-derived title. This is the exact key accepted by `get_note(title=...)` and may differ from the first markdown H1."
+                            "description": "Exact filename-derived title. Use `query_notes(title_exact=...)` for title lookup; this may differ from the first markdown H1."
                         },
                         "heading_title": {
                             "type": ["string", "null"],
-                            "description": "First markdown H1 when present. Display-only metadata; do not use this as an exact `get_note(title=...)` lookup key."
+                            "description": "First markdown H1 when present. Display-only metadata; do not use this as an exact title lookup key."
                         },
                         "content": {"type": "string"},
                         "summary": {"type": "string"},
@@ -153,15 +153,15 @@ pub(crate) fn openapi_spec() -> Value {
                     "properties": {
                         "id": {
                             "type": "string",
-                            "description": "Canonical vault-relative note ID. Pass this unchanged to `get_note(id=...)`."
+                            "description": "Canonical vault-relative note ID. Pass this unchanged to `get_vault_file(id=...)` when exact file content is needed."
                         },
                         "title": {
                             "type": "string",
-                            "description": "Exact filename-derived title. This is the exact key accepted by `get_note(title=...)` and may differ from the first markdown H1."
+                            "description": "Exact filename-derived title. Use `query_notes(title_exact=...)` for title lookup; this may differ from the first markdown H1."
                         },
                         "heading_title": {
                             "type": ["string", "null"],
-                            "description": "First markdown H1 when present. Display-only metadata; do not use this as an exact `get_note(title=...)` lookup key."
+                            "description": "First markdown H1 when present. Display-only metadata; do not use this as an exact title lookup key."
                         },
                         "summary": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},

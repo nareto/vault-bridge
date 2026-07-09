@@ -1376,9 +1376,7 @@ impl VaultStore {
                                 let file_timestamps =
                                     note_timestamp_hints_for_parent_locked(&guard, &note.parent_id);
                                 let created_at = file_timestamps.created_at;
-                                let updated_at = file_timestamps
-                                    .updated_at
-                                    .unwrap_or(now);
+                                let updated_at = file_timestamps.updated_at.unwrap_or(now);
                                 upsert_vault_file_locked(
                                     &mut guard,
                                     &note.parent_id,
@@ -1388,8 +1386,7 @@ impl VaultStore {
                                     updated_at,
                                     now,
                                 );
-                                vault_file_changed_paths
-                                    .insert(note.parent_id.clone());
+                                vault_file_changed_paths.insert(note.parent_id.clone());
 
                                 if is_md {
                                     index_reassembled_note_locked(
@@ -1515,11 +1512,9 @@ impl VaultStore {
                     indexed_at: vf.indexed_at,
                 })
                 .collect::<Vec<_>>();
-            vault_file_persisted_upserts
-                .sort_by(|a, b| a.path.cmp(&b.path));
-            let mut vault_file_persisted_deletes = vault_file_deleted_paths
-                .into_iter()
-                .collect::<Vec<_>>();
+            vault_file_persisted_upserts.sort_by(|a, b| a.path.cmp(&b.path));
+            let mut vault_file_persisted_deletes =
+                vault_file_deleted_paths.into_iter().collect::<Vec<_>>();
             vault_file_persisted_deletes.sort();
             vault_file_persisted_deletes.dedup();
 
@@ -2912,15 +2907,21 @@ impl VaultStore {
         auth: &AuthContext,
         file_id: &NoteId,
     ) -> NoteVisibility {
-        self.prepare_cached_read("vault file visibility lookup").await;
+        self.prepare_cached_read("vault file visibility lookup")
+            .await;
         let guard = self.inner.read().await;
         let path = file_id.as_str();
         match guard.vault_files.get(path) {
             None => NoteVisibility::Missing,
             Some(_) => {
                 let config = self.authorization_config().await;
-                if vault_file_readable_for_policy_from_inner(&guard, &config, auth, path, Utc::now())
-                {
+                if vault_file_readable_for_policy_from_inner(
+                    &guard,
+                    &config,
+                    auth,
+                    path,
+                    Utc::now(),
+                ) {
                     NoteVisibility::Accessible
                 } else {
                     NoteVisibility::Filtered
@@ -2964,8 +2965,8 @@ impl VaultStore {
             return Err(WriteError::PolicyDenied {
                 operation: "create",
                 path: path.clone(),
-                reason:
-                    "created content would not satisfy the effective authorization policy".to_string(),
+                reason: "created content would not satisfy the effective authorization policy"
+                    .to_string(),
             });
         }
 
@@ -3066,8 +3067,7 @@ impl VaultStore {
             return Err(WriteError::PolicyDenied {
                 operation: "edit",
                 path: path.clone(),
-                reason:
-                    "no matching edit rule in the effective authorization policy".to_string(),
+                reason: "no matching edit rule in the effective authorization policy".to_string(),
             });
         };
 
@@ -3821,7 +3821,21 @@ impl VaultStore {
         ];
 
         for note in notes {
+            let path = note.id.as_str().to_string();
+            let raw_content = markdown_from_seed_note(&note.frontmatter, &note.content);
+            let created_at = note.created_at;
+            let updated_at = note.updated_at;
             self.upsert_note(note).await;
+            let mut guard = self.inner.write().await;
+            upsert_vault_file_locked(
+                &mut guard,
+                &path,
+                &raw_content,
+                "1-seed",
+                created_at,
+                updated_at,
+                now,
+            );
         }
 
         self.set_sync_state("1547", "1549").await;
@@ -3889,6 +3903,30 @@ async fn fetch_localai_search_embedding(
     }
 
     Ok(embedding)
+}
+
+fn markdown_from_seed_note(frontmatter: &Value, body: &str) -> String {
+    let Some(frontmatter_obj) = frontmatter.as_object() else {
+        return body.to_string();
+    };
+    if frontmatter_obj.is_empty() {
+        return body.to_string();
+    }
+
+    let yaml_mapping: serde_yaml::Mapping = frontmatter_obj
+        .iter()
+        .filter_map(|(key, value)| {
+            let yaml_value = serde_yaml::to_value(value).ok()?;
+            Some((serde_yaml::Value::String(key.clone()), yaml_value))
+        })
+        .collect();
+    let yaml = serde_yaml::to_string(&yaml_mapping).unwrap_or_default();
+    let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
+    let mut markdown = format!("---\n{}---\n\n{}", yaml, body);
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+    markdown
 }
 
 fn upsert_note_locked(guard: &mut StoreInner, note: NoteInput, indexed_at: DateTime<Utc>) {
