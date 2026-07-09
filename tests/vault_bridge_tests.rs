@@ -392,6 +392,7 @@ async fn create_note_with_template_id_rejects_missing_template_frontmatter() {
 #[tokio::test]
 async fn create_base_file_uses_base_extension_without_indexing_note() {
     let app = test_app(test_config()).await;
+    let content = "views:\n  - type: table\n    name: Dashboard\n";
 
     let create = app
         .clone()
@@ -401,7 +402,7 @@ async fn create_base_file_uses_base_extension_without_indexing_note() {
             json!({
                 "title": "Project Dashboard",
                 "file_type": "base",
-                "content": "views:\n  - type: table\n    name: Dashboard\n"
+                "content": content
             }),
         ))
         .await
@@ -414,11 +415,25 @@ async fn create_base_file_uses_base_extension_without_indexing_note() {
     assert_eq!(created["file_type"], "base");
     assert_eq!(created["indexed_as_note"], false);
 
-    let read = app
+    // Notes API still 404s because base files are not indexed notes.
+    let read_note = app
+        .clone()
         .oneshot(get(&format!("/api/v1/notes/{id}"), "external-dev-token"))
         .await
-        .expect("read response");
-    assert_eq!(read.status(), StatusCode::NOT_FOUND);
+        .expect("note read response");
+    assert_eq!(read_note.status(), StatusCode::NOT_FOUND);
+
+    // Vault-files API returns the raw content.
+    let read = app
+        .oneshot(get(&format!("/api/v1/vault-files/{id}"), "external-dev-token"))
+        .await
+        .expect("vault file read response");
+    assert_eq!(read.status(), StatusCode::OK);
+    let file = response_json(read).await;
+    assert_eq!(file["id"], json!(id));
+    assert_eq!(file["file_type"], "base");
+    assert_eq!(file["content"], content);
+    assert!(file["size_bytes"].as_u64().unwrap_or(0) > 0);
 }
 
 #[tokio::test]

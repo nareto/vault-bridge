@@ -144,12 +144,20 @@ pub fn normalize_note_path(path: &str) -> String {
     path.trim().trim_start_matches('/').replace('\\', "/")
 }
 
-/// Best-effort note id extraction from a file metadata document.
-pub fn file_document_note_id(file: &FileDocument) -> Option<String> {
+/// Best-effort vault file id extraction from a file metadata document.
+///
+/// Returns a vault-relative path for supported text file types (.md, .base).
+pub fn file_document_vault_file_id(file: &FileDocument) -> Option<String> {
     if !is_supported_note_file_type(&file.doc_type) {
         return None;
     }
 
+    let normalized = normalize_note_path(&file.path);
+    is_supported_vault_file_path(&normalized).then_some(normalized)
+}
+
+/// Legacy alias for sync code that only needs markdown note IDs.
+pub fn file_document_note_id(file: &FileDocument) -> Option<String> {
     let normalized = normalize_note_path(&file.path);
     (is_markdown_note_path(&normalized)).then_some(normalized)
 }
@@ -473,4 +481,10 @@ fn is_supported_note_file_type(doc_type: &str) -> bool {
 
 pub(crate) fn is_markdown_note_path(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".md")
+}
+
+/// Returns true for supported vault text file paths (.md, .base).
+pub(crate) fn is_supported_vault_file_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".base")
 }

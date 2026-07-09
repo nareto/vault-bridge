@@ -24,14 +24,20 @@ resourceTemplates:
   - id: note_by_id
     uriTemplate: vault-bridge://notes/{id}
     name: Vault Note By ID
-    description: "Read a note by exact canonical vault-relative ID when you already know the path, for example `vault-bridge://notes/03Concepts/rust-phantom-types.md`. Returns the same sanitized note payload shape as `get_note(id=...)`."
+    description: "Read an indexed Markdown note by exact canonical vault-relative ID when you already know the path, for example `vault-bridge://notes/03Concepts/rust-phantom-types.md`. Returns the same sanitized note payload shape as `get_note(id=...)`."
+    mimeType: application/json
+
+  - id: vault_file_by_id
+    uriTemplate: vault-bridge://files/{id}
+    name: Vault File By ID
+    description: "Read a raw vault file by exact canonical vault-relative ID, for example `vault-bridge://files/11New/dashboard.base`. Returns raw content plus file metadata; supports `.md` and `.base` files."
     mimeType: application/json
 
 
 tools:
   - id: get_note
     name: get_note
-    description: "Read one note by exact vault-relative `id` (preferred) or case-insensitive exact filename-derived `title`; if both are present, `id` wins. Example: `{ \"id\": \"03Concepts/rust-phantom-types.md\" }`, or `{ \"title\": \"rust-phantom-types\", \"raw\": true }` when you need unsanitized embedded image data. A 404 means the note is missing or not visible to this token; duplicate title matches resolve to the most recently updated visible note, so use IDs from search/list responses when possible. `heading_title` is display-only and not a lookup key."
+    description: "Read one indexed Markdown note by exact vault-relative `.md` id (preferred) or case-insensitive exact filename-derived `title`; if both are present, `id` wins. Does NOT read raw vault files such as `.base`; use `get_vault_file` for those. Example: `{ \"id\": \"03Concepts/rust-phantom-types.md\" }`, or `{ \"title\": \"rust-phantom-types\", \"raw\": true }` when you need unsanitized embedded image data. A 404 means the note is missing or not visible to this token; duplicate title matches resolve to the most recently updated visible note, so use IDs from search/list responses when possible. `heading_title` is display-only and not a lookup key."
     inputSchema:
       type: object
       properties:
@@ -48,7 +54,7 @@ tools:
 
   - id: recent_notes
     name: recent_notes
-    description: "List visible notes ordered by stored update time. Example: `{ \"last_n_days\": 7, \"limit\": 20 }`; use `since` for an absolute RFC3339 cutoff, and `last_n_days` takes precedence if both are supplied. You can omit both for newest visible notes across history; limit defaults to 20 and caps at 500, so check `total` for more available results. Use returned `id` values with `get_note`."
+    description: "List visible indexed Markdown notes ordered by stored update time. Example: `{ \"last_n_days\": 7, \"limit\": 20 }`; use `since` for an absolute RFC3339 cutoff, and `last_n_days` takes precedence if both are supplied. You can omit both for newest visible notes across history; limit defaults to 20 and caps at 500, so check `total` for more available results. Use returned `id` values with `get_note`."
     inputSchema:
       type: object
       properties:
@@ -69,7 +75,7 @@ tools:
 
   - id: query_notes
     name: query_notes
-    description: "Filter and rank visible notes. Example: `{ \"tags_all\": [\"project\"], \"sort_by\": \"updated_at\", \"sort_order\": \"desc\" }` lists notes carrying the exact case-sensitive tag; add `text_query` and `search_mode: \"hybrid\"` for ranked search. Use `semantic`, `fulltext`, or `hybrid`, and combine tag/time/frontmatter/path/title filters. Empty `notes` means no visible matches after filters; limit defaults to 20 and caps at 500. Use result `id` with `get_note`, not `heading_title`."
+    description: "Filter and rank visible indexed Markdown notes. Example: `{ \"tags_all\": [\"project\"], \"sort_by\": \"updated_at\", \"sort_order\": \"desc\" }` lists notes carrying the exact case-sensitive tag; add `text_query` and `search_mode: \"hybrid\"` for ranked search. Use `semantic`, `fulltext`, or `hybrid`, and combine tag/time/frontmatter/path/title filters. Empty `notes` means no visible matches after filters; limit defaults to 20 and caps at 500. Use result `id` with `get_note`, not `heading_title`."
     inputSchema:
       type: object
       properties:
@@ -206,9 +212,9 @@ tools:
           format: date-time
           description: Only count tags from notes updated on or before this RFC3339 timestamp
 
-  - id: new_note
-    name: new_note
-    description: "Create a new vault file in the configured new-note location. The server generates the path from `title` and `file_type`; `content` is complete file content, not a body fragment. Example: `{ \"title\": \"Sync Notes\", \"content\": \"# Sync Notes\\n\\nBody\" }`."
+  - id: create_vault_file
+    name: create_vault_file
+    description: "Create a new vault file in the configured new-file location. The server generates the path from `title` and `file_type`; `content` is complete raw file content, not a body fragment. For `md` files, include the full Markdown including YAML frontmatter if needed; server policy may add managed frontmatter such as tags/owner/created. For `base` files, provide the full Bases YAML content. Returns `indexed_as_note` indicating whether the file was also indexed as a parsed Markdown note (only `.md` files). Example: `{ \"title\": \"Sync Notes\", \"content\": \"# Sync Notes\\n\\nBody\", \"file_type\": \"md\" }`."
     inputSchema:
       type: object
       properties:
@@ -217,7 +223,7 @@ tools:
           description: "Human-readable title for filename generation. Do not include a folder or extension."
         content:
           type: string
-          description: "Complete raw file content. For `md`, include the full Markdown file, including YAML frontmatter if needed; server policy may add managed frontmatter such as tags/owner/created. For `base`, provide the full Bases file content."
+          description: "Complete raw file content."
         template_id:
           type: string
           description: "Optional exact vault-relative template path used to produce this content. Read the template first; do not guess."
@@ -228,21 +234,32 @@ tools:
           description: "File extension/type to create. Defaults to `md`; use `base` for Obsidian Bases files."
       required: [title, content]
 
-  - id: edit_note
-    name: edit_note
-    description: "Edit a visible note if policy allows it. Example: `{ \"id\": \"11New/sync-notes.md\", \"content_patch\": [{\"op\": \"replace\", \"old\": \"old text\", \"new\": \"new text\"}] }`; `content` and `content_patch` are mutually exclusive, patch anchors/old text must match exactly once after prior operations, and policy-denied edits return 403. Tags replace the tag set except preserved policy tags."
+  - id: get_vault_file
+    name: get_vault_file
+    description: "Read one raw readable vault file by exact vault-relative `id`. Example: `{ \"id\": \"11New/dashboard.base\" }` reads a Bases file; `{ \"id\": \"03Concepts/rust-phantom-types.md\" }` reads a Markdown file raw (including YAML frontmatter). Returns raw text content plus file metadata. Enforces the same read policy boundaries as notes. A 404 means the file is missing or not visible to this token."
     inputSchema:
       type: object
       properties:
         id:
           type: string
-          description: "Vault-relative note ID"
+          description: "Exact vault-relative file ID (e.g. '11New/dashboard.base')"
+      required: [id]
+
+  - id: edit_vault_file
+    name: edit_vault_file
+    description: "Edit a raw readable vault file by exact `id` if policy allows it. `content` and `content_patch` are mutually exclusive. Supports raw text replacement or patch operations on any file type. `metadata` and `tags` parameters are only valid for `.md` files; they are rejected for `.base` files. For `.base` files, the resulting content is validated as YAML. A 403 means the edit was denied by policy. Example: `{ \"id\": \"11New/dashboard.base\", \"content_patch\": [{\"op\": \"replace\", \"old\": \"old text\", \"new\": \"new text\"}] }`."
+    inputSchema:
+      type: object
+      properties:
+        id:
+          type: string
+          description: "Vault-relative file ID"
         content:
           type: string
-          description: "New markdown content (replaces existing body). Mutually exclusive with content_patch."
+          description: "New raw file content (replaces existing). Mutually exclusive with content_patch."
         content_patch:
           type: array
-          description: "Ordered body patch operations. Each exact-match operation must match exactly once after previous operations are applied; unmatched or ambiguous operations reject the whole edit."
+          description: "Ordered body patch operations for raw text. Each exact-match operation must match exactly once after previous operations are applied; unmatched or ambiguous operations reject the whole edit."
           items:
             oneOf:
               - type: object
@@ -253,7 +270,7 @@ tools:
                     const: replace
                   old:
                     type: string
-                    description: "Existing body text to replace; must occur exactly once."
+                    description: "Existing text to replace; must occur exactly once."
                   new:
                     type: string
                     description: Replacement text.
@@ -265,7 +282,7 @@ tools:
                     const: delete
                   old:
                     type: string
-                    description: "Existing body text to delete; must occur exactly once."
+                    description: "Existing text to delete; must occur exactly once."
               - type: object
                 required: [op, anchor, text]
                 properties:
@@ -274,7 +291,7 @@ tools:
                     enum: [insert_before, insert_after]
                   anchor:
                     type: string
-                    description: "Existing body text used as the insertion anchor; must occur exactly once."
+                    description: "Existing text used as the insertion anchor; must occur exactly once."
                   text:
                     type: string
                     description: Text to insert.
@@ -286,7 +303,56 @@ tools:
                     enum: [append, prepend]
                   text:
                     type: string
-                    description: Text to add at the end or beginning of the body.
+                    description: Text to add at the end or beginning of the file.
+        tags:
+          type: array
+          items:
+            type: string
+          description: "New tag set (only valid for .md files)."
+        metadata:
+          type: object
+          description: "Frontmatter metadata keys to add or update (only valid for .md files)."
+      required: [id]
+
+  - id: edit_note
+    name: edit_note
+    description: "[DEPRECATED: use edit_vault_file instead] Edit a visible indexed Markdown note if policy allows it. Example: `{ \"id\": \"11New/sync-notes.md\", \"content_patch\": [{\"op\": \"replace\", \"old\": \"old text\", \"new\": \"new text\"}] }`; `content` and `content_patch` are mutually exclusive, patch anchors/old text must match exactly once after prior operations, and policy-denied edits return 403. Tags replace the tag set except preserved policy tags."
+    inputSchema:
+      type: object
+      properties:
+        id:
+          type: string
+          description: "Vault-relative note ID"
+        content:
+          type: string
+          description: "New markdown content (replaces existing body). Mutually exclusive with content_patch."
+        content_patch:
+          type: array
+          description: "Ordered body patch operations."
+          items:
+            oneOf:
+              - type: object
+                required: [op, old, new]
+                properties:
+                  op: { type: string, const: replace }
+                  old: { type: string, description: "Existing body text to replace; must occur exactly once." }
+                  new: { type: string, description: Replacement text. }
+              - type: object
+                required: [op, old]
+                properties:
+                  op: { type: string, const: delete }
+                  old: { type: string, description: "Existing body text to delete; must occur exactly once." }
+              - type: object
+                required: [op, anchor, text]
+                properties:
+                  op: { type: string, enum: [insert_before, insert_after] }
+                  anchor: { type: string, description: "Existing body text used as the insertion anchor; must occur exactly once." }
+                  text: { type: string, description: Text to insert. }
+              - type: object
+                required: [op, text]
+                properties:
+                  op: { type: string, enum: [append, prepend] }
+                  text: { type: string, description: Text to add at the end or beginning of the body. }
         tags:
           type: array
           items:
@@ -296,3 +362,25 @@ tools:
           type: object
           description: "Frontmatter metadata keys to add or update"
       required: [id]
+
+  - id: new_note
+    name: new_note
+    description: "[DEPRECATED: use create_vault_file instead] Create a new vault file. Example: `{ \"title\": \"Sync Notes\", \"content\": \"# Sync Notes\\n\\nBody\" }`."
+    inputSchema:
+      type: object
+      properties:
+        title:
+          type: string
+          description: "Human-readable title for filename generation."
+        content:
+          type: string
+          description: "Complete raw file content."
+        template_id:
+          type: string
+          description: "Optional exact vault-relative template path."
+        file_type:
+          type: string
+          enum: [md, base]
+          default: md
+          description: "File extension/type to create."
+      required: [title, content]

@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::new_note::NewNoteFileType;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(transparent)]
 pub struct NoteId(String);
@@ -62,6 +64,23 @@ pub struct Note {
     pub backlinks: Vec<NoteId>,
     pub tags: Vec<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A raw readable vault file (supported text files: .md, .base).
+///
+/// `content` is the exact file content including YAML frontmatter for .md and
+/// raw YAML for .base. Parsed note semantics (frontmatter, tags, links, etc.)
+/// are available through the existing note-index APIs for .md files.
+#[derive(Debug, Clone, Serialize)]
+pub struct VaultFile {
+    pub id: NoteId,
+    pub path: String,
+    pub file_type: NewNoteFileType,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub size_bytes: usize,
 }
 
 impl UnscopedNote {

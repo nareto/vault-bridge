@@ -23,21 +23,21 @@ use crate::context::{
 use crate::graph::FilteredGraph;
 use crate::livesync::{
     ChangeEvent, ChunkStagingBuffer, DecodedChunk, FileDocument, LivesyncDocument, ReassembledNote,
-    StageResult, decode_leaf_chunk, file_document_note_id, is_deletion, is_markdown_note_path,
-    sequence_to_string,
+    StageResult, decode_leaf_chunk, file_document_vault_file_id, is_deletion,
+    is_markdown_note_path, is_supported_vault_file_path, sequence_to_string,
 };
 use crate::markdown::{
     breadcrumb_prefix, extract_frontmatter_tags, extract_tags, first_h1_title, markdown_plain_text,
     parse_frontmatter, parse_markdown, split_into_semantic_blocks,
 };
-use crate::model::{Note, NoteId, UnscopedNote};
+use crate::model::{Note, NoteId, UnscopedNote, VaultFile};
 use crate::new_note::{
     NewNoteFileType, NewNotePathSettings, NewNoteRequest, UpdateNoteRequest, WriteError,
 };
 use crate::persistence::{
     BlockEmbeddingStats, BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias,
     PersistedLinkRecord, PersistedNoteRecord, PersistedSearchNote, PersistedStagedChunk,
-    PersistedSyncState, PostgresPersistence,
+    PersistedSyncState, PersistedVaultFile, PostgresPersistence,
 };
 use crate::runtime_config::{ConfigReloadStatus, RuntimeAuthConfig};
 use crate::search::{
@@ -73,6 +73,20 @@ pub struct StoredNote {
     pub updated_at: DateTime<Utc>,
     pub indexed_at: DateTime<Utc>,
     pub embedding: Option<Vec<f32>>,
+}
+
+/// Raw vault file stored alongside the parsed note index.
+///
+/// For .md files, content is the full markdown including YAML frontmatter.
+/// For .base files, content is the raw YAML.
+#[derive(Debug, Clone)]
+pub struct StoredVaultFile {
+    pub path: String,
+    pub content: String,
+    pub couchdb_rev: String,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub indexed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -606,6 +620,7 @@ fn persisted_sync_state_is_newer(
 #[derive(Debug)]
 pub struct StoreInner {
     notes: HashMap<NoteId, StoredNote>,
+    vault_files: HashMap<String, StoredVaultFile>,
     links: Vec<LinkRecord>,
     created_file_paths: HashSet<String>,
     file_doc_paths: HashMap<String, String>,
@@ -710,6 +725,7 @@ impl VaultStore {
         Self {
             inner: Arc::new(RwLock::new(StoreInner {
                 notes: HashMap::new(),
+                vault_files: HashMap::new(),
                 links: Vec::new(),
                 created_file_paths: HashSet::new(),
                 file_doc_paths: HashMap::new(),
@@ -807,6 +823,7 @@ impl VaultStore {
         let mut guard = self.inner.write().await;
 
         guard.notes.clear();
+        guard.vault_files.clear();
         guard.links.clear();
         guard.file_doc_paths.clear();
         guard.file_doc_revs.clear();
@@ -857,6 +874,20 @@ impl VaultStore {
                 couchdb_rev: chunk.couchdb_rev,
                 received_at: chunk.received_at,
             });
+        }
+
+        for vf in snapshot.vault_files {
+            guard.vault_files.insert(
+                vf.path.clone(),
+                StoredVaultFile {
+                    path: vf.path,
+                    content: vf.content,
+                    couchdb_rev: vf.couchdb_rev,
+                    created_at: vf.created_at,
+                    updated_at: vf.updated_at,
+                    indexed_at: vf.indexed_at,
+                },
+            );
         }
 
         let mut repaired_note_ids: HashSet<NoteId> = HashSet::new();
@@ -1177,6 +1208,8 @@ impl VaultStore {
         let mut staged_parent_deletes: HashSet<String> = HashSet::new();
         let mut file_alias_upserts: HashMap<String, PersistedFileAlias> = HashMap::new();
         let mut file_alias_deletes: HashSet<String> = HashSet::new();
+        let mut vault_file_changed_paths: HashSet<String> = HashSet::new();
+        let mut vault_file_deleted_paths: HashSet<String> = HashSet::new();
 
         // Pre-register file metadata so leaf chunks can be resolved to stable
         // vault paths even when `_changes` delivers file/leaf docs out-of-order.
@@ -1198,7 +1231,7 @@ impl VaultStore {
                     warn!(file_id = %file.id, error = %e, "failed to decrypt file metadata, skipping");
                     continue;
                 }
-                if let Some(note_path) = file_document_note_id(&file) {
+                if let Some(note_path) = file_document_vault_file_id(&file) {
                     let persisted_alias = persisted_file_alias_from_file(&file, &note_path);
                     let child_ids = persisted_alias.children.clone();
                     let removed_file_aliases =
@@ -1257,10 +1290,18 @@ impl VaultStore {
                         deleted_note_ids.insert(resolved_note_id.clone());
                         changed_note_ids.remove(&resolved_note_id);
                     }
+                    // Also remove the raw vault file for all supported paths.
+                    delete_vault_file_locked(&mut guard, resolved_note_id.as_str());
+                    vault_file_deleted_paths.insert(resolved_note_id.as_str().to_string());
                 }
 
                 if let Some(file_doc_id) = deletion_file_doc_id(&change) {
                     staged_parent_deletes.insert(file_doc_id.clone());
+                    // Remove vault file for the note path before unregistering aliases.
+                    if let Some(note_path) = guard.file_doc_paths.get(&file_doc_id).cloned() {
+                        delete_vault_file_locked(&mut guard, &note_path);
+                        vault_file_deleted_paths.insert(note_path);
+                    }
                     unregister_file_aliases_locked(&mut guard, &file_doc_id);
                     file_alias_upserts.remove(&file_doc_id);
                     file_alias_deletes.insert(file_doc_id);
@@ -1304,7 +1345,7 @@ impl VaultStore {
                     };
 
                     for chunk in apply_chunk_aliases_locked(&guard, &leaf.id, chunk) {
-                        if !is_markdown_note_path(&chunk.parent_id) {
+                        if !is_supported_vault_file_path(&chunk.parent_id) {
                             let pending_chunk = chunk.clone();
                             guard.chunk_staging.restore_pending_chunk(chunk);
                             result.pending_chunks = guard.chunk_staging.pending_count();
@@ -1315,6 +1356,7 @@ impl VaultStore {
                             continue;
                         }
                         let pending_chunk = chunk.clone();
+                        let is_md = is_markdown_note_path(&chunk.parent_id);
 
                         match guard.chunk_staging.stage(chunk) {
                             StageResult::Pending { .. } => {
@@ -1329,16 +1371,38 @@ impl VaultStore {
                                 staged_chunk_upserts.retain(|(parent_id, _), _| {
                                     parent_id != note.parent_id.as_str()
                                 });
-                                index_reassembled_note_locked(
+
+                                // Store raw vault file for all supported paths.
+                                let file_timestamps =
+                                    note_timestamp_hints_for_parent_locked(&guard, &note.parent_id);
+                                let created_at = file_timestamps.created_at;
+                                let updated_at = file_timestamps
+                                    .updated_at
+                                    .unwrap_or(now);
+                                upsert_vault_file_locked(
                                     &mut guard,
-                                    note,
-                                    context_window,
+                                    &note.parent_id,
+                                    &note.content,
+                                    &note.couchdb_rev,
+                                    created_at,
+                                    updated_at,
                                     now,
-                                    &mut changed_note_ids,
-                                    &mut deleted_note_ids,
                                 );
-                                graph_dirty = true;
-                                result.indexed_notes += 1;
+                                vault_file_changed_paths
+                                    .insert(note.parent_id.clone());
+
+                                if is_md {
+                                    index_reassembled_note_locked(
+                                        &mut guard,
+                                        note,
+                                        context_window,
+                                        now,
+                                        &mut changed_note_ids,
+                                        &mut deleted_note_ids,
+                                    );
+                                    graph_dirty = true;
+                                    result.indexed_notes += 1;
+                                }
                                 result.pending_chunks = guard.chunk_staging.pending_count();
                             }
                         }
@@ -1350,9 +1414,11 @@ impl VaultStore {
                         continue;
                     }
                     if file.deleted
-                        && let Some(note_id) = file_document_note_id(&file).map(NoteId::new)
+                        && let Some(note_id) = file_document_vault_file_id(&file).map(NoteId::new)
                     {
                         staged_parent_deletes.insert(note_id.as_str().to_string());
+                        delete_vault_file_locked(&mut guard, note_id.as_str());
+                        vault_file_deleted_paths.insert(note_id.as_str().to_string());
                         if delete_note_locked(&mut guard, &note_id) {
                             graph_dirty = true;
                             result.deleted_notes += 1;
@@ -1437,6 +1503,26 @@ impl VaultStore {
             alias_deletes.sort();
             alias_deletes.dedup();
 
+            let mut vault_file_persisted_upserts = vault_file_changed_paths
+                .iter()
+                .filter_map(|path| guard.vault_files.get(path))
+                .map(|vf| PersistedVaultFile {
+                    path: vf.path.clone(),
+                    content: vf.content.clone(),
+                    couchdb_rev: vf.couchdb_rev.clone(),
+                    created_at: vf.created_at,
+                    updated_at: vf.updated_at,
+                    indexed_at: vf.indexed_at,
+                })
+                .collect::<Vec<_>>();
+            vault_file_persisted_upserts
+                .sort_by(|a, b| a.path.cmp(&b.path));
+            let mut vault_file_persisted_deletes = vault_file_deleted_paths
+                .into_iter()
+                .collect::<Vec<_>>();
+            vault_file_persisted_deletes.sort();
+            vault_file_persisted_deletes.dedup();
+
             Some((
                 upserts,
                 deletes,
@@ -1445,6 +1531,8 @@ impl VaultStore {
                 chunk_staging_deletes,
                 alias_upserts,
                 alias_deletes,
+                vault_file_persisted_upserts,
+                vault_file_persisted_deletes,
             ))
         } else {
             None
@@ -1480,6 +1568,8 @@ impl VaultStore {
                 chunk_deletes,
                 alias_upserts,
                 alias_deletes,
+                vault_file_upserts,
+                vault_file_deletes,
             )) = persistence_batch
         {
             if (!upserts.is_empty() || !deletes.is_empty() || sync_state.is_some())
@@ -1502,6 +1592,14 @@ impl VaultStore {
                     .await
             {
                 warn!(error = %error, "failed to persist file alias batch");
+            }
+
+            if (!vault_file_upserts.is_empty() || !vault_file_deletes.is_empty())
+                && let Err(error) = persistence
+                    .apply_vault_file_delta(vault_file_upserts, vault_file_deletes)
+                    .await
+            {
+                warn!(error = %error, "failed to persist vault file batch");
             }
         }
 
@@ -2590,17 +2688,27 @@ impl VaultStore {
         now: DateTime<Utc>,
     ) -> Result<NewNoteResponse, WriteError> {
         let path = self.validate_new_note_write_at(&request, now).await?;
+        let file_type = request.file_type;
 
-        if !request.file_type.is_markdown() {
-            self.inner
-                .write()
-                .await
-                .created_file_paths
-                .insert(path.clone());
+        {
+            let mut guard = self.inner.write().await;
+            guard.created_file_paths.insert(path.clone());
+            upsert_vault_file_locked(
+                &mut guard,
+                &path,
+                &request.content,
+                "local-new-note",
+                Some(now),
+                now,
+                now,
+            );
+        }
+
+        if !file_type.is_markdown() {
             return Ok(NewNoteResponse {
                 id: NoteId::new(path),
                 status: "created",
-                file_type: request.file_type,
+                file_type,
                 indexed_as_note: false,
             });
         }
@@ -2760,12 +2868,329 @@ impl VaultStore {
 
         self.upsert_note(input).await;
 
+        {
+            let mut guard = self.inner.write().await;
+            upsert_vault_file_locked(
+                &mut guard,
+                &path,
+                &markdown,
+                "local-update-note",
+                existing_created_at,
+                now,
+                now,
+            );
+        }
+
         Ok((
             UpdateNoteResponse {
                 id: note_id.clone(),
                 status: "updated",
             },
             markdown,
+        ))
+    }
+
+    /// Read a raw vault file by exact path with policy enforcement.
+    pub async fn get_vault_file_for_policy(
+        &self,
+        auth: &AuthContext,
+        file_id: &NoteId,
+    ) -> Option<VaultFile> {
+        self.prepare_cached_read("vault file lookup").await;
+        let guard = self.inner.read().await;
+        let config = self.authorization_config().await;
+        let now = Utc::now();
+        let path = file_id.as_str();
+        if !vault_file_readable_for_policy_from_inner(&guard, &config, auth, path, now) {
+            return None;
+        }
+        get_vault_file_from_inner(&guard, path)
+    }
+
+    pub async fn vault_file_visibility_for_policy(
+        &self,
+        auth: &AuthContext,
+        file_id: &NoteId,
+    ) -> NoteVisibility {
+        self.prepare_cached_read("vault file visibility lookup").await;
+        let guard = self.inner.read().await;
+        let path = file_id.as_str();
+        match guard.vault_files.get(path) {
+            None => NoteVisibility::Missing,
+            Some(_) => {
+                let config = self.authorization_config().await;
+                if vault_file_readable_for_policy_from_inner(&guard, &config, auth, path, Utc::now())
+                {
+                    NoteVisibility::Accessible
+                } else {
+                    NoteVisibility::Filtered
+                }
+            }
+        }
+    }
+
+    /// Create a raw vault file (md or base) with policy enforcement.
+    pub async fn create_vault_file(
+        &self,
+        auth: &AuthContext,
+        mut request: NewNoteRequest,
+        now: DateTime<Utc>,
+    ) -> Result<NewNoteResponse, WriteError> {
+        let path = self.validate_new_note_write_at(&request, now).await?;
+        validate_create_template_reference(&request)?;
+        if request.file_type == NewNoteFileType::Base {
+            validate_base_file_content(&request.content)?;
+        }
+
+        let note = policy_note_from_create_request(&request, &path, now)?;
+        let config = self.authorization_config().await;
+        let Some(decision) = policy_decision_for(&config, auth, "create", &note, now) else {
+            return Err(WriteError::PolicyDenied {
+                operation: "create",
+                path: path.clone(),
+                reason: "no matching create rule in the effective authorization policy".to_string(),
+            });
+        };
+
+        let owner_principal = decision.set_owner.then_some(auth.principal.as_str());
+        if request.file_type.is_markdown() {
+            request.apply_markdown_create_metadata(now, &decision.add_tags, owner_principal)?;
+        }
+        self.validate_create_template_content(auth, &request)
+            .await?;
+
+        let note = policy_note_from_create_request(&request, &path, now)?;
+        if !policy_allows(&config, auth, "create", &note, now) {
+            return Err(WriteError::PolicyDenied {
+                operation: "create",
+                path: path.clone(),
+                reason:
+                    "created content would not satisfy the effective authorization policy".to_string(),
+            });
+        }
+
+        self.create_vault_file_at(request, now).await
+    }
+
+    pub async fn create_vault_file_at(
+        &self,
+        request: NewNoteRequest,
+        now: DateTime<Utc>,
+    ) -> Result<NewNoteResponse, WriteError> {
+        let path = self.validate_new_note_write_at(&request, now).await?;
+        let file_type = request.file_type;
+
+        {
+            let mut guard = self.inner.write().await;
+            guard.created_file_paths.insert(path.clone());
+            upsert_vault_file_locked(
+                &mut guard,
+                &path,
+                &request.content,
+                "local-new-file",
+                Some(now),
+                now,
+                now,
+            );
+        }
+
+        let indexed_as_note = if file_type.is_markdown() {
+            let max_link_context_chars = self.settings.read().await.max_link_context_chars;
+            let parsed = parse_markdown(&request.content, max_link_context_chars);
+            let links = parsed
+                .links
+                .into_iter()
+                .map(|link| LinkInput {
+                    target_id: NoteId::new(link.target),
+                    context_text: link.context,
+                    position: link.byte_offset,
+                })
+                .collect::<Vec<_>>();
+            let mut tags = parsed.tags;
+            tags.sort();
+            tags.dedup();
+            let input = NoteInput {
+                id: NoteId::new(path.clone()),
+                title: title_from_note_id(&path),
+                content: parsed.body,
+                frontmatter: parsed.frontmatter,
+                tags,
+                couchdb_rev: "local-new-note".to_string(),
+                created_at: Some(now),
+                updated_at: now,
+                embedding: None,
+                links,
+            };
+            self.upsert_note(input).await;
+            true
+        } else {
+            false
+        };
+
+        Ok(NewNoteResponse {
+            id: NoteId::new(path),
+            status: "created",
+            file_type,
+            indexed_as_note,
+        })
+    }
+
+    /// Edit a raw vault file with policy enforcement.
+    pub async fn edit_vault_file(
+        &self,
+        auth: &AuthContext,
+        file_id: &NoteId,
+        request: UpdateNoteRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(UpdateNoteResponse, String), WriteError> {
+        let path = file_id.as_str().to_string();
+
+        let policy_note = {
+            let guard = self.inner.read().await;
+            if let Some(vf) = guard.vault_files.get(&path) {
+                PolicyNote {
+                    path: path.clone(),
+                    title: title_from_note_id(&path),
+                    tags: Vec::new(),
+                    created_at: vf.created_at,
+                    updated_at: vf.updated_at,
+                    owner: None,
+                }
+            } else {
+                return Err(WriteError::NotFound { path });
+            }
+        };
+
+        let config = self.authorization_config().await;
+        let Some(decision) = policy_decision_for(&config, auth, "edit", &policy_note, now) else {
+            return Err(WriteError::PolicyDenied {
+                operation: "edit",
+                path: path.clone(),
+                reason:
+                    "no matching edit rule in the effective authorization policy".to_string(),
+            });
+        };
+
+        let mut request = request;
+        if let Some(tags) = request.tags.as_mut() {
+            for tag in decision.preserve_tags {
+                if tags.iter().any(|candidate| {
+                    crate::authorization::normalize_tag(candidate)
+                        .eq_ignore_ascii_case(&crate::authorization::normalize_tag(&tag))
+                }) {
+                    add_unique_tag(tags, &tag);
+                }
+            }
+            tags.sort();
+            tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        }
+
+        self.edit_vault_file_at(file_id, &request, now).await
+    }
+
+    /// Edit a raw vault file by exact path.
+    pub async fn edit_vault_file_at(
+        &self,
+        file_id: &NoteId,
+        request: &UpdateNoteRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(UpdateNoteResponse, String), WriteError> {
+        let path = file_id.as_str().to_string();
+        let file_type = file_type_from_path(&path);
+
+        let (existing_content, existing_created_at) = {
+            let guard = self.inner.read().await;
+            let file = guard
+                .vault_files
+                .get(&path)
+                .ok_or_else(|| WriteError::NotFound { path: path.clone() })?;
+            (file.content.clone(), file.created_at)
+        };
+
+        if !file_type.is_markdown() && (request.tags.is_some() || request.metadata.is_some()) {
+            return Err(WriteError::InvalidUpdate {
+                reason: "tags and metadata are only valid for markdown (.md) files".to_string(),
+            });
+        }
+
+        let new_content = if let Some(content) = &request.content {
+            content.clone()
+        } else if let Some(patch_ops) = &request.content_patch {
+            apply_content_patch_for_vault_file(&existing_content, patch_ops)?
+        } else {
+            existing_content.clone()
+        };
+
+        if !file_type.is_markdown() {
+            validate_base_file_content(&new_content)?;
+        }
+
+        {
+            let mut guard = self.inner.write().await;
+            upsert_vault_file_locked(
+                &mut guard,
+                &path,
+                &new_content,
+                "local-edit-file",
+                existing_created_at,
+                now,
+                now,
+            );
+        }
+
+        if file_type.is_markdown() {
+            let max_link_context_chars = self.settings.read().await.max_link_context_chars;
+            let (_existing_frontmatter, _existing_body, existing_tags) = {
+                let guard = self.inner.read().await;
+                let note = guard
+                    .notes
+                    .get(file_id)
+                    .ok_or_else(|| WriteError::NotFound { path: path.clone() })?;
+                (
+                    note.frontmatter.clone(),
+                    note.content.clone(),
+                    note.tags.clone(),
+                )
+            };
+
+            // Rebuild markdown note from raw content edit minus frontmatter rebuild
+            let parsed = parse_markdown(&new_content, max_link_context_chars);
+            let links = parsed
+                .links
+                .into_iter()
+                .map(|link| LinkInput {
+                    target_id: NoteId::new(link.target),
+                    context_text: link.context,
+                    position: link.byte_offset,
+                })
+                .collect::<Vec<_>>();
+
+            let mut tags = request.tags.clone().unwrap_or(existing_tags);
+            tags.extend(parsed.tags);
+            tags.sort();
+            tags.dedup();
+
+            let input = NoteInput {
+                id: file_id.clone(),
+                title: title_from_note_id(&path),
+                content: parsed.body,
+                frontmatter: parsed.frontmatter,
+                tags,
+                couchdb_rev: "local-edit-file".to_string(),
+                created_at: existing_created_at,
+                updated_at: now,
+                embedding: None,
+                links,
+            };
+            self.upsert_note(input).await;
+        }
+
+        Ok((
+            UpdateNoteResponse {
+                id: file_id.clone(),
+                status: "updated",
+            },
+            new_content,
         ))
     }
 
@@ -3525,6 +3950,128 @@ fn upsert_note_locked(guard: &mut StoreInner, note: NoteInput, indexed_at: DateT
     guard.notes.insert(note.id, stored);
 }
 
+fn upsert_vault_file_locked(
+    guard: &mut StoreInner,
+    path: &str,
+    content: &str,
+    couchdb_rev: &str,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+    indexed_at: DateTime<Utc>,
+) {
+    guard.vault_files.insert(
+        path.to_string(),
+        StoredVaultFile {
+            path: path.to_string(),
+            content: content.to_string(),
+            couchdb_rev: couchdb_rev.to_string(),
+            created_at,
+            updated_at,
+            indexed_at,
+        },
+    );
+}
+
+fn delete_vault_file_locked(guard: &mut StoreInner, path: &str) -> bool {
+    guard.vault_files.remove(path).is_some()
+}
+
+fn get_vault_file_from_inner(guard: &StoreInner, path: &str) -> Option<VaultFile> {
+    let file = guard.vault_files.get(path)?;
+    Some(VaultFile {
+        id: NoteId::new(path),
+        path: path.to_string(),
+        file_type: file_type_from_path(path),
+        content: file.content.clone(),
+        created_at: file.created_at,
+        updated_at: file.updated_at,
+        size_bytes: file.content.len(),
+    })
+}
+
+fn vault_file_readable_for_policy_from_inner(
+    guard: &StoreInner,
+    config: &AuthorizationConfig,
+    auth: &AuthContext,
+    path: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(file) = guard.vault_files.get(path) else {
+        return false;
+    };
+    let policy_note = PolicyNote {
+        path: path.to_string(),
+        title: title_from_note_id(path),
+        tags: Vec::new(),
+        created_at: file.created_at,
+        updated_at: file.updated_at,
+        owner: None,
+    };
+    policy_allows(config, auth, "read", &policy_note, now)
+}
+
+fn file_type_from_path(path: &str) -> NewNoteFileType {
+    if path.to_ascii_lowercase().ends_with(".md") {
+        NewNoteFileType::Md
+    } else {
+        NewNoteFileType::Base
+    }
+}
+
+fn apply_content_patch_for_vault_file(
+    content: &str,
+    patch: &[crate::new_note::ContentPatchOperation],
+) -> Result<String, WriteError> {
+    use crate::new_note::ContentPatchOperation;
+    let mut result = content.to_string();
+    for op in patch {
+        match op {
+            ContentPatchOperation::Replace { old, new } => {
+                if !result.contains(old) {
+                    return Err(WriteError::InvalidUpdate {
+                        reason: format!("replace: old text not found in content"),
+                    });
+                }
+                result = result.replacen(old, new, 1);
+            }
+            ContentPatchOperation::Delete { old } => {
+                if !result.contains(old) {
+                    return Err(WriteError::InvalidUpdate {
+                        reason: format!("delete: old text not found in content"),
+                    });
+                }
+                result = result.replacen(old, "", 1);
+            }
+            ContentPatchOperation::InsertBefore { anchor, text } => {
+                if let Some(pos) = result.find(anchor) {
+                    result.insert_str(pos, text);
+                } else {
+                    return Err(WriteError::InvalidUpdate {
+                        reason: "insert_before: anchor not found in content".to_string(),
+                    });
+                }
+            }
+            ContentPatchOperation::InsertAfter { anchor, text } => {
+                if let Some(pos) = result.find(anchor) {
+                    let end = pos + anchor.len();
+                    result.insert_str(end, text);
+                } else {
+                    return Err(WriteError::InvalidUpdate {
+                        reason: "insert_after: anchor not found in content".to_string(),
+                    });
+                }
+            }
+            ContentPatchOperation::Append { text } => {
+                result.push_str(text);
+            }
+            ContentPatchOperation::Prepend { text } => {
+                result.insert_str(0, text);
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn delete_note_locked(guard: &mut StoreInner, note_id: &NoteId) -> bool {
     let existed = guard.notes.remove(note_id).is_some();
     guard
@@ -3657,6 +4204,7 @@ fn store_inner_from_persisted_notes(
 
     StoreInner {
         notes,
+        vault_files: HashMap::new(),
         links,
         created_file_paths: HashSet::new(),
         file_doc_paths: HashMap::new(),
@@ -4742,7 +5290,7 @@ fn frontmatter_datetime(frontmatter: &Value, key: &str) -> Option<DateTime<Utc>>
 fn note_id_from_deletion_change(change: &ChangeEvent) -> Option<NoteId> {
     if let Some(doc) = change.doc.as_ref() {
         if let Ok(LivesyncDocument::File(file)) = LivesyncDocument::try_from(doc.clone())
-            && let Some(path) = file_document_note_id(&file)
+            && let Some(path) = file_document_vault_file_id(&file)
         {
             return Some(NoteId::new(path));
         }
@@ -4751,7 +5299,10 @@ fn note_id_from_deletion_change(change: &ChangeEvent) -> Option<NoteId> {
             .get("path")
             .and_then(Value::as_str)
             .map(crate::livesync::normalize_note_path)
-            .filter(|value| value.to_ascii_lowercase().ends_with(".md"))
+            .filter(|value| {
+                let lower = value.to_ascii_lowercase();
+                lower.ends_with(".md") || lower.ends_with(".base")
+            })
             .filter(|value| !value.is_empty())
         {
             return Some(NoteId::new(path));
@@ -5545,8 +6096,11 @@ fn deletion_file_doc_id(change: &ChangeEvent) -> Option<String> {
         return None;
     }
 
-    (change.id.starts_with("f:") || change.id.to_ascii_lowercase().ends_with(".md"))
-        .then(|| change.id.clone())
+    (change.id.starts_with("f:") || {
+        let lower = change.id.to_ascii_lowercase();
+        lower.ends_with(".md") || lower.ends_with(".base")
+    })
+    .then(|| change.id.clone())
 }
 
 fn snippet_for(content: &str, query: &str) -> String {

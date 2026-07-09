@@ -150,6 +150,17 @@ pub struct PersistedSnapshot {
     pub sync_state: Option<PersistedSyncState>,
     pub staged_chunks: Vec<PersistedStagedChunk>,
     pub file_aliases: Vec<PersistedFileAlias>,
+    pub vault_files: Vec<PersistedVaultFile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistedVaultFile {
+    pub path: String,
+    pub content: String,
+    pub couchdb_rev: String,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub indexed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -589,6 +600,88 @@ impl PostgresPersistence {
                 .bind(file_doc_id)
                 .execute(&mut *tx)
                 .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn upsert_vault_file(
+        &self,
+        file: &PersistedVaultFile,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            r#"
+            INSERT INTO vault_files (path, content, couchdb_rev, created_at, updated_at, indexed_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (path)
+            DO UPDATE SET
+                content = EXCLUDED.content,
+                couchdb_rev = EXCLUDED.couchdb_rev,
+                created_at = EXCLUDED.created_at,
+                updated_at = EXCLUDED.updated_at,
+                indexed_at = EXCLUDED.indexed_at
+            "#,
+        )
+        .bind(&file.path)
+        .bind(&file.content)
+        .bind(&file.couchdb_rev)
+        .bind(file.created_at)
+        .bind(file.updated_at)
+        .bind(file.indexed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_vault_file(&self, path: &str) -> Result<(), PersistenceError> {
+        sqlx::query("DELETE FROM vault_files WHERE path = $1")
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn apply_vault_file_delta(
+        &self,
+        upserts: Vec<PersistedVaultFile>,
+        deletes: Vec<String>,
+    ) -> Result<(), PersistenceError> {
+        if upserts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        for path in deletes {
+            sqlx::query("DELETE FROM vault_files WHERE path = $1")
+                .bind(path)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        for file in &upserts {
+            sqlx::query(
+                r#"
+                INSERT INTO vault_files (path, content, couchdb_rev, created_at, updated_at, indexed_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (path)
+                DO UPDATE SET
+                    content = EXCLUDED.content,
+                    couchdb_rev = EXCLUDED.couchdb_rev,
+                    created_at = EXCLUDED.created_at,
+                    updated_at = EXCLUDED.updated_at,
+                    indexed_at = EXCLUDED.indexed_at
+                "#,
+            )
+            .bind(&file.path)
+            .bind(&file.content)
+            .bind(&file.couchdb_rev)
+            .bind(file.created_at)
+            .bind(file.updated_at)
+            .bind(file.indexed_at)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -1318,11 +1411,35 @@ impl PostgresPersistence {
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
+        let vault_file_rows = sqlx::query(
+            r#"
+            SELECT path, content, couchdb_rev, created_at, updated_at, indexed_at
+            FROM vault_files
+            ORDER BY path ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let vault_files = vault_file_rows
+            .into_iter()
+            .map(|row| {
+                Ok(PersistedVaultFile {
+                    path: row.try_get("path")?,
+                    content: row.try_get("content")?,
+                    couchdb_rev: row.try_get("couchdb_rev")?,
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                    indexed_at: row.try_get("indexed_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
         Ok(PersistedSnapshot {
             notes: notes_by_id.into_values().collect(),
             sync_state,
             staged_chunks,
             file_aliases,
+            vault_files,
         })
     }
 

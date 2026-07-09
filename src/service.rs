@@ -9,7 +9,7 @@ use crate::authorization::AuthContext;
 use crate::base_query::{QueryBaseRequest, QueryBaseResponse};
 use crate::context::{AssembleContextRequest, AssembleContextResponse};
 use crate::couchdb::{CouchDbClient, CouchDbError};
-use crate::model::{Note, NoteId};
+use crate::model::{Note, NoteId, VaultFile};
 use crate::new_note::{NewNoteRequest, UpdateNoteRequest, WriteError};
 use crate::search::{SearchMode, SearchResponse};
 use crate::store::{
@@ -205,6 +205,76 @@ impl VaultBridgeService {
     pub async fn status(&self) -> StatusResponse {
         self.store.status().await
     }
+
+    pub async fn get_vault_file(
+        &self,
+        auth: &AuthContext,
+        file_id: &NoteId,
+    ) -> Result<VaultFile, ServiceError> {
+        if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
+            return Ok(file);
+        }
+
+        let visibility = self
+            .store
+            .vault_file_visibility_for_policy(auth, file_id)
+            .await;
+        log_vault_file_lookup_miss(auth, file_id.as_str(), visibility);
+        Err(ServiceError::NotFound)
+    }
+
+    pub async fn create_vault_file(
+        &self,
+        auth: &AuthContext,
+        request: NewNoteRequest,
+    ) -> Result<NewNoteResponse, ServiceError> {
+        let now = Utc::now();
+        let path = self
+            .store
+            .validate_new_note_write_at(&request, now)
+            .await
+            .map_err(ServiceError::Write)?;
+        let request = self
+            .store
+            .prepare_create_note_request(auth, request, &path, now)
+            .await
+            .map_err(ServiceError::Write)?;
+
+        if let Some(couchdb) = self.couchdb.as_ref() {
+            couchdb
+                .write_livesync_note(&path, &request.content)
+                .await
+                .map_err(ServiceError::CouchDbWrite)?;
+        }
+
+        self.store
+            .create_vault_file_at(request, now)
+            .await
+            .map_err(ServiceError::Write)
+    }
+
+    pub async fn edit_vault_file(
+        &self,
+        auth: &AuthContext,
+        file_id: &NoteId,
+        request: UpdateNoteRequest,
+    ) -> Result<UpdateNoteResponse, ServiceError> {
+        let now = Utc::now();
+        let (response, new_content) = self
+            .store
+            .edit_vault_file(auth, file_id, request, now)
+            .await
+            .map_err(ServiceError::Write)?;
+
+        if let Some(couchdb) = self.couchdb.as_ref() {
+            couchdb
+                .update_livesync_note(file_id.as_str(), &new_content)
+                .await
+                .map_err(ServiceError::CouchDbUpdate)?;
+        }
+
+        Ok(response)
+    }
 }
 
 fn log_note_lookup_miss(
@@ -238,6 +308,20 @@ fn lookup_fingerprint(kind: &str, value: &str) -> String {
     hasher.update(value.trim().as_bytes());
     let digest = hex::encode(hasher.finalize());
     digest.chars().take(16).collect()
+}
+
+fn log_vault_file_lookup_miss(
+    auth: &AuthContext,
+    lookup_value: &str,
+    visibility: NoteVisibility,
+) {
+    info!(
+        context = auth.context.as_str(),
+        principal = auth.principal.as_str(),
+        lookup_hash = lookup_fingerprint("vault_file", lookup_value).as_str(),
+        visibility = note_visibility_label(visibility),
+        "vault file lookup returned not found"
+    );
 }
 
 #[derive(Debug, Error)]

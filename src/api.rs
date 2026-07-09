@@ -450,6 +450,8 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/notes/get", post(get_note_lookup))
         .route("/api/v1/notes", post(create_note))
         .route("/api/v1/notes/{*id}", get(get_note).put(update_note))
+        .route("/api/v1/vault-files", post(create_vault_file_endpoint))
+        .route("/api/v1/vault-files/{*id}", get(get_vault_file_endpoint).put(edit_vault_file_endpoint))
         .route("/api/v1/search", get(search_notes))
         .route("/api/v1/neighbors/{*id}", get(get_neighbors))
         .route("/api/v1/backlinks/{*id}", get(get_backlinks))
@@ -811,6 +813,77 @@ async fn update_note(
         &auth,
         "/api/v1/notes/{id}",
         &json!({"id": response.id, "action": "update"}),
+        &[response.id.clone()],
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn create_vault_file_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<NewNoteRequest>, JsonRejection>,
+) -> Result<Json<crate::store::NewNoteResponse>, ApiError> {
+    let auth = auth_from_headers(&state, &headers).await?;
+    let request = decode_json(payload)?;
+    let response = state
+        .service
+        .create_vault_file(&auth, request)
+        .await
+        .map_err(map_service_error)?;
+    log_access(
+        &state,
+        &auth,
+        "/api/v1/vault-files",
+        &json!({"id": response.id}),
+        &[response.id.clone()],
+    )
+    .await;
+    Ok(Json(response))
+}
+
+async fn get_vault_file_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<crate::model::VaultFile>, ApiError> {
+    let auth = auth_from_headers(&state, &headers).await?;
+    let file_id = NoteId::new(id);
+    let file = state
+        .service
+        .get_vault_file(&auth, &file_id)
+        .await
+        .map_err(map_service_error)?;
+    log_access(
+        &state,
+        &auth,
+        "/api/v1/vault-files/{id}",
+        &json!({"id": file_id}),
+        &[file.id.clone()],
+    )
+    .await;
+    Ok(Json(file))
+}
+
+async fn edit_vault_file_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    payload: Result<Json<UpdateNoteRequest>, JsonRejection>,
+) -> Result<Json<crate::store::UpdateNoteResponse>, ApiError> {
+    let auth = auth_from_headers(&state, &headers).await?;
+    let request = decode_json(payload)?;
+    let file_id = NoteId::new(id);
+    let response = state
+        .service
+        .edit_vault_file(&auth, &file_id, request)
+        .await
+        .map_err(map_service_error)?;
+    log_access(
+        &state,
+        &auth,
+        "/api/v1/vault-files/{id}",
+        &json!({"id": response.id, "action": "edit"}),
         &[response.id.clone()],
     )
     .await;

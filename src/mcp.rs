@@ -44,16 +44,18 @@ const EMBEDDED_IMAGE_BASE64_MIN_CHARS: usize = 512;
 const TOOLING_CATALOG_URI: &str = "vault-bridge://catalog/tooling.json";
 const OPENAPI_SCHEMA_URI: &str = "vault-bridge://schemas/openapi.json";
 const NOTE_RESOURCE_PREFIX: &str = "vault-bridge://notes/";
+const VAULT_FILE_RESOURCE_PREFIX: &str = "vault-bridge://files/";
 const READ_TOOL_NAMES: &[&str] = &[
     "get_note",
+    "get_vault_file",
     "recent_notes",
     "query_notes",
     "query_base",
     "get_neighbors",
     "list_tags",
 ];
-const CREATE_TOOL_NAMES: &[&str] = &["new_note"];
-const EDIT_TOOL_NAMES: &[&str] = &["edit_note"];
+const CREATE_TOOL_NAMES: &[&str] = &["new_note", "create_vault_file"];
+const EDIT_TOOL_NAMES: &[&str] = &["edit_note", "edit_vault_file"];
 
 static EMBEDDED_IMAGE_DATA_URI_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!(
@@ -769,6 +771,49 @@ async fn read_resource_contents(
                 "text": serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
             })])
         }
+        _ if uri.starts_with(VAULT_FILE_RESOURCE_PREFIX) => {
+            let encoded_file_id = &uri[VAULT_FILE_RESOURCE_PREFIX.len()..];
+            let decoded_file_id = urlencoding::decode(encoded_file_id).map_err(|_| {
+                ErrorMetadata::new(
+                    ErrorCategory::Validation,
+                    false,
+                    "invalid vault file resource uri",
+                    format!(
+                        "vault file resource uri '{}' contains invalid percent-encoding in the file id",
+                        uri
+                    ),
+                )
+            })?;
+            let file_id = decoded_file_id.trim();
+            if file_id.is_empty() {
+                return Err(ErrorMetadata::new(
+                    ErrorCategory::Validation,
+                    false,
+                    "file id is required",
+                    "vault file resource URIs must include a non-empty canonical file id after vault-bridge://files/",
+                ));
+            }
+
+            let response = state
+                .service
+                .get_vault_file(auth, &NoteId::new(file_id))
+                .await
+                .map_err(|error| service_error_metadata(&error, Some("resources/read")))?;
+            let response = serde_json::to_value(response).map_err(|error| {
+                ErrorMetadata::new(
+                    ErrorCategory::Business,
+                    false,
+                    "serialization failed",
+                    format!("Failed to serialize vault file resource response: {error}"),
+                )
+            })?;
+
+            Ok(vec![json!({
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+            })])
+        }
         _ => Err(ErrorMetadata::new(
             ErrorCategory::Business,
             false,
@@ -993,6 +1038,15 @@ async fn execute_tool_call(
             };
             to_tool_value(note)
         }
+        "get_vault_file" => {
+            let id = required_string(arguments, "id")?;
+            let file = state
+                .service
+                .get_vault_file(auth, &NoteId::new(id))
+                .await
+                .map_err(McpError::Service)?;
+            to_tool_value(file)
+        }
         "recent_notes" => {
             let since = match optional_string(arguments, "since")? {
                 Some(value) if !value.trim().is_empty() => Some(parse_datetime(&value)?),
@@ -1074,28 +1128,37 @@ async fn execute_tool_call(
             let filter = deserialize_arguments::<NoteTimeFilter>(tool_name, arguments)?;
             to_tool_value(state.service.list_tags(auth, filter).await)
         }
-        "new_note" => {
+        "new_note" | "create_vault_file" => {
             let request = deserialize_arguments::<NewNoteRequest>(tool_name, arguments)?;
             let response = state
                 .service
-                .create_note(auth, request)
+                .create_vault_file(auth, request)
                 .await
                 .map_err(McpError::Service)?;
             to_tool_value(response)
         }
-        "edit_note" => {
+        "edit_note" | "edit_vault_file" => {
             let note_id = required_string(arguments, "id")?;
             let mut update_body = arguments.clone();
             if let Some(map) = update_body.as_object_mut() {
                 map.remove("id");
             }
             let request = deserialize_arguments::<UpdateNoteRequest>(tool_name, &update_body)?;
-            let response = state
-                .service
-                .update_note(auth, &NoteId::new(note_id), request)
-                .await
-                .map_err(McpError::Service)?;
-            to_tool_value(response)
+            if tool_name == "edit_vault_file" {
+                let response = state
+                    .service
+                    .edit_vault_file(auth, &NoteId::new(note_id), request)
+                    .await
+                    .map_err(McpError::Service)?;
+                to_tool_value(response)
+            } else {
+                let response = state
+                    .service
+                    .update_note(auth, &NoteId::new(note_id), request)
+                    .await
+                    .map_err(McpError::Service)?;
+                to_tool_value(response)
+            }
         }
         _ => Err(McpError::UnknownTool(tool_name.to_string())),
     }
@@ -1701,13 +1764,16 @@ fn supported_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "get_note"
+            | "get_vault_file"
             | "recent_notes"
             | "query_notes"
             | "query_base"
             | "get_neighbors"
             | "list_tags"
             | "new_note"
+            | "create_vault_file"
             | "edit_note"
+            | "edit_vault_file"
     )
 }
 
@@ -2054,9 +2120,26 @@ mod tests {
         assert!(
             new_note
                 .description
-                .contains("configured new-note location")
+                .contains("DEPRECATED")
         );
-        assert!(new_note.description.contains("complete file content"));
+        assert!(new_note.description.contains("vault"));
+
+        let create_vault_file = tool_named("create_vault_file");
+        assert!(
+            create_vault_file
+                .description
+                .contains("indexed_as_note")
+        );
+        assert!(create_vault_file.description.contains("file_type"));
+
+        let get_vault_file = tool_named("get_vault_file");
+        assert!(get_vault_file.description.contains("raw"));
+        assert!(get_vault_file.description.contains("404"));
+
+        let edit_vault_file = tool_named("edit_vault_file");
+        assert!(edit_vault_file.description.contains("mutually exclusive"));
+        assert!(edit_vault_file.description.contains("403"));
+        assert!(edit_vault_file.description.contains("YAML"));
 
         let edit_note = tool_named("edit_note");
         assert!(edit_note.description.contains("mutually exclusive"));
