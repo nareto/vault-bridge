@@ -74,7 +74,7 @@ surfaces:
 The MCP tools are deliberately small:
 
 - **Read**: `get_note`, `recent_notes`
-- **Retrieve**: `query_notes`, `get_neighbors`, `list_tags`
+- **Retrieve**: `query_notes`, `query_base`, `get_neighbors`, `list_tags`
 - **Write**: `new_note`, `edit_note`
 
 Small tools are easier for agents to choose correctly and easier for humans to
@@ -125,7 +125,8 @@ This split keeps the expensive and security-sensitive note logic in one backend.
 | Obsidian-native ingestion | Reads from the existing LiveSync CouchDB database, including optional LiveSync E2EE decryption |
 | Context policy visibility | YAML contexts define allow/deny rules for every read and write |
 | Search | Supports full-text, semantic, and hybrid search modes |
-| Structured note queries | Filters by tags, paths, frontmatter, timestamps, exact titles, and text relevance |
+| Structured note queries | Filters by tags, paths, frontmatter key presence, timestamps, exact titles, and text relevance |
+| Base-compatible table queries | Runs inline Obsidian Bases-style filters and table projections over visible notes, returning typed JSON rows |
 | Graph exploration | Returns neighbors, backlinks, shortest paths, hub-aware graph expansion, and link context |
 | REST context assembly | Builds compact bundles from note seeds, semantic queries, and graph expansion for REST clients |
 | Write support | Creates notes in a configured inbox path and updates eligible notes back through CouchDB |

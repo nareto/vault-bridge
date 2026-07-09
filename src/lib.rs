@@ -3,6 +3,7 @@
 pub mod api;
 mod api_docs;
 pub mod authorization;
+pub mod base_query;
 pub mod config;
 pub mod context;
 pub mod couchdb;

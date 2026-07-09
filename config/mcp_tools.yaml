@@ -142,6 +142,26 @@ tools:
           maximum: 500
           description: Return at most this many notes; maximum 500.
 
+  - id: query_base
+    name: query_base
+    description: "Run a deterministic, Base-compatible table query over visible Markdown notes. Example: `{ \"base_query\": \"filters:\\n  and:\\n    - file.hasTag(\\\"workout-exercise\\\")\\nviews:\\n  - type: table\\n    order: [file.name, note.exercise_status]\\n\" }`. Use Base filters to select rows and `views[].order` to project columns. Supports comparisons, and/or/not, note props, file fields, file.hasTag/inFolder/hasLink, list(...).contains, date/today/now. Returns structured columns/rows JSON; formulas and saved base_id are not supported yet; limit caps at 500."
+    inputSchema:
+      type: object
+      properties:
+        base_query:
+          type: string
+          description: "Inline Obsidian Bases YAML. `views[].order` controls projected columns; global and view filters are combined with AND."
+        view:
+          type: string
+          description: "Optional exact table view name to execute. Defaults to the first table view, or a default table if no views are provided."
+        limit:
+          type: integer
+          default: 100
+          minimum: 0
+          maximum: 500
+          description: "Optional response cap. The effective cap is the minimum of this value, the view limit when present, and 500."
+      required: [base_query]
+
   - id: get_neighbors
     name: get_neighbors
     description: "Explore the visible graph around a note by BFS. Example: `{ \"id\": \"03Concepts/rust-phantom-types.md\", \"depth\": 2, \"direction\": \"both\" }`; depth accepts 1-5 with max depth 5, and direction can be `outgoing`, `incoming`, or `both`. A 404 means the center note is missing or not visible; filtered/private neighbors are omitted."

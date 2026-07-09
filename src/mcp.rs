@@ -23,6 +23,7 @@ use tracing::{info, warn};
 
 use crate::api_docs;
 use crate::authorization::{AccessMatcher, AccessPolicy, AccessRule, AuthContext, ContextName};
+use crate::base_query::QueryBaseRequest;
 use crate::config::McpTokenConfig;
 use crate::error_metadata::{ErrorCategory, ErrorMetadata, service_error_metadata};
 use crate::model::NoteId;
@@ -47,6 +48,7 @@ const READ_TOOL_NAMES: &[&str] = &[
     "get_note",
     "recent_notes",
     "query_notes",
+    "query_base",
     "get_neighbors",
     "list_tags",
 ];
@@ -1029,6 +1031,22 @@ async fn execute_tool_call(
             )?;
             to_tool_value(state.service.query_notes(auth, request).await)
         }
+        "query_base" => {
+            let request = deserialize_arguments::<QueryBaseRequest>(tool_name, arguments)?;
+            validate_optional_usize_range(
+                tool_name,
+                "limit",
+                request.limit,
+                0,
+                MAX_NOTE_LIST_LIMIT,
+            )?;
+            let response = state
+                .service
+                .query_base(auth, request)
+                .await
+                .map_err(McpError::Service)?;
+            to_tool_value(response)
+        }
         "get_neighbors" => {
             let id = required_string(arguments, "id")?;
             let depth = optional_usize(arguments, "depth")?;
@@ -1685,6 +1703,7 @@ fn supported_tool_name(tool_name: &str) -> bool {
         "get_note"
             | "recent_notes"
             | "query_notes"
+            | "query_base"
             | "get_neighbors"
             | "list_tags"
             | "new_note"
@@ -2016,6 +2035,12 @@ mod tests {
         assert!(query_notes.description.contains("Empty `notes`"));
         assert!(query_notes.description.contains("caps at 500"));
 
+        let query_base = tool_named("query_base");
+        assert!(query_base.description.contains("Base-compatible"));
+        assert!(query_base.description.contains("columns"));
+        assert!(query_base.description.contains("rows"));
+        assert!(query_base.description.contains("caps at 500"));
+
         let get_neighbors = tool_named("get_neighbors");
         assert!(get_neighbors.description.contains("1-5"));
         assert!(get_neighbors.description.contains("404"));
@@ -2050,6 +2075,12 @@ mod tests {
         let query_notes = tool_named("query_notes");
         assert_eq!(
             query_notes.input_schema["properties"]["limit"]["maximum"],
+            json!(MAX_NOTE_LIST_LIMIT)
+        );
+
+        let query_base = tool_named("query_base");
+        assert_eq!(
+            query_base.input_schema["properties"]["limit"]["maximum"],
             json!(MAX_NOTE_LIST_LIMIT)
         );
 
@@ -2109,6 +2140,17 @@ mod tests {
         );
         assert!(query_notes.description.contains("500"));
 
+        let query_base = find_tool("query_base");
+        assert_eq!(
+            query_base.input_schema["properties"]["limit"]["maximum"],
+            json!(MAX_NOTE_LIST_LIMIT)
+        );
+        assert_eq!(
+            query_base.input_schema["properties"]["limit"]["minimum"],
+            json!(0)
+        );
+        assert!(query_base.description.contains("500"));
+
         let get_neighbors = find_tool("get_neighbors");
         assert_eq!(
             get_neighbors.input_schema["properties"]["depth"]["maximum"],
@@ -2153,6 +2195,22 @@ mod tests {
         );
         assert!(tool.description.contains("Use result `id` with `get_note`"));
         assert!(tool.description.contains("heading_title"));
+    }
+
+    #[test]
+    fn query_base_schema_exposes_base_query_projection() {
+        let tool = tool_named("query_base");
+
+        assert_eq!(
+            tool.input_schema["properties"]["base_query"]["type"],
+            "string"
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["limit"]["maximum"],
+            json!(MAX_NOTE_LIST_LIMIT)
+        );
+        assert!(tool.description.contains("views[].order"));
+        assert!(tool.description.contains("formulas"));
     }
 
     #[test]

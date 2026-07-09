@@ -348,6 +348,11 @@ async fn tool_call_rejects_arguments_outside_advertised_caps() {
             format!("limit must be between 0 and {MAX_NOTE_LIST_LIMIT}"),
         ),
         (
+            "query_base",
+            json!({"base_query": "views:\n  - type: table\n", "limit": MAX_NOTE_LIST_LIMIT + 1}),
+            format!("limit must be between 0 and {MAX_NOTE_LIST_LIMIT}"),
+        ),
+        (
             "get_neighbors",
             json!({
                 "id": "03Concepts/rust-phantom-types.md",

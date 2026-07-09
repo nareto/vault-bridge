@@ -6,6 +6,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::authorization::AuthContext;
+use crate::base_query::{QueryBaseRequest, QueryBaseResponse};
 use crate::context::{AssembleContextRequest, AssembleContextResponse};
 use crate::couchdb::{CouchDbClient, CouchDbError};
 use crate::model::{Note, NoteId};
@@ -85,6 +86,17 @@ impl VaultBridgeService {
         request: QueryNotesRequest,
     ) -> RecentNotesResponse {
         self.store.query_notes_for_policy(auth, request).await
+    }
+
+    pub async fn query_base(
+        &self,
+        auth: &AuthContext,
+        request: QueryBaseRequest,
+    ) -> Result<QueryBaseResponse, ServiceError> {
+        self.store
+            .query_base_for_policy(auth, request)
+            .await
+            .map_err(|error| ServiceError::BadRequest(error.to_string()))
     }
 
     pub async fn neighbors(

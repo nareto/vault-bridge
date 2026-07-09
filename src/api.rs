@@ -17,6 +17,7 @@ use tracing::info;
 
 use crate::api_docs;
 use crate::authorization::{AuthContext, ContextName};
+use crate::base_query::QueryBaseRequest;
 use crate::config::ApiTokenConfig;
 use crate::context::AssembleContextRequest;
 use crate::error_metadata::{
@@ -445,6 +446,7 @@ pub fn app_router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/api/v1/notes/recent", get(recent_notes))
         .route("/api/v1/notes/query", post(query_notes))
+        .route("/api/v1/base/query", post(query_base))
         .route("/api/v1/notes/get", post(get_note_lookup))
         .route("/api/v1/notes", post(create_note))
         .route("/api/v1/notes/{*id}", get(get_note).put(update_note))
@@ -618,6 +620,28 @@ async fn query_notes(
         .map(|note| note.id.clone())
         .collect::<Vec<_>>();
     log_access(&state, &auth, "/api/v1/notes/query", &request_log, &ids).await;
+    Ok(Json(response))
+}
+
+async fn query_base(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<QueryBaseRequest>, JsonRejection>,
+) -> Result<Json<crate::base_query::QueryBaseResponse>, ApiError> {
+    let auth = auth_from_headers(&state, &headers).await?;
+    let request = decode_json(payload)?;
+    let request_log = json!(&request);
+    let response = state
+        .service
+        .query_base(&auth, request)
+        .await
+        .map_err(map_service_error)?;
+    let ids = response
+        .rows
+        .iter()
+        .map(|row| row.note_id.clone())
+        .collect::<Vec<_>>();
+    log_access(&state, &auth, "/api/v1/base/query", &request_log, &ids).await;
     Ok(Json(response))
 }
 

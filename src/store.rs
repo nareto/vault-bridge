@@ -13,6 +13,9 @@ use crate::authorization::{
     AccessRule, AuthContext, AuthorizationConfig, ContextName, PolicyNote, add_unique_tag,
     owner_from_frontmatter,
 };
+use crate::base_query::{
+    BaseQueryCandidate, BaseQueryError, QueryBaseRequest, QueryBaseResponse, execute_query_base,
+};
 use crate::config::EmbeddingConfig;
 use crate::context::{
     AssembleContextRequest, AssembleContextResponse, ContextCandidate, assemble_context,
@@ -2070,6 +2073,44 @@ impl VaultStore {
         self.prepare_cached_read("query_notes policy query").await;
         let guard = self.inner.read().await;
         self.query_notes_from_inner(&guard, &request, auth).await
+    }
+
+    pub async fn query_base_for_policy(
+        &self,
+        auth: &AuthContext,
+        request: QueryBaseRequest,
+    ) -> Result<QueryBaseResponse, BaseQueryError> {
+        self.prepare_cached_read("query_base policy query").await;
+        let guard = self.inner.read().await;
+        let config = self.authorization_config().await;
+        let now = Utc::now();
+        let mut outgoing_links: HashMap<NoteId, Vec<String>> = HashMap::new();
+        for link in &guard.links {
+            outgoing_links
+                .entry(link.source_id.clone())
+                .or_default()
+                .push(link.target_id.as_str().to_string());
+        }
+
+        let candidates = guard
+            .notes
+            .values()
+            .filter(|note| {
+                policy_allows(&config, auth, "read", &policy_note_from_stored(note), now)
+            })
+            .map(|note| BaseQueryCandidate {
+                id: note.id.clone(),
+                path: note.path.clone(),
+                title: note.title.clone(),
+                frontmatter: note.frontmatter.clone(),
+                tags: note.tags.clone(),
+                created_at: note.created_at,
+                updated_at: note.updated_at,
+                links: outgoing_links.get(&note.id).cloned().unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+
+        execute_query_base(request, candidates, MAX_NOTE_LIST_LIMIT, now)
     }
 
     pub async fn neighbors_for_policy(
@@ -5613,13 +5654,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::{Duration, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use static_assertions::assert_not_impl_any;
 
     use super::{
-        NeighborDirection, NoteInput, QueryNotesRequest, RuntimeSyncState, StoreSettings,
-        UnscopedBacklinkEntry, UnscopedNeighborNode, UnscopedRecentNoteSummary, VaultStore,
-        find_case_insensitive, get_note_from_inner, neighbors_from_inner,
+        NeighborDirection, NoteInput, QueryBaseRequest, QueryNotesRequest, RuntimeSyncState,
+        StoreSettings, UnscopedBacklinkEntry, UnscopedNeighborNode, UnscopedRecentNoteSummary,
+        VaultStore, find_case_insensitive, get_note_from_inner, neighbors_from_inner,
         note_readable_for_policy_from_inner, status_from_inner, store_inner_from_persisted_notes,
     };
     use crate::authorization::{
@@ -5815,6 +5856,88 @@ mod tests {
         assert_eq!(case_response.notes[0].id, NoteId::new("public-case.md"));
     }
 
+    #[tokio::test]
+    async fn query_base_projects_base_table_rows_and_hides_denied_notes() {
+        let now = Utc::now();
+        let store = VaultStore::new(20);
+        store.set_authorization_config(external_config()).await;
+        store
+            .upsert_note(note_input_with_frontmatter(
+                "public-rings.md",
+                "Public Rings",
+                vec!["workout-exercise"],
+                now,
+                json!({
+                    "uses": ["mini_wod"],
+                    "equipment": ["rings"],
+                    "exercise_status": ["unassessed"]
+                }),
+            ))
+            .await;
+        store
+            .upsert_note(note_input_with_frontmatter(
+                "public-bike.md",
+                "Public Bike",
+                vec!["workout-exercise"],
+                now - Duration::minutes(1),
+                json!({
+                    "uses": ["mini_wod"],
+                    "equipment": ["bike"],
+                    "exercise_status": ["active"]
+                }),
+            ))
+            .await;
+        store
+            .upsert_note(note_input_with_frontmatter(
+                "secret.md",
+                "Secret Rings",
+                vec!["workout-exercise"],
+                now,
+                json!({
+                    "uses": ["mini_wod"],
+                    "equipment": ["rings"],
+                    "exercise_status": ["unassessed"]
+                }),
+            ))
+            .await;
+
+        let response = store
+            .query_base_for_policy(
+                &external_auth(),
+                QueryBaseRequest {
+                    base_query: r#"
+filters:
+  and:
+    - file.hasTag("workout-exercise")
+    - list(uses).contains("mini_wod")
+    - list(equipment).contains("rings")
+properties:
+  note.exercise_status:
+    displayName: Status
+views:
+  - type: table
+    name: Candidates
+    limit: 25
+    order:
+      - file.name
+      - note.equipment
+      - note.exercise_status
+"#
+                    .to_string(),
+                    view: Some("Candidates".to_string()),
+                    limit: None,
+                },
+            )
+            .await
+            .expect("base query succeeds");
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.returned, 1);
+        assert_eq!(response.rows[0].note_id, NoteId::new("public-rings.md"));
+        assert_eq!(response.rows[0].cells["note.equipment"], json!(["rings"]));
+        assert_eq!(response.columns[2].label, "Status");
+    }
+
     #[test]
     fn persisted_snapshot_status_uses_runtime_sync_metadata() {
         let now = Utc::now();
@@ -5909,11 +6032,21 @@ mod tests {
         tags: Vec<&str>,
         updated_at: chrono::DateTime<Utc>,
     ) -> NoteInput {
+        note_input_with_frontmatter(id, title, tags, updated_at, json!({}))
+    }
+
+    fn note_input_with_frontmatter(
+        id: &str,
+        title: &str,
+        tags: Vec<&str>,
+        updated_at: chrono::DateTime<Utc>,
+        frontmatter: Value,
+    ) -> NoteInput {
         NoteInput {
             id: NoteId::new(id),
             title: title.to_string(),
             content: format!("# {title}\n\nBody for {id}."),
-            frontmatter: json!({}),
+            frontmatter,
             tags: tags.into_iter().map(ToString::to_string).collect(),
             couchdb_rev: "1-test".to_string(),
             created_at: Some(updated_at),

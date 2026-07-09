@@ -28,7 +28,7 @@ pub(crate) fn openapi_spec() -> Value {
         "openapi": "3.1.0",
         "info": {
             "title": "Vault Bridge REST API",
-            "version": "0.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "description": "Self-hosted REST API for context-authorized note access, search, graph traversal, and context assembly."
         },
         "tags": [
@@ -258,6 +258,71 @@ pub(crate) fn openapi_spec() -> Value {
                             ]
                         },
                         "limit": {"type": ["integer", "null"], "minimum": 0, "maximum": MAX_NOTE_LIST_LIMIT}
+                    }
+                },
+                "QueryBaseRequest": {
+                    "type": "object",
+                    "required": ["base_query"],
+                    "properties": {
+                        "base_query": {
+                            "type": "string",
+                            "description": "Inline Obsidian Bases YAML. Base and view filters select rows; table view order selects returned columns."
+                        },
+                        "view": {
+                            "type": ["string", "null"],
+                            "description": "Optional exact table view name to execute. Defaults to the first table view."
+                        },
+                        "limit": {
+                            "type": ["integer", "null"],
+                            "minimum": 0,
+                            "maximum": MAX_NOTE_LIST_LIMIT,
+                            "description": "Optional response cap. Effective cap is min(request limit, view limit, runtime cap)."
+                        }
+                    }
+                },
+                "BaseQueryValueType": {
+                    "type": "string",
+                    "enum": ["empty", "string", "number", "boolean", "array", "object", "date", "mixed"]
+                },
+                "BaseQueryColumn": {
+                    "type": "object",
+                    "required": ["id", "label", "value_type"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "value_type": {"$ref": "#/components/schemas/BaseQueryValueType"}
+                    }
+                },
+                "BaseQueryRow": {
+                    "type": "object",
+                    "required": ["note_id", "path", "title", "cells"],
+                    "properties": {
+                        "note_id": {"type": "string"},
+                        "path": {"type": "string"},
+                        "title": {"type": "string"},
+                        "cells": {
+                            "type": "object",
+                            "description": "Projected cell values keyed by column id.",
+                            "additionalProperties": true
+                        }
+                    }
+                },
+                "QueryBaseResponse": {
+                    "type": "object",
+                    "required": ["columns", "rows", "total", "returned", "truncated"],
+                    "properties": {
+                        "view": {"type": ["string", "null"]},
+                        "columns": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/BaseQueryColumn"}
+                        },
+                        "rows": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/BaseQueryRow"}
+                        },
+                        "total": {"type": "integer", "minimum": 0},
+                        "returned": {"type": "integer", "minimum": 0},
+                        "truncated": {"type": "boolean"}
                     }
                 },
                 "NeighborDirection": {
@@ -730,6 +795,26 @@ pub(crate) fn openapi_spec() -> Value {
                     "responses": {
                         "200": json_response("#/components/schemas/RecentNotesResponse", "Query results"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid query payload"),
+                        "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
+                    }
+                }
+            },
+            "/api/v1/base/query": {
+                "post": {
+                    "tags": ["vault_bridge"],
+                    "summary": "Run a Base-compatible structured table query",
+                    "security": [{"api_key": []}],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/QueryBaseRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": json_response("#/components/schemas/QueryBaseResponse", "Structured table query results"),
+                        "400": json_response("#/components/schemas/ApiError", "Invalid Base query payload or unsupported expression"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
                     }
                 }

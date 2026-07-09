@@ -243,6 +243,40 @@ async fn openapi_documents_structured_rest_errors() {
             .get("NotesByTagResponse")
             .is_none()
     );
+    assert!(
+        body["components"]["schemas"]
+            .get("QueryBaseRequest")
+            .is_some()
+    );
+    assert_eq!(
+        body["paths"]["/api/v1/base/query"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/QueryBaseResponse"
+    );
+}
+
+#[tokio::test]
+async fn query_base_rest_endpoint_returns_structured_rows() {
+    let app = test_app(test_config()).await;
+
+    let response = app
+        .oneshot(post(
+            "/api/v1/base/query",
+            "external-dev-token",
+            json!({
+                "base_query": "filters:\n  and:\n    - file.hasTag(\"rust\")\nviews:\n  - type: table\n    name: Rust notes\n    order:\n      - file.name\n      - file.tags\n    limit: 10\n",
+                "view": "Rust notes"
+            }),
+        ))
+        .await
+        .expect("base query response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["view"], "Rust notes");
+    assert_eq!(body["columns"][0]["id"], "file.name");
+    assert!(body["rows"].as_array().expect("rows").len() >= 3);
+    assert_eq!(body["truncated"], false);
 }
 
 #[tokio::test]
