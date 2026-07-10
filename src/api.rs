@@ -1077,11 +1077,23 @@ fn render_prometheus_metrics(status: &StatusResponse) -> String {
             "vault_bridge_orphan_leaf_staging {}",
             status.index.orphan_leaf_staging_count
         ),
-        "# HELP vault_bridge_stale_file_aliases LiveSync file aliases whose indexed note row is missing or stale.".to_string(),
+        "# HELP vault_bridge_stale_file_aliases LiveSync file aliases whose raw file or Markdown index row is missing or stale.".to_string(),
         "# TYPE vault_bridge_stale_file_aliases gauge".to_string(),
         format!(
             "vault_bridge_stale_file_aliases {}",
             status.index.stale_file_aliases
+        ),
+        "# HELP vault_bridge_missing_vault_files_for_notes Indexed Markdown notes without a matching raw vault file.".to_string(),
+        "# TYPE vault_bridge_missing_vault_files_for_notes gauge".to_string(),
+        format!(
+            "vault_bridge_missing_vault_files_for_notes {}",
+            status.index.missing_vault_files_for_notes
+        ),
+        "# HELP vault_bridge_unindexed_markdown_vault_files Raw Markdown vault files without a matching indexed note.".to_string(),
+        "# TYPE vault_bridge_unindexed_markdown_vault_files gauge".to_string(),
+        format!(
+            "vault_bridge_unindexed_markdown_vault_files {}",
+            status.index.unindexed_markdown_vault_files
         ),
         "# HELP vault_bridge_total_notes Total indexed notes.".to_string(),
         "# TYPE vault_bridge_total_notes gauge".to_string(),

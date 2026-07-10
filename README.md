@@ -687,6 +687,8 @@ Metrics exposed by `GET /api/v1/metrics` include:
 - `vault_bridge_pending_chunks`
 - `vault_bridge_orphan_leaf_staging`
 - `vault_bridge_stale_file_aliases`
+- `vault_bridge_missing_vault_files_for_notes`
+- `vault_bridge_unindexed_markdown_vault_files`
 - `vault_bridge_total_notes`
 - `vault_bridge_total_links`
 - `vault_bridge_total_tags`
@@ -734,6 +736,9 @@ just logs vault-bridge-db
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
+
+Set `VAULT_BRIDGE_TEST_DATABASE_URL` to a disposable PostgreSQL database whose
+name contains `test` to run the cross-process vault-file persistence regression.
 
 Optional live validation harnesses:
 

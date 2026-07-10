@@ -48,7 +48,8 @@ async fn mock_put_document(
     (
         StatusCode::OK,
         Json(json!({
-            "ok": true
+            "ok": true,
+            "rev": "1-mock"
         })),
     )
 }

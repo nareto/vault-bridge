@@ -28,7 +28,7 @@ async fn mock_put_document(
 ) -> Json<Value> {
     let mut guard = state.upserted_docs.lock().await;
     guard.push((doc_id, doc));
-    Json(json!({ "ok": true }))
+    Json(json!({ "ok": true, "rev": "1-mock" }))
 }
 
 fn spawn_mock_couchdb() -> (String, MockCouchState) {

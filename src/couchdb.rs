@@ -57,6 +57,11 @@ struct BulkAllDocsValue {
     rev: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSyncWriteReceipt {
+    pub couchdb_rev: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct CouchDbClient {
     http: Client,
@@ -608,7 +613,7 @@ impl CouchDbClient {
         &self,
         note_path: &str,
         markdown: &str,
-    ) -> Result<(), CouchDbError> {
+    ) -> Result<LiveSyncWriteReceipt, CouchDbError> {
         let docs = match self.livesync_crypto.as_deref() {
             Some(crypto) => build_native_encrypted_livesync_note_documents(
                 note_path,
@@ -628,7 +633,8 @@ impl CouchDbClient {
                     other => other,
                 })?;
         }
-        self.put_document(&docs.file_id, &docs.file_doc)
+        let file_response = self
+            .put_document(&docs.file_id, &docs.file_doc)
             .await
             .map_err(|error| match error {
                 CouchDbError::Conflict { .. } => CouchDbError::NoteAlreadyExists {
@@ -636,6 +642,7 @@ impl CouchDbClient {
                 },
                 other => other,
             })?;
+        let couchdb_rev = write_response_revision(&file_response, &docs.file_id)?;
         info!(
             note_path,
             file_id = %docs.file_id,
@@ -645,7 +652,7 @@ impl CouchDbClient {
             bytes = markdown.len(),
             "wrote LiveSync note to CouchDB"
         );
-        Ok(())
+        Ok(LiveSyncWriteReceipt { couchdb_rev })
     }
 
     /// Update an existing markdown note in CouchDB.
@@ -658,7 +665,7 @@ impl CouchDbClient {
         &self,
         note_path: &str,
         markdown: &str,
-    ) -> Result<(), CouchDbError> {
+    ) -> Result<LiveSyncWriteReceipt, CouchDbError> {
         let new_docs = match self.livesync_crypto.as_deref() {
             Some(crypto) => build_native_encrypted_livesync_note_documents(
                 note_path,
@@ -716,7 +723,8 @@ impl CouchDbClient {
         // observe the new child list before any now-obsolete chunks disappear.
         let mut file_doc = new_docs.file_doc;
         file_doc["_rev"] = Value::String(file_rev);
-        self.put_document(&new_docs.file_id, &file_doc).await?;
+        let file_response = self.put_document(&new_docs.file_id, &file_doc).await?;
+        let couchdb_rev = write_response_revision(&file_response, &new_docs.file_id)?;
 
         // Delete stale old leaves that are no longer needed.
         for old_leaf_id in &old_leaf_ids {
@@ -735,7 +743,7 @@ impl CouchDbClient {
             bytes = markdown.len(),
             "updated LiveSync note in CouchDB"
         );
-        Ok(())
+        Ok(LiveSyncWriteReceipt { couchdb_rev })
     }
 
     fn existing_file_leaf_ids(&self, existing_file: &Value) -> Result<Vec<String>, CouchDbError> {
@@ -946,6 +954,18 @@ impl CouchDbClient {
     fn recovery_candidate_doc_ids(&self, parent_id: &str) -> Vec<String> {
         recovery_candidate_doc_ids(parent_id, self.livesync_passphrase.as_deref())
     }
+}
+
+fn write_response_revision(response: &Value, document_id: &str) -> Result<String, CouchDbError> {
+    response
+        .get("rev")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            CouchDbError::InvalidResponse(format!(
+                "write response for {document_id} is missing rev"
+            ))
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -1425,7 +1445,7 @@ mod tests {
     ) -> Json<Value> {
         state.operations.lock().await.push(format!("put:{doc_id}"));
         state.docs.lock().await.insert(doc_id, doc);
-        Json(serde_json::json!({ "ok": true }))
+        Json(serde_json::json!({ "ok": true, "rev": "2-mock" }))
     }
 
     async fn mock_delete_document(

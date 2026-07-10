@@ -146,6 +146,7 @@ pub struct PersistedLinkContext {
 
 #[derive(Debug, Clone)]
 pub struct PersistedSnapshot {
+    pub generation: u64,
     pub notes: Vec<PersistedNoteRecord>,
     pub sync_state: Option<PersistedSyncState>,
     pub staged_chunks: Vec<PersistedStagedChunk>,
@@ -251,6 +252,7 @@ impl PostgresPersistence {
                 content TEXT NOT NULL,
                 summary TEXT NOT NULL DEFAULT '',
                 frontmatter JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                sensitivity TEXT NOT NULL DEFAULT 'public',
                 embedding vector({target_dimensions_i32}),
                 couchdb_rev TEXT NOT NULL,
                 created_at TIMESTAMPTZ,
@@ -460,17 +462,20 @@ impl PostgresPersistence {
     }
 
     pub async fn upsert_note(&self, note: &PersistedNoteRecord) -> Result<(), PersistenceError> {
-        let mut tx = self.pool.begin().await?;
-        upsert_note_tx(&mut tx, note).await?;
-        tx.commit().await?;
+        self.apply_content_delta(vec![note.clone()], Vec::new(), None, Vec::new(), Vec::new())
+            .await?;
         Ok(())
     }
 
     pub async fn delete_note(&self, note_id: &str) -> Result<(), PersistenceError> {
-        sqlx::query("DELETE FROM notes WHERE id = $1")
-            .bind(note_id)
-            .execute(&self.pool)
-            .await?;
+        self.apply_content_delta(
+            Vec::new(),
+            vec![note_id.to_string()],
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -479,26 +484,47 @@ impl PostgresPersistence {
         upserts: Vec<PersistedNoteRecord>,
         deletes: Vec<String>,
         sync_state: Option<PersistedSyncState>,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<u64, PersistenceError> {
+        self.apply_content_delta(upserts, deletes, sync_state, Vec::new(), Vec::new())
+            .await
+    }
+
+    pub async fn apply_content_delta(
+        &self,
+        note_upserts: Vec<PersistedNoteRecord>,
+        note_deletes: Vec<String>,
+        sync_state: Option<PersistedSyncState>,
+        vault_file_upserts: Vec<PersistedVaultFile>,
+        vault_file_deletes: Vec<String>,
+    ) -> Result<u64, PersistenceError> {
         let mut tx = self.pool.begin().await?;
 
-        for note_id in deletes {
+        for note_id in note_deletes {
             sqlx::query("DELETE FROM notes WHERE id = $1")
                 .bind(note_id)
                 .execute(&mut *tx)
                 .await?;
         }
 
-        for note in &upserts {
+        for note in &note_upserts {
             upsert_note_tx(&mut tx, note).await?;
+        }
+
+        for path in vault_file_deletes {
+            delete_vault_file_tx(&mut tx, &path).await?;
+        }
+
+        for file in &vault_file_upserts {
+            upsert_vault_file_tx(&mut tx, file).await?;
         }
 
         if let Some(sync_state) = sync_state {
             upsert_sync_state_tx(&mut tx, &sync_state).await?;
         }
 
+        let generation = bump_store_generation_tx(&mut tx).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(generation)
     }
 
     pub async fn apply_chunk_staging_delta(
@@ -610,34 +636,13 @@ impl PostgresPersistence {
         &self,
         file: &PersistedVaultFile,
     ) -> Result<(), PersistenceError> {
-        sqlx::query(
-            r#"
-            INSERT INTO vault_files (path, content, couchdb_rev, created_at, updated_at, indexed_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (path)
-            DO UPDATE SET
-                content = EXCLUDED.content,
-                couchdb_rev = EXCLUDED.couchdb_rev,
-                created_at = EXCLUDED.created_at,
-                updated_at = EXCLUDED.updated_at,
-                indexed_at = EXCLUDED.indexed_at
-            "#,
-        )
-        .bind(&file.path)
-        .bind(&file.content)
-        .bind(&file.couchdb_rev)
-        .bind(file.created_at)
-        .bind(file.updated_at)
-        .bind(file.indexed_at)
-        .execute(&self.pool)
-        .await?;
+        self.apply_vault_file_delta(vec![file.clone()], Vec::new())
+            .await?;
         Ok(())
     }
 
     pub async fn delete_vault_file(&self, path: &str) -> Result<(), PersistenceError> {
-        sqlx::query("DELETE FROM vault_files WHERE path = $1")
-            .bind(path)
-            .execute(&self.pool)
+        self.apply_vault_file_delta(Vec::new(), vec![path.to_string()])
             .await?;
         Ok(())
     }
@@ -646,46 +651,27 @@ impl PostgresPersistence {
         &self,
         upserts: Vec<PersistedVaultFile>,
         deletes: Vec<String>,
-    ) -> Result<(), PersistenceError> {
-        if upserts.is_empty() && deletes.is_empty() {
-            return Ok(());
-        }
+    ) -> Result<u64, PersistenceError> {
+        self.apply_content_delta(Vec::new(), Vec::new(), None, upserts, deletes)
+            .await
+    }
 
-        let mut tx = self.pool.begin().await?;
+    pub async fn load_store_generation(&self) -> Result<u64, PersistenceError> {
+        let generation: i64 = sqlx::query_scalar("SELECT generation FROM store_state WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(0);
+        Ok(generation.max(0) as u64)
+    }
 
-        for path in deletes {
-            sqlx::query("DELETE FROM vault_files WHERE path = $1")
-                .bind(path)
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        for file in &upserts {
-            sqlx::query(
-                r#"
-                INSERT INTO vault_files (path, content, couchdb_rev, created_at, updated_at, indexed_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (path)
-                DO UPDATE SET
-                    content = EXCLUDED.content,
-                    couchdb_rev = EXCLUDED.couchdb_rev,
-                    created_at = EXCLUDED.created_at,
-                    updated_at = EXCLUDED.updated_at,
-                    indexed_at = EXCLUDED.indexed_at
-                "#,
-            )
-            .bind(&file.path)
-            .bind(&file.content)
-            .bind(&file.couchdb_rev)
-            .bind(file.created_at)
-            .bind(file.updated_at)
-            .bind(file.indexed_at)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
+    pub async fn vault_path_exists(&self, path: &str) -> Result<bool, PersistenceError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM vault_files WHERE path = $1 UNION SELECT 1 FROM notes WHERE id = $1)",
+        )
+        .bind(path)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
     }
 
     pub async fn pending_embedding_batch(
@@ -1106,9 +1092,14 @@ impl PostgresPersistence {
             r#"
             SELECT COUNT(*) AS stale_file_aliases
             FROM file_aliases fa
+            LEFT JOIN vault_files vf ON vf.path = fa.note_path
             LEFT JOIN notes n ON n.id = fa.note_path
-            WHERE n.id IS NULL
-               OR n.couchdb_rev <> fa.couchdb_rev
+            WHERE vf.path IS NULL
+               OR vf.couchdb_rev <> fa.couchdb_rev
+               OR (
+                    lower(fa.note_path) LIKE '%.md'
+                    AND (n.id IS NULL OR n.couchdb_rev <> fa.couchdb_rev)
+               )
             "#,
         )
         .fetch_one(&self.pool)
@@ -1270,6 +1261,11 @@ impl PostgresPersistence {
     }
 
     pub async fn load_snapshot(&self) -> Result<PersistedSnapshot, PersistenceError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+
         let note_rows = sqlx::query(
             r#"
             SELECT id, path, title, content, search_text, summary, frontmatter,
@@ -1277,7 +1273,7 @@ impl PostgresPersistence {
             FROM notes
             "#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let mut notes_by_id: HashMap<String, PersistedNoteRecord> = HashMap::new();
@@ -1306,7 +1302,7 @@ impl PostgresPersistence {
         }
 
         let tag_rows = sqlx::query("SELECT note_id, tag FROM tags")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         for row in tag_rows {
             let note_id: String = row.try_get("note_id")?;
@@ -1318,7 +1314,7 @@ impl PostgresPersistence {
 
         let link_rows =
             sqlx::query("SELECT source_id, target_id, context_text, position FROM links")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
         for row in link_rows {
             let source_id: String = row.try_get("source_id")?;
@@ -1348,7 +1344,7 @@ impl PostgresPersistence {
         let sync_state = match sqlx::query(
             "SELECT last_seq, couchdb_current_seq, updated_at FROM sync_state WHERE id = 1",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
         {
             Some(row) => Some(PersistedSyncState {
@@ -1365,7 +1361,7 @@ impl PostgresPersistence {
             FROM chunk_staging
             "#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let mut staged_chunks = chunk_rows
             .into_iter()
@@ -1395,7 +1391,7 @@ impl PostgresPersistence {
             ORDER BY file_doc_id ASC
             "#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let file_aliases = alias_rows
             .into_iter()
@@ -1418,7 +1414,7 @@ impl PostgresPersistence {
             ORDER BY path ASC
             "#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let vault_files = vault_file_rows
             .into_iter()
@@ -1434,7 +1430,14 @@ impl PostgresPersistence {
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
+        let generation: i64 = sqlx::query_scalar("SELECT generation FROM store_state WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(0);
+        tx.commit().await?;
+
         Ok(PersistedSnapshot {
+            generation: generation.max(0) as u64,
             notes: notes_by_id.into_values().collect(),
             sync_state,
             staged_chunks,
@@ -2088,7 +2091,7 @@ impl PostgresPersistence {
     #[cfg(test)]
     pub async fn reset_for_test(&self) -> Result<(), PersistenceError> {
         sqlx::query(
-            "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, sync_state, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
+            "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
         )
         .execute(&self.pool)
         .await?;
@@ -2150,6 +2153,62 @@ fn parse_vector_dimensions_from_format_type(formatted_type: &str) -> Option<usiz
         .ok()?;
 
     (dimensions > 0).then_some(dimensions)
+}
+
+async fn upsert_vault_file_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    file: &PersistedVaultFile,
+) -> Result<(), PersistenceError> {
+    sqlx::query(
+        r#"
+        INSERT INTO vault_files (path, content, couchdb_rev, created_at, updated_at, indexed_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (path)
+        DO UPDATE SET
+            content = EXCLUDED.content,
+            couchdb_rev = EXCLUDED.couchdb_rev,
+            created_at = EXCLUDED.created_at,
+            updated_at = EXCLUDED.updated_at,
+            indexed_at = EXCLUDED.indexed_at
+        "#,
+    )
+    .bind(&file.path)
+    .bind(&file.content)
+    .bind(&file.couchdb_rev)
+    .bind(file.created_at)
+    .bind(file.updated_at)
+    .bind(file.indexed_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn delete_vault_file_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    path: &str,
+) -> Result<(), PersistenceError> {
+    sqlx::query("DELETE FROM vault_files WHERE path = $1")
+        .bind(path)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn bump_store_generation_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<u64, PersistenceError> {
+    let generation: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO store_state (id, generation)
+        VALUES (1, 1)
+        ON CONFLICT (id)
+        DO UPDATE SET generation = store_state.generation + 1
+        RETURNING generation
+        "#,
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(generation.max(0) as u64)
 }
 
 async fn upsert_note_tx(

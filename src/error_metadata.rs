@@ -176,6 +176,13 @@ fn write_error_metadata(error: &WriteError) -> ErrorMetadata {
             error.to_string(),
         )
         .with_http_status(400),
+        WriteError::Persistence => ErrorMetadata::new(
+            ErrorCategory::Transient,
+            true,
+            "persistence failed",
+            "The durable local content transaction failed; retry after source reconciliation",
+        )
+        .with_http_status(503),
     }
 }
 

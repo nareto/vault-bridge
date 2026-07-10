@@ -118,6 +118,8 @@ pub enum WriteError {
         path: String,
         reason: String,
     },
+    #[error("persistence failed")]
+    Persistence,
 }
 
 impl NewNoteRequest {
@@ -316,7 +318,7 @@ impl UpdateNoteRequest {
     }
 }
 
-fn apply_content_patch(
+pub(crate) fn apply_content_patch(
     existing_body: &str,
     patch: &[ContentPatchOperation],
 ) -> Result<String, WriteError> {

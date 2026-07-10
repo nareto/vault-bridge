@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
@@ -33,6 +34,7 @@ use crate::markdown::{
 use crate::model::{Note, NoteId, UnscopedNote, VaultFile};
 use crate::new_note::{
     NewNoteFileType, NewNotePathSettings, NewNoteRequest, UpdateNoteRequest, WriteError,
+    apply_content_patch,
 };
 use crate::persistence::{
     BlockEmbeddingStats, BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias,
@@ -108,6 +110,23 @@ pub struct LinkInput {
     pub target_id: NoteId,
     pub context_text: String,
     pub position: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedVaultWrite {
+    pub(crate) path: String,
+    pub(crate) content: String,
+    pub(crate) file_type: NewNoteFileType,
+    pub(crate) created_at: Option<DateTime<Utc>>,
+    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) note: Option<NoteInput>,
+    pub(crate) mark_created: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedNoteUpsert {
+    note: StoredNote,
+    links: Vec<LinkRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +437,8 @@ pub struct IndexStats {
     pub pending_chunks: usize,
     pub orphan_leaf_staging_count: usize,
     pub stale_file_aliases: usize,
+    pub missing_vault_files_for_notes: usize,
+    pub unindexed_markdown_vault_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -491,6 +512,15 @@ impl ChunkStagingPurgeResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteVisibility {
     Missing,
+    Accessible,
+    Filtered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultFileVisibility {
+    Missing,
+    MissingRawWithIndexedNote,
+    MissingIndexWithRawMarkdown,
     Accessible,
     Filtered,
 }
@@ -663,6 +693,7 @@ pub struct VaultStore {
     authorization: RuntimeAuthConfig,
     audit: Arc<RwLock<StoreAuditState>>,
     sync_state: Arc<RwLock<RuntimeSyncState>>,
+    cache_generation: Arc<AtomicU64>,
     read_refresh_lock: Arc<Mutex<()>>,
     persistence: Option<Arc<PostgresPersistence>>,
 }
@@ -764,6 +795,7 @@ impl VaultStore {
             authorization,
             audit: Arc::new(RwLock::new(audit)),
             sync_state: Arc::new(RwLock::new(sync_state)),
+            cache_generation: Arc::new(AtomicU64::new(0)),
             read_refresh_lock: Arc::new(Mutex::new(())),
             persistence,
         }
@@ -774,28 +806,41 @@ impl VaultStore {
             return Ok(());
         };
 
-        let Some(persisted_sync_state) = persistence.load_sync_state().await? else {
-            return Ok(());
-        };
+        let persisted_generation = persistence.load_store_generation().await?;
+        let persisted_sync_state = persistence.load_sync_state().await?;
+        if !self
+            .persisted_state_is_newer(persisted_generation, persisted_sync_state.as_ref())
+            .await
         {
-            let runtime_sync_state = self.sync_state.read().await;
-            if !persisted_sync_state_is_newer(&runtime_sync_state, &persisted_sync_state) {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         let _refresh_guard = self.read_refresh_lock.lock().await;
-        let Some(persisted_sync_state) = persistence.load_sync_state().await? else {
-            return Ok(());
-        };
+        let persisted_generation = persistence.load_store_generation().await?;
+        let persisted_sync_state = persistence.load_sync_state().await?;
+        if !self
+            .persisted_state_is_newer(persisted_generation, persisted_sync_state.as_ref())
+            .await
         {
-            let runtime_sync_state = self.sync_state.read().await;
-            if !persisted_sync_state_is_newer(&runtime_sync_state, &persisted_sync_state) {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         self.hydrate_from_persistence().await
+    }
+
+    async fn persisted_state_is_newer(
+        &self,
+        persisted_generation: u64,
+        persisted_sync_state: Option<&PersistedSyncState>,
+    ) -> bool {
+        if persisted_generation > self.cache_generation.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(persisted_sync_state) = persisted_sync_state else {
+            return false;
+        };
+        let runtime_sync_state = self.sync_state.read().await;
+        persisted_sync_state_is_newer(&runtime_sync_state, persisted_sync_state)
     }
 
     async fn prepare_cached_read(&self, read_context: &'static str) {
@@ -820,6 +865,7 @@ impl VaultStore {
         };
 
         let snapshot = persistence.load_snapshot().await?;
+        let snapshot_generation = snapshot.generation;
         let mut guard = self.inner.write().await;
 
         guard.notes.clear();
@@ -966,13 +1012,16 @@ impl VaultStore {
         drop(guard);
         *self.sync_state.write().await = runtime_sync_state;
 
+        let mut cache_generation = snapshot_generation;
         if let Some((upserts, deletes, block_sync_notes)) = repaired_batch {
-            persistence.apply_delta(upserts, deletes, None).await?;
+            cache_generation = persistence.apply_delta(upserts, deletes, None).await?;
             for (note_id, path, title, content) in block_sync_notes {
                 self.sync_blocks_for_note(&note_id, &path, &title, &content)
                     .await;
             }
         }
+        self.cache_generation
+            .store(cache_generation, Ordering::Release);
 
         Ok(())
     }
@@ -1108,11 +1157,16 @@ impl VaultStore {
 
         if let Some(persistence) = self.persistence.as_ref()
             && let (Some(note), Some(sync_state)) = (persisted_note, sync_state)
-            && let Err(error) = persistence
+        {
+            match persistence
                 .apply_delta(vec![note], Vec::new(), Some(sync_state))
                 .await
-        {
-            warn!(error = %error, note_id = %note_id, "failed to persist note upsert");
+            {
+                Ok(generation) => self.cache_generation.store(generation, Ordering::Release),
+                Err(error) => {
+                    warn!(error = %error, note_id = %note_id, "failed to persist note upsert")
+                }
+            }
         }
 
         if let Some((path, title, content)) = block_data {
@@ -1145,15 +1199,20 @@ impl VaultStore {
         if existed
             && let Some(persistence) = self.persistence.as_ref()
             && let Some(sync_state) = sync_state
-            && let Err(error) = persistence
+        {
+            match persistence
                 .apply_delta(
                     Vec::new(),
                     vec![note_id.as_str().to_string()],
                     Some(sync_state),
                 )
                 .await
-        {
-            warn!(error = %error, note_id = %note_id, "failed to persist note deletion");
+            {
+                Ok(generation) => self.cache_generation.store(generation, Ordering::Release),
+                Err(error) => {
+                    warn!(error = %error, note_id = %note_id, "failed to persist note deletion")
+                }
+            }
         }
     }
 
@@ -1567,10 +1626,25 @@ impl VaultStore {
                 vault_file_deletes,
             )) = persistence_batch
         {
-            if (!upserts.is_empty() || !deletes.is_empty() || sync_state.is_some())
-                && let Err(error) = persistence.apply_delta(upserts, deletes, sync_state).await
+            if !upserts.is_empty()
+                || !deletes.is_empty()
+                || sync_state.is_some()
+                || !vault_file_upserts.is_empty()
+                || !vault_file_deletes.is_empty()
             {
-                warn!(error = %error, "failed to persist sync batch");
+                match persistence
+                    .apply_content_delta(
+                        upserts,
+                        deletes,
+                        sync_state,
+                        vault_file_upserts,
+                        vault_file_deletes,
+                    )
+                    .await
+                {
+                    Ok(generation) => self.cache_generation.store(generation, Ordering::Release),
+                    Err(error) => warn!(error = %error, "failed to persist sync content batch"),
+                }
             }
 
             if (!chunk_upserts.is_empty() || !chunk_deletes.is_empty())
@@ -1587,14 +1661,6 @@ impl VaultStore {
                     .await
             {
                 warn!(error = %error, "failed to persist file alias batch");
-            }
-
-            if (!vault_file_upserts.is_empty() || !vault_file_deletes.is_empty())
-                && let Err(error) = persistence
-                    .apply_vault_file_delta(vault_file_upserts, vault_file_deletes)
-                    .await
-            {
-                warn!(error = %error, "failed to persist vault file batch");
             }
         }
 
@@ -2587,27 +2653,24 @@ impl VaultStore {
         let note_id = NoteId::new(path.clone());
 
         if let Some(persistence) = self.persistence.as_ref() {
-            match persistence
-                .load_note_titles_by_ids(std::slice::from_ref(&path))
-                .await
-            {
-                Ok(existing) => {
-                    if existing.contains_key(&path) {
-                        return Err(WriteError::AlreadyExists { path });
-                    }
-                }
+            match persistence.vault_path_exists(&path).await {
+                Ok(true) => return Err(WriteError::AlreadyExists { path }),
+                Ok(false) => {}
                 Err(error) => {
                     warn!(
                         error = %error,
                         note_id = %note_id,
-                        "failed postgres-backed note existence check; using in-memory fallback"
+                        "failed postgres-backed vault path existence check; using in-memory fallback"
                     );
                 }
             }
         }
 
         let guard = self.inner.read().await;
-        if guard.notes.contains_key(&note_id) || guard.created_file_paths.contains(&path) {
+        if guard.notes.contains_key(&note_id)
+            || guard.vault_files.contains_key(&path)
+            || guard.created_file_paths.contains(&path)
+        {
             return Err(WriteError::AlreadyExists { path });
         }
 
@@ -2682,76 +2745,134 @@ impl VaultStore {
         request: NewNoteRequest,
         now: DateTime<Utc>,
     ) -> Result<NewNoteResponse, WriteError> {
-        let path = self.validate_new_note_write_at(&request, now).await?;
-        let file_type = request.file_type;
+        let write = self.prepare_create_vault_write_at(request, now).await?;
+        let response = NewNoteResponse {
+            id: NoteId::new(write.path.clone()),
+            status: "created",
+            file_type: write.file_type,
+            indexed_as_note: write.note.is_some(),
+        };
+        self.commit_prepared_vault_write(write, "local-new-note")
+            .await?;
+        Ok(response)
+    }
 
-        {
-            let mut guard = self.inner.write().await;
-            guard.created_file_paths.insert(path.clone());
-            upsert_vault_file_locked(
-                &mut guard,
+    pub async fn prepare_create_vault_write_at(
+        &self,
+        request: NewNoteRequest,
+        now: DateTime<Utc>,
+    ) -> Result<PreparedVaultWrite, WriteError> {
+        let path = self.validate_new_note_write_at(&request, now).await?;
+        if request.file_type == NewNoteFileType::Base {
+            validate_base_file_content(&request.content)?;
+        }
+        let note = if request.file_type.is_markdown() {
+            let max_link_context_chars = self.settings.read().await.max_link_context_chars;
+            Some(note_input_from_raw_markdown(
                 &path,
                 &request.content,
-                "local-new-note",
+                "",
                 Some(now),
                 now,
-                now,
-            );
-        }
-
-        if !file_type.is_markdown() {
-            return Ok(NewNoteResponse {
-                id: NoteId::new(path),
-                status: "created",
-                file_type,
-                indexed_as_note: false,
-            });
-        }
-
-        let max_link_context_chars = self.settings.read().await.max_link_context_chars;
-        let parsed = parse_markdown(&request.content, max_link_context_chars);
-
-        let links = parsed
-            .links
-            .into_iter()
-            .map(|link| LinkInput {
-                target_id: NoteId::new(link.target),
-                context_text: link.context,
-                position: link.byte_offset,
-            })
-            .collect::<Vec<_>>();
-
-        let mut tags = parsed.tags;
-        tags.sort();
-        tags.dedup();
-
-        let input = NoteInput {
-            id: NoteId::new(path.clone()),
-            title: title_from_note_id(&path),
-            // Store body without frontmatter to mirror notes.content semantics.
-            content: parsed.body,
-            frontmatter: parsed.frontmatter,
-            tags,
-            couchdb_rev: "local-new-note".to_string(),
-            created_at: Some(now),
-            updated_at: now,
-            embedding: None,
-            links,
+                max_link_context_chars,
+            ))
+        } else {
+            None
         };
 
-        self.upsert_note(input).await;
-        self.inner
-            .write()
-            .await
-            .created_file_paths
-            .insert(path.clone());
-
-        Ok(NewNoteResponse {
-            id: NoteId::new(path),
-            status: "created",
+        Ok(PreparedVaultWrite {
+            path,
+            content: request.content,
             file_type: request.file_type,
-            indexed_as_note: true,
+            created_at: Some(now),
+            updated_at: now,
+            note,
+            mark_created: true,
         })
+    }
+
+    pub async fn commit_prepared_vault_write(
+        &self,
+        mut write: PreparedVaultWrite,
+        couchdb_rev: &str,
+    ) -> Result<(), WriteError> {
+        let couchdb_rev = couchdb_rev.to_string();
+        if let Some(note) = write.note.as_mut() {
+            note.couchdb_rev = couchdb_rev.clone();
+        }
+        let prepared_note = write
+            .note
+            .take()
+            .map(|note| prepare_note_upsert(note, write.updated_at));
+        let persisted_note = prepared_note.as_ref().map(persisted_note_from_prepared);
+        let stored_file = StoredVaultFile {
+            path: write.path.clone(),
+            content: write.content.clone(),
+            couchdb_rev: couchdb_rev.clone(),
+            created_at: write.created_at,
+            updated_at: write.updated_at,
+            indexed_at: write.updated_at,
+        };
+        let persisted_file = PersistedVaultFile {
+            path: stored_file.path.clone(),
+            content: stored_file.content.clone(),
+            couchdb_rev: stored_file.couchdb_rev.clone(),
+            created_at: stored_file.created_at,
+            updated_at: stored_file.updated_at,
+            indexed_at: stored_file.indexed_at,
+        };
+
+        let refresh_guard = self.read_refresh_lock.lock().await;
+        let generation = if let Some(persistence) = self.persistence.as_ref() {
+            match persistence
+                .apply_content_delta(
+                    persisted_note.into_iter().collect(),
+                    Vec::new(),
+                    None,
+                    vec![persisted_file],
+                    Vec::new(),
+                )
+                .await
+            {
+                Ok(generation) => Some(generation),
+                Err(error) => {
+                    warn!(error = %error, "failed to persist direct vault write");
+                    return Err(WriteError::Persistence);
+                }
+            }
+        } else {
+            None
+        };
+
+        let block_data = prepared_note.as_ref().map(|prepared| {
+            (
+                prepared.note.id.as_str().to_string(),
+                prepared.note.path.clone(),
+                prepared.note.title.clone(),
+                prepared.note.content.clone(),
+            )
+        });
+        {
+            let mut guard = self.inner.write().await;
+            if write.mark_created {
+                guard.created_file_paths.insert(write.path.clone());
+            }
+            guard.vault_files.insert(write.path, stored_file);
+            if let Some(prepared_note) = prepared_note {
+                apply_prepared_note_upsert_locked(&mut guard, prepared_note);
+                rebuild_graph_cache_locked(&mut guard);
+            }
+        }
+        if let Some(generation) = generation {
+            self.cache_generation.store(generation, Ordering::Release);
+        }
+        drop(refresh_guard);
+
+        if let Some((note_id, path, title, content)) = block_data {
+            self.sync_blocks_for_note(&note_id, &path, &title, &content)
+                .await;
+        }
+        Ok(())
     }
 
     pub async fn prepare_update_note_request(
@@ -2761,6 +2882,7 @@ impl VaultStore {
         mut request: UpdateNoteRequest,
         now: DateTime<Utc>,
     ) -> Result<UpdateNoteRequest, WriteError> {
+        self.prepare_cached_read("prepare note update").await;
         let path = note_id.as_str().to_string();
         let note = {
             let guard = self.inner.read().await;
@@ -2778,6 +2900,17 @@ impl VaultStore {
                 reason: "no matching edit rule in the effective authorization policy".to_string(),
             });
         };
+
+        if let Some(metadata) = request.metadata.as_mut() {
+            let Some(metadata) = metadata.as_object_mut() else {
+                return Err(WriteError::InvalidUpdate {
+                    reason: "metadata must be an object".to_string(),
+                });
+            };
+            for managed_key in ["created", "created_by", "tags", "updated"] {
+                metadata.remove(managed_key);
+            }
+        }
 
         if let Some(tags) = request.tags.as_mut() {
             for tag in decision.preserve_tags {
@@ -2802,19 +2935,13 @@ impl VaultStore {
         Some(note.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)))
     }
 
-    /// Update an existing note in the in-memory store.
-    ///
-    /// Returns the rebuilt markdown so the caller can write it back to CouchDB
-    /// before or after this call.
-    pub async fn update_note_at(
+    pub async fn prepare_update_note_write_at(
         &self,
         note_id: &NoteId,
         request: &UpdateNoteRequest,
         now: DateTime<Utc>,
-    ) -> Result<(UpdateNoteResponse, String), WriteError> {
+    ) -> Result<PreparedVaultWrite, WriteError> {
         let path = note_id.as_str().to_string();
-        let max_link_context_chars = self.settings.read().await.max_link_context_chars;
-
         let (existing_frontmatter, existing_body, existing_tags, existing_created_at) = {
             let guard = self.inner.read().await;
             let note = guard
@@ -2828,54 +2955,41 @@ impl VaultStore {
                 note.created_at,
             )
         };
-
         let markdown =
             request.rebuild_markdown(&existing_frontmatter, &existing_body, &existing_tags, now)?;
-        let parsed = parse_markdown(&markdown, max_link_context_chars);
+        let max_link_context_chars = self.settings.read().await.max_link_context_chars;
+        let note = note_input_from_raw_markdown(
+            &path,
+            &markdown,
+            "",
+            existing_created_at,
+            now,
+            max_link_context_chars,
+        );
 
-        let links = parsed
-            .links
-            .into_iter()
-            .map(|link| LinkInput {
-                target_id: NoteId::new(link.target),
-                context_text: link.context,
-                position: link.byte_offset,
-            })
-            .collect::<Vec<_>>();
-
-        let mut tags = request.tags.clone().unwrap_or(existing_tags);
-        tags.extend(parsed.tags);
-        tags.sort();
-        tags.dedup();
-
-        let input = NoteInput {
-            id: note_id.clone(),
-            title: title_from_note_id(&path),
-            content: parsed.body,
-            frontmatter: parsed.frontmatter,
-            tags,
-            couchdb_rev: "local-update-note".to_string(),
+        Ok(PreparedVaultWrite {
+            path,
+            content: markdown,
+            file_type: NewNoteFileType::Md,
             created_at: existing_created_at,
             updated_at: now,
-            embedding: None,
-            links,
-        };
+            note: Some(note),
+            mark_created: false,
+        })
+    }
 
-        self.upsert_note(input).await;
-
-        {
-            let mut guard = self.inner.write().await;
-            upsert_vault_file_locked(
-                &mut guard,
-                &path,
-                &markdown,
-                "local-update-note",
-                existing_created_at,
-                now,
-                now,
-            );
-        }
-
+    pub async fn update_note_at(
+        &self,
+        note_id: &NoteId,
+        request: &UpdateNoteRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(UpdateNoteResponse, String), WriteError> {
+        let write = self
+            .prepare_update_note_write_at(note_id, request, now)
+            .await?;
+        let markdown = write.content.clone();
+        self.commit_prepared_vault_write(write, "local-update-note")
+            .await?;
         Ok((
             UpdateNoteResponse {
                 id: note_id.clone(),
@@ -2906,27 +3020,27 @@ impl VaultStore {
         &self,
         auth: &AuthContext,
         file_id: &NoteId,
-    ) -> NoteVisibility {
+    ) -> VaultFileVisibility {
         self.prepare_cached_read("vault file visibility lookup")
             .await;
         let guard = self.inner.read().await;
         let path = file_id.as_str();
-        match guard.vault_files.get(path) {
-            None => NoteVisibility::Missing,
-            Some(_) => {
-                let config = self.authorization_config().await;
-                if vault_file_readable_for_policy_from_inner(
-                    &guard,
-                    &config,
-                    auth,
-                    path,
-                    Utc::now(),
-                ) {
-                    NoteVisibility::Accessible
-                } else {
-                    NoteVisibility::Filtered
-                }
-            }
+        let Some(_) = guard.vault_files.get(path) else {
+            return if is_markdown_note_path(path) && guard.notes.contains_key(&NoteId::new(path)) {
+                VaultFileVisibility::MissingRawWithIndexedNote
+            } else {
+                VaultFileVisibility::Missing
+            };
+        };
+        if is_markdown_note_path(path) && !guard.notes.contains_key(&NoteId::new(path)) {
+            return VaultFileVisibility::MissingIndexWithRawMarkdown;
+        }
+
+        let config = self.authorization_config().await;
+        if vault_file_readable_for_policy_from_inner(&guard, &config, auth, path, Utc::now()) {
+            VaultFileVisibility::Accessible
+        } else {
+            VaultFileVisibility::Filtered
         }
     }
 
@@ -2978,88 +3092,61 @@ impl VaultStore {
         request: NewNoteRequest,
         now: DateTime<Utc>,
     ) -> Result<NewNoteResponse, WriteError> {
-        let path = self.validate_new_note_write_at(&request, now).await?;
-        let file_type = request.file_type;
-
-        {
-            let mut guard = self.inner.write().await;
-            guard.created_file_paths.insert(path.clone());
-            upsert_vault_file_locked(
-                &mut guard,
-                &path,
-                &request.content,
-                "local-new-file",
-                Some(now),
-                now,
-                now,
-            );
-        }
-
-        let indexed_as_note = if file_type.is_markdown() {
-            let max_link_context_chars = self.settings.read().await.max_link_context_chars;
-            let parsed = parse_markdown(&request.content, max_link_context_chars);
-            let links = parsed
-                .links
-                .into_iter()
-                .map(|link| LinkInput {
-                    target_id: NoteId::new(link.target),
-                    context_text: link.context,
-                    position: link.byte_offset,
-                })
-                .collect::<Vec<_>>();
-            let mut tags = parsed.tags;
-            tags.sort();
-            tags.dedup();
-            let input = NoteInput {
-                id: NoteId::new(path.clone()),
-                title: title_from_note_id(&path),
-                content: parsed.body,
-                frontmatter: parsed.frontmatter,
-                tags,
-                couchdb_rev: "local-new-note".to_string(),
-                created_at: Some(now),
-                updated_at: now,
-                embedding: None,
-                links,
-            };
-            self.upsert_note(input).await;
-            true
-        } else {
-            false
-        };
-
-        Ok(NewNoteResponse {
-            id: NoteId::new(path),
+        let write = self.prepare_create_vault_write_at(request, now).await?;
+        let response = NewNoteResponse {
+            id: NoteId::new(write.path.clone()),
             status: "created",
-            file_type,
-            indexed_as_note,
-        })
+            file_type: write.file_type,
+            indexed_as_note: write.note.is_some(),
+        };
+        self.commit_prepared_vault_write(write, "local-new-file")
+            .await?;
+        Ok(response)
     }
 
-    /// Edit a raw vault file with policy enforcement.
-    pub async fn edit_vault_file(
+    pub async fn prepare_edit_vault_file_write(
         &self,
         auth: &AuthContext,
         file_id: &NoteId,
         request: UpdateNoteRequest,
         now: DateTime<Utc>,
-    ) -> Result<(UpdateNoteResponse, String), WriteError> {
+    ) -> Result<PreparedVaultWrite, WriteError> {
+        self.prepare_cached_read("prepare vault file edit").await;
         let path = file_id.as_str().to_string();
-
-        let policy_note = {
+        let file_type = file_type_from_path(&path);
+        let (existing_content, existing_created_at, existing_frontmatter, policy_note) = {
             let guard = self.inner.read().await;
-            if let Some(vf) = guard.vault_files.get(&path) {
-                PolicyNote {
-                    path: path.clone(),
-                    title: title_from_note_id(&path),
-                    tags: Vec::new(),
-                    created_at: vf.created_at,
-                    updated_at: vf.updated_at,
-                    owner: None,
-                }
+            let file = guard
+                .vault_files
+                .get(&path)
+                .ok_or_else(|| WriteError::NotFound { path: path.clone() })?;
+            let stored_note = if file_type.is_markdown() {
+                Some(
+                    guard
+                        .notes
+                        .get(file_id)
+                        .ok_or_else(|| WriteError::NotFound { path: path.clone() })?,
+                )
             } else {
-                return Err(WriteError::NotFound { path });
-            }
+                None
+            };
+            let policy_note =
+                stored_note
+                    .map(policy_note_from_stored)
+                    .unwrap_or_else(|| PolicyNote {
+                        path: path.clone(),
+                        title: title_from_note_id(&path),
+                        tags: Vec::new(),
+                        created_at: file.created_at,
+                        updated_at: file.updated_at,
+                        owner: None,
+                    });
+            (
+                file.content.clone(),
+                file.created_at,
+                stored_note.map(|note| note.frontmatter.clone()),
+                policy_note,
+            )
         };
 
         let config = self.authorization_config().await;
@@ -3070,127 +3157,81 @@ impl VaultStore {
                 reason: "no matching edit rule in the effective authorization policy".to_string(),
             });
         };
-
-        let mut request = request;
-        if let Some(tags) = request.tags.as_mut() {
-            for tag in decision.preserve_tags {
-                if tags.iter().any(|candidate| {
-                    crate::authorization::normalize_tag(candidate)
-                        .eq_ignore_ascii_case(&crate::authorization::normalize_tag(&tag))
-                }) {
-                    add_unique_tag(tags, &tag);
-                }
-            }
-            tags.sort();
-            tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        if request.content.is_some() && request.content_patch.is_some() {
+            return Err(WriteError::InvalidUpdate {
+                reason: "content and content_patch are mutually exclusive".to_string(),
+            });
         }
-
-        self.edit_vault_file_at(file_id, &request, now).await
-    }
-
-    /// Edit a raw vault file by exact path.
-    pub async fn edit_vault_file_at(
-        &self,
-        file_id: &NoteId,
-        request: &UpdateNoteRequest,
-        now: DateTime<Utc>,
-    ) -> Result<(UpdateNoteResponse, String), WriteError> {
-        let path = file_id.as_str().to_string();
-        let file_type = file_type_from_path(&path);
-
-        let (existing_content, existing_created_at) = {
-            let guard = self.inner.read().await;
-            let file = guard
-                .vault_files
-                .get(&path)
-                .ok_or_else(|| WriteError::NotFound { path: path.clone() })?;
-            (file.content.clone(), file.created_at)
-        };
-
         if !file_type.is_markdown() && (request.tags.is_some() || request.metadata.is_some()) {
             return Err(WriteError::InvalidUpdate {
                 reason: "tags and metadata are only valid for markdown (.md) files".to_string(),
             });
         }
 
-        let new_content = if let Some(content) = &request.content {
-            content.clone()
-        } else if let Some(patch_ops) = &request.content_patch {
-            apply_content_patch_for_vault_file(&existing_content, patch_ops)?
-        } else {
-            existing_content.clone()
+        let candidate_content = match (&request.content, &request.content_patch) {
+            (Some(content), None) => content.clone(),
+            (None, Some(patch)) => apply_content_patch(&existing_content, patch)?,
+            (None, None) => existing_content,
+            (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
         };
 
-        if !file_type.is_markdown() {
-            validate_base_file_content(&new_content)?;
-        }
-
-        {
-            let mut guard = self.inner.write().await;
-            upsert_vault_file_locked(
-                &mut guard,
+        let (content, note) = if file_type.is_markdown() {
+            let existing_frontmatter = existing_frontmatter
+                .as_ref()
+                .expect("markdown edit requires indexed frontmatter");
+            let content = apply_markdown_raw_update(
+                &candidate_content,
+                &request,
+                existing_frontmatter,
+                &decision.preserve_tags,
+                &policy_note.tags,
+                now,
+            )?;
+            let max_link_context_chars = self.settings.read().await.max_link_context_chars;
+            let note = note_input_from_raw_markdown(
                 &path,
-                &new_content,
-                "local-edit-file",
+                &content,
+                "",
                 existing_created_at,
                 now,
-                now,
+                max_link_context_chars,
             );
-        }
+            (content, Some(note))
+        } else {
+            validate_base_file_content(&candidate_content)?;
+            (candidate_content, None)
+        };
 
-        if file_type.is_markdown() {
-            let max_link_context_chars = self.settings.read().await.max_link_context_chars;
-            let (_existing_frontmatter, _existing_body, existing_tags) = {
-                let guard = self.inner.read().await;
-                let note = guard
-                    .notes
-                    .get(file_id)
-                    .ok_or_else(|| WriteError::NotFound { path: path.clone() })?;
-                (
-                    note.frontmatter.clone(),
-                    note.content.clone(),
-                    note.tags.clone(),
-                )
-            };
+        Ok(PreparedVaultWrite {
+            path,
+            content,
+            file_type,
+            created_at: existing_created_at,
+            updated_at: now,
+            note,
+            mark_created: false,
+        })
+    }
 
-            // Rebuild markdown note from raw content edit minus frontmatter rebuild
-            let parsed = parse_markdown(&new_content, max_link_context_chars);
-            let links = parsed
-                .links
-                .into_iter()
-                .map(|link| LinkInput {
-                    target_id: NoteId::new(link.target),
-                    context_text: link.context,
-                    position: link.byte_offset,
-                })
-                .collect::<Vec<_>>();
-
-            let mut tags = request.tags.clone().unwrap_or(existing_tags);
-            tags.extend(parsed.tags);
-            tags.sort();
-            tags.dedup();
-
-            let input = NoteInput {
-                id: file_id.clone(),
-                title: title_from_note_id(&path),
-                content: parsed.body,
-                frontmatter: parsed.frontmatter,
-                tags,
-                couchdb_rev: "local-edit-file".to_string(),
-                created_at: existing_created_at,
-                updated_at: now,
-                embedding: None,
-                links,
-            };
-            self.upsert_note(input).await;
-        }
-
+    pub async fn edit_vault_file(
+        &self,
+        auth: &AuthContext,
+        file_id: &NoteId,
+        request: UpdateNoteRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(UpdateNoteResponse, String), WriteError> {
+        let write = self
+            .prepare_edit_vault_file_write(auth, file_id, request, now)
+            .await?;
+        let content = write.content.clone();
+        self.commit_prepared_vault_write(write, "local-edit-file")
+            .await?;
         Ok((
             UpdateNoteResponse {
                 id: file_id.clone(),
                 status: "updated",
             },
-            new_content,
+            content,
         ))
     }
 
@@ -3825,17 +3866,18 @@ impl VaultStore {
             let raw_content = markdown_from_seed_note(&note.frontmatter, &note.content);
             let created_at = note.created_at;
             let updated_at = note.updated_at;
-            self.upsert_note(note).await;
-            let mut guard = self.inner.write().await;
-            upsert_vault_file_locked(
-                &mut guard,
-                &path,
-                &raw_content,
-                "1-seed",
+            let write = PreparedVaultWrite {
+                path,
+                content: raw_content,
+                file_type: NewNoteFileType::Md,
                 created_at,
                 updated_at,
-                now,
-            );
+                note: Some(note),
+                mark_created: false,
+            };
+            if let Err(error) = self.commit_prepared_vault_write(write, "1-seed").await {
+                warn!(error = %error, "failed to persist seeded vault file");
+            }
         }
 
         self.set_sync_state("1547", "1549").await;
@@ -3929,15 +3971,16 @@ fn markdown_from_seed_note(frontmatter: &Value, body: &str) -> String {
     markdown
 }
 
-fn upsert_note_locked(guard: &mut StoreInner, note: NoteInput, indexed_at: DateTime<Utc>) {
+fn prepare_note_upsert(note: NoteInput, indexed_at: DateTime<Utc>) -> PreparedNoteUpsert {
+    let note_id = note.id.clone();
     let title = note.title;
     let summary = summary_with_title_fallback(&title, &note.content);
     let heading_title = first_h1_title(&note.content);
     let search_text = markdown_plain_text(&note.content);
 
     let stored = StoredNote {
-        id: note.id.clone(),
-        path: note.id.as_str().to_string(),
+        id: note_id.clone(),
+        path: note_id.as_str().to_string(),
         title,
         heading_title,
         content: note.content.clone(),
@@ -3952,16 +3995,12 @@ fn upsert_note_locked(guard: &mut StoreInner, note: NoteInput, indexed_at: DateT
         embedding: note.embedding,
     };
 
-    // Enforce source+target uniqueness (links table primary-key semantics).
     let mut unique_links: HashMap<NoteId, LinkInput> = HashMap::new();
     for link in note.links {
         let target = link.target_id.clone();
         match unique_links.get_mut(&target) {
-            Some(existing) => {
-                if link.position < existing.position {
-                    *existing = link;
-                }
-            }
+            Some(existing) if link.position < existing.position => *existing = link,
+            Some(_) => {}
             None => {
                 unique_links.insert(target, link);
             }
@@ -3974,18 +4013,31 @@ fn upsert_note_locked(guard: &mut StoreInner, note: NoteInput, indexed_at: DateT
             .cmp(&b.position)
             .then_with(|| a.target_id.as_str().cmp(b.target_id.as_str()))
     });
-
-    guard.links.retain(|link| link.source_id != note.id);
-    guard
-        .links
-        .extend(ordered_links.into_iter().map(|link| LinkRecord {
-            source_id: note.id.clone(),
+    let links = ordered_links
+        .into_iter()
+        .map(|link| LinkRecord {
+            source_id: note_id.clone(),
             target_id: link.target_id,
             context_text: link.context_text,
             position: link.position,
-        }));
+        })
+        .collect();
 
-    guard.notes.insert(note.id, stored);
+    PreparedNoteUpsert {
+        note: stored,
+        links,
+    }
+}
+
+fn apply_prepared_note_upsert_locked(guard: &mut StoreInner, prepared: PreparedNoteUpsert) {
+    let note_id = prepared.note.id.clone();
+    guard.links.retain(|link| link.source_id != note_id);
+    guard.links.extend(prepared.links);
+    guard.notes.insert(note_id, prepared.note);
+}
+
+fn upsert_note_locked(guard: &mut StoreInner, note: NoteInput, indexed_at: DateTime<Utc>) {
+    apply_prepared_note_upsert_locked(guard, prepare_note_upsert(note, indexed_at));
 }
 
 fn upsert_vault_file_locked(
@@ -4037,13 +4089,20 @@ fn vault_file_readable_for_policy_from_inner(
     let Some(file) = guard.vault_files.get(path) else {
         return false;
     };
-    let policy_note = PolicyNote {
-        path: path.to_string(),
-        title: title_from_note_id(path),
-        tags: Vec::new(),
-        created_at: file.created_at,
-        updated_at: file.updated_at,
-        owner: None,
+    let policy_note = if is_markdown_note_path(path) {
+        let Some(note) = guard.notes.get(&NoteId::new(path)) else {
+            return false;
+        };
+        policy_note_from_stored(note)
+    } else {
+        PolicyNote {
+            path: path.to_string(),
+            title: title_from_note_id(path),
+            tags: Vec::new(),
+            created_at: file.created_at,
+            updated_at: file.updated_at,
+            owner: None,
+        }
     };
     policy_allows(config, auth, "read", &policy_note, now)
 }
@@ -4056,58 +4115,141 @@ fn file_type_from_path(path: &str) -> NewNoteFileType {
     }
 }
 
-fn apply_content_patch_for_vault_file(
+fn note_input_from_raw_markdown(
+    path: &str,
     content: &str,
-    patch: &[crate::new_note::ContentPatchOperation],
+    couchdb_rev: &str,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+    max_link_context_chars: usize,
+) -> NoteInput {
+    let parsed = parse_markdown(content, max_link_context_chars);
+    let links = parsed
+        .links
+        .into_iter()
+        .map(|link| LinkInput {
+            target_id: NoteId::new(link.target),
+            context_text: link.context,
+            position: link.byte_offset,
+        })
+        .collect::<Vec<_>>();
+    let mut tags = parsed.tags;
+    tags.sort();
+    tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+    NoteInput {
+        id: NoteId::new(path),
+        title: title_from_note_id(path),
+        content: parsed.body,
+        frontmatter: parsed.frontmatter,
+        tags,
+        couchdb_rev: couchdb_rev.to_string(),
+        created_at,
+        updated_at,
+        embedding: None,
+        links,
+    }
+}
+
+fn apply_markdown_raw_update(
+    candidate_content: &str,
+    request: &UpdateNoteRequest,
+    existing_frontmatter: &Value,
+    preserve_tags: &[String],
+    existing_tags: &[String],
+    now: DateTime<Utc>,
 ) -> Result<String, WriteError> {
-    use crate::new_note::ContentPatchOperation;
-    let mut result = content.to_string();
-    for op in patch {
-        match op {
-            ContentPatchOperation::Replace { old, new } => {
-                if !result.contains(old) {
-                    return Err(WriteError::InvalidUpdate {
-                        reason: format!("replace: old text not found in content"),
-                    });
-                }
-                result = result.replacen(old, new, 1);
+    let (mut frontmatter, body) = parse_frontmatter(candidate_content);
+    if !frontmatter.is_object() {
+        return Err(WriteError::InvalidUpdate {
+            reason: "markdown frontmatter must be a YAML mapping".to_string(),
+        });
+    }
+
+    if let Some(metadata) = request.metadata.as_ref() {
+        let Some(metadata) = metadata.as_object() else {
+            return Err(WriteError::InvalidUpdate {
+                reason: "metadata must be an object".to_string(),
+            });
+        };
+        let map = frontmatter
+            .as_object_mut()
+            .expect("frontmatter object checked above");
+        for (key, value) in metadata {
+            if matches!(key.as_str(), "created" | "created_by" | "tags" | "updated") {
+                continue;
             }
-            ContentPatchOperation::Delete { old } => {
-                if !result.contains(old) {
-                    return Err(WriteError::InvalidUpdate {
-                        reason: format!("delete: old text not found in content"),
-                    });
-                }
-                result = result.replacen(old, "", 1);
-            }
-            ContentPatchOperation::InsertBefore { anchor, text } => {
-                if let Some(pos) = result.find(anchor) {
-                    result.insert_str(pos, text);
-                } else {
-                    return Err(WriteError::InvalidUpdate {
-                        reason: "insert_before: anchor not found in content".to_string(),
-                    });
-                }
-            }
-            ContentPatchOperation::InsertAfter { anchor, text } => {
-                if let Some(pos) = result.find(anchor) {
-                    let end = pos + anchor.len();
-                    result.insert_str(end, text);
-                } else {
-                    return Err(WriteError::InvalidUpdate {
-                        reason: "insert_after: anchor not found in content".to_string(),
-                    });
-                }
-            }
-            ContentPatchOperation::Append { text } => {
-                result.push_str(text);
-            }
-            ContentPatchOperation::Prepend { text } => {
-                result.insert_str(0, text);
-            }
+            map.insert(key.clone(), value.clone());
         }
     }
-    Ok(result)
+
+    let mut tags = request
+        .tags
+        .clone()
+        .unwrap_or_else(|| extract_frontmatter_tags(&frontmatter));
+    for tag in preserve_tags {
+        if existing_tags.iter().any(|candidate| {
+            crate::authorization::normalize_tag(candidate)
+                .eq_ignore_ascii_case(&crate::authorization::normalize_tag(tag))
+        }) {
+            add_unique_tag(&mut tags, tag);
+        }
+    }
+    tags.sort();
+    tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+    {
+        let map = frontmatter
+            .as_object_mut()
+            .expect("frontmatter object checked above");
+        map.insert(
+            "tags".to_string(),
+            Value::Array(tags.into_iter().map(Value::String).collect()),
+        );
+        map.insert("updated".to_string(), Value::String(now.to_rfc3339()));
+        if let Some(created) = existing_frontmatter.get("created") {
+            map.insert("created".to_string(), created.clone());
+        } else {
+            map.remove("created");
+        }
+        map.remove("created_by");
+        if let Some(legacy) = map.get_mut("vault_bridge").and_then(Value::as_object_mut) {
+            legacy.remove("created_by");
+        }
+    }
+    if let Some(owner) = owner_from_frontmatter(existing_frontmatter) {
+        crate::authorization::set_owner_metadata(&mut frontmatter, owner);
+    }
+
+    markdown_with_updated_frontmatter(&frontmatter, &body)
+}
+
+fn markdown_with_updated_frontmatter(
+    frontmatter: &Value,
+    body: &str,
+) -> Result<String, WriteError> {
+    let Some(frontmatter) = frontmatter.as_object() else {
+        return Err(WriteError::InvalidUpdate {
+            reason: "markdown frontmatter must be a YAML mapping".to_string(),
+        });
+    };
+    let yaml_mapping: serde_yaml::Mapping = frontmatter
+        .iter()
+        .filter_map(|(key, value)| {
+            serde_yaml::to_value(value)
+                .ok()
+                .map(|value| (serde_yaml::Value::String(key.clone()), value))
+        })
+        .collect();
+    let yaml = serde_yaml::to_string(&yaml_mapping).map_err(|error| WriteError::InvalidUpdate {
+        reason: format!("failed to serialize markdown frontmatter: {error}"),
+    })?;
+    let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
+    let mut content = format!("---\n{}---\n\n{}", yaml, body.trim());
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Ok(content)
 }
 
 fn delete_note_locked(guard: &mut StoreInner, note_id: &NoteId) -> bool {
@@ -4116,6 +4258,33 @@ fn delete_note_locked(guard: &mut StoreInner, note_id: &NoteId) -> bool {
         .links
         .retain(|link| &link.source_id != note_id && &link.target_id != note_id);
     existed
+}
+
+fn persisted_note_from_prepared(prepared: &PreparedNoteUpsert) -> PersistedNoteRecord {
+    PersistedNoteRecord {
+        id: prepared.note.id.as_str().to_string(),
+        path: prepared.note.path.clone(),
+        title: prepared.note.title.clone(),
+        content: prepared.note.content.clone(),
+        search_text: prepared.note.search_text.clone(),
+        summary: prepared.note.summary.clone(),
+        frontmatter: prepared.note.frontmatter.clone(),
+        tags: prepared.note.tags.clone(),
+        couchdb_rev: prepared.note.couchdb_rev.clone(),
+        created_at: prepared.note.created_at,
+        updated_at: prepared.note.updated_at,
+        indexed_at: prepared.note.indexed_at,
+        embedding: prepared.note.embedding.clone(),
+        links: prepared
+            .links
+            .iter()
+            .map(|link| PersistedLinkRecord {
+                target_id: link.target_id.as_str().to_string(),
+                context_text: link.context_text.clone(),
+                position: link.position,
+            })
+            .collect(),
+    }
 }
 
 fn note_for_persistence_locked(
@@ -4889,6 +5058,18 @@ fn status_from_inner(
         .values()
         .filter(|note| note.embedding.is_none())
         .count();
+    let missing_vault_files_for_notes = guard
+        .notes
+        .keys()
+        .filter(|note_id| !guard.vault_files.contains_key(note_id.as_str()))
+        .count();
+    let unindexed_markdown_vault_files = guard
+        .vault_files
+        .keys()
+        .filter(|path| {
+            is_markdown_note_path(path) && !guard.notes.contains_key(&NoteId::new(path.as_str()))
+        })
+        .count();
 
     let last_seq_n = parse_seq_value(&sync_state.last_seq);
     let current_seq_n = parse_seq_value(&sync_state.couchdb_current_seq);
@@ -4906,6 +5087,8 @@ fn status_from_inner(
             pending_chunks,
             orphan_leaf_staging_count,
             stale_file_aliases,
+            missing_vault_files_for_notes,
+            unindexed_markdown_vault_files,
         },
         embedding: embedding_status_from_inner(
             guard,
@@ -5889,11 +6072,16 @@ fn stale_file_recovery_targets_locked(guard: &StoreInner) -> Vec<StaleFileRecove
             continue;
         };
 
-        let note_is_stale = guard
-            .notes
-            .get(&NoteId::new(note_path))
-            .is_none_or(|note| note.couchdb_rev != *file_doc_rev);
-        if note_is_stale {
+        let vault_file_is_stale = guard
+            .vault_files
+            .get(note_path)
+            .is_none_or(|file| file.couchdb_rev != *file_doc_rev);
+        let note_is_stale = is_markdown_note_path(note_path)
+            && guard
+                .notes
+                .get(&NoteId::new(note_path))
+                .is_none_or(|note| note.couchdb_rev != *file_doc_rev);
+        if vault_file_is_stale || note_is_stale {
             stale_file_targets.push(StaleFileRecoveryTarget {
                 file_doc_id: file_doc_id.clone(),
                 note_path: note_path.clone(),
@@ -6251,9 +6439,10 @@ mod tests {
 
     use super::{
         NeighborDirection, NoteInput, QueryBaseRequest, QueryNotesRequest, RuntimeSyncState,
-        StoreSettings, UnscopedBacklinkEntry, UnscopedNeighborNode, UnscopedRecentNoteSummary,
-        VaultStore, find_case_insensitive, get_note_from_inner, neighbors_from_inner,
-        note_readable_for_policy_from_inner, status_from_inner, store_inner_from_persisted_notes,
+        StoreSettings, StoredVaultFile, UnscopedBacklinkEntry, UnscopedNeighborNode,
+        UnscopedRecentNoteSummary, VaultStore, find_case_insensitive, get_note_from_inner,
+        neighbors_from_inner, note_readable_for_policy_from_inner,
+        stale_file_recovery_targets_locked, status_from_inner, store_inner_from_persisted_notes,
     };
     use crate::authorization::{
         AccessMatcher, AccessPolicy, AccessRule, AuthContext, AuthorizationConfig, ContextName,
@@ -6272,6 +6461,36 @@ mod tests {
     fn find_case_insensitive_matches_mixed_case_query() {
         let content = "Alpha beta DEF gamma";
         assert_eq!(find_case_insensitive(content, "def"), content.find("DEF"));
+    }
+
+    #[test]
+    fn base_alias_freshness_depends_on_raw_file_not_markdown_index() {
+        let now = Utc::now();
+        let settings = StoreSettings::new(20);
+        let sync_state = RuntimeSyncState::new(now);
+        let mut inner = store_inner_from_persisted_notes(Vec::new(), &settings, &sync_state);
+        let path = "11New/dashboard.base";
+        inner
+            .file_doc_paths
+            .insert("f:base".to_string(), path.to_string());
+        inner
+            .file_doc_revs
+            .insert("f:base".to_string(), "2-base".to_string());
+        inner.vault_files.insert(
+            path.to_string(),
+            StoredVaultFile {
+                path: path.to_string(),
+                content: "views: []\n".to_string(),
+                couchdb_rev: "2-base".to_string(),
+                created_at: Some(now),
+                updated_at: now,
+                indexed_at: now,
+            },
+        );
+
+        assert!(stale_file_recovery_targets_locked(&inner).is_empty());
+        inner.vault_files.remove(path);
+        assert_eq!(stale_file_recovery_targets_locked(&inner).len(), 1);
     }
 
     #[test]

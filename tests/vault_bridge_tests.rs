@@ -101,6 +101,16 @@ fn post(uri: &str, key: &str, body: Value) -> Request<Body> {
         .expect("request")
 }
 
+fn put(uri: &str, key: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("x-api-key", key)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
 #[tokio::test]
 async fn rest_api_resolves_api_token_to_configured_context() {
     let app = test_app(test_config()).await;
@@ -470,4 +480,163 @@ async fn create_note_applies_context_write_mutations() {
     assert!(tags.iter().any(|tag| tag == "ai-created"));
     assert_eq!(body["frontmatter"]["created_by"], "api_token:external");
     assert!(body["frontmatter"].get("vault_bridge").is_none());
+}
+
+#[tokio::test]
+async fn raw_markdown_read_uses_indexed_tag_policy() {
+    let mut config = test_config();
+    let external = config
+        .contexts
+        .get_mut("external")
+        .expect("external context");
+    external.read = vec![
+        AccessRule::deny(AccessMatcher {
+            tags_any: vec!["personal".to_string()],
+            ..Default::default()
+        }),
+        AccessRule::allow(AccessMatcher::allow_all()),
+    ];
+    let app = test_app(config).await;
+
+    let create = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/vault-files",
+            "admin-dev-token",
+            json!({
+                "title": "Tag Hidden Raw File",
+                "content": "---\ntags: [personal]\n---\n\n# Tag Hidden Raw File\n\nPrivate body."
+            }),
+        ))
+        .await
+        .expect("create response");
+    assert_eq!(create.status(), StatusCode::OK);
+    let created = response_json(create).await;
+    let id = created["id"].as_str().expect("created id");
+
+    let note_read = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/notes/{id}"), "external-dev-token"))
+        .await
+        .expect("note read response");
+    assert_eq!(note_read.status(), StatusCode::NOT_FOUND);
+
+    let raw_read = app
+        .oneshot(get(
+            &format!("/api/v1/vault-files/{id}"),
+            "external-dev-token",
+        ))
+        .await
+        .expect("raw read response");
+    assert_eq!(raw_read.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn raw_markdown_edit_keeps_policy_metadata_and_index_in_sync() {
+    let app = test_app(test_config()).await;
+    let create = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/vault-files",
+            "external-dev-token",
+            json!({
+                "title": "Raw Edit Contract",
+                "content": "---\ntags: [custom]\nstatus: draft\n---\n\n# Raw Edit Contract\n\nOriginal body."
+            }),
+        ))
+        .await
+        .expect("create response");
+    assert_eq!(create.status(), StatusCode::OK);
+    let created = response_json(create).await;
+    let id = created["id"].as_str().expect("created id").to_string();
+
+    let before = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/notes/{id}"), "external-dev-token"))
+        .await
+        .expect("initial note read");
+    let before = response_json(before).await;
+    let created_at = before["frontmatter"]["created"].clone();
+
+    let edit = app
+        .clone()
+        .oneshot(put(
+            &format!("/api/v1/vault-files/{id}"),
+            "external-dev-token",
+            json!({
+                "content_patch": [{
+                    "op": "replace",
+                    "old": "Original body.",
+                    "new": "Updated body."
+                }],
+                "tags": ["custom-updated"],
+                "metadata": {
+                    "status": "done",
+                    "created": "forged",
+                    "created_by": "forged"
+                }
+            }),
+        ))
+        .await
+        .expect("edit response");
+    assert_eq!(edit.status(), StatusCode::OK);
+
+    let raw = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/vault-files/{id}"),
+            "external-dev-token",
+        ))
+        .await
+        .expect("raw read response");
+    assert_eq!(raw.status(), StatusCode::OK);
+    let raw = response_json(raw).await;
+    let raw_content = raw["content"].as_str().expect("raw content");
+    assert!(raw_content.contains("Updated body."));
+    assert!(raw_content.contains("custom-updated"));
+    assert!(raw_content.contains("ai-created"));
+    assert!(!raw_content.contains("created_by: forged"));
+
+    let note = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/notes/{id}"), "external-dev-token"))
+        .await
+        .expect("note read response");
+    let note = response_json(note).await;
+    assert_eq!(note["frontmatter"]["status"], "done");
+    assert_eq!(note["frontmatter"]["created"], created_at);
+    assert_eq!(note["frontmatter"]["created_by"], "api_token:external");
+    assert!(note["tags"].as_array().is_some_and(|tags| {
+        tags.iter().any(|tag| tag == "custom-updated") && tags.iter().any(|tag| tag == "ai-created")
+    }));
+
+    let invalid = app
+        .clone()
+        .oneshot(put(
+            &format!("/api/v1/vault-files/{id}"),
+            "external-dev-token",
+            json!({
+                "content": "replacement",
+                "content_patch": [{"op": "append", "text": "also patch"}]
+            }),
+        ))
+        .await
+        .expect("invalid edit response");
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let ambiguous = app
+        .oneshot(put(
+            &format!("/api/v1/vault-files/{id}"),
+            "external-dev-token",
+            json!({
+                "content_patch": [{
+                    "op": "replace",
+                    "old": "---",
+                    "new": "Ambiguous"
+                }]
+            }),
+        ))
+        .await
+        .expect("ambiguous edit response");
+    assert_eq!(ambiguous.status(), StatusCode::BAD_REQUEST);
 }
