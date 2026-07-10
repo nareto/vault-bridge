@@ -401,6 +401,26 @@ impl VaultBridgeService {
             return Err(ServiceError::NotFound);
         }
 
+        if recovery.source_file_seen
+            && let Some(recovered) = self
+                .store
+                .recovered_vault_file_from_index(file_id)
+                .await
+                .map_err(ServiceError::Write)?
+        {
+            self.store
+                .commit_recovered_vault_file(recovered)
+                .await
+                .map_err(ServiceError::Write)?;
+            if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
+                warn!(
+                    lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
+                    "reconstructed raw vault file from visible index after incomplete CouchDB chunk recovery"
+                );
+                return Ok(file);
+            }
+        }
+
         warn!(
             lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
             "policy-visible vault file could not be reconstructed from couchdb"
@@ -1032,6 +1052,39 @@ mod tests {
             .await
             .expect("edited raw file");
         assert!(file.content.contains("Repaired and edited."));
+    }
+
+    #[tokio::test]
+    async fn incomplete_live_source_falls_back_to_visible_index_content() {
+        let path = "11Active/incomplete-live-source.md";
+        let (store, auth) = indexed_store(path, "1-stale").await;
+        let docs = build_livesync_note_documents(path, "# Incomplete Live Source\n\nNewer body.\n");
+        let mut file_doc = docs.file_doc;
+        file_doc["_rev"] = serde_json::json!("2-file");
+        store
+            .ingest_changes_batch(
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String(String::new()),
+                    id: docs.file_id.clone(),
+                    deleted: false,
+                    doc: Some(file_doc.clone()),
+                }],
+                "",
+                250,
+                Duration::from_secs(60),
+                None,
+            )
+            .await;
+        let (couch, _) =
+            spawn_mock_couchdb(HashMap::from([(docs.file_id, file_doc)]), HashSet::new());
+        let service = VaultBridgeService::new(store, Some(couch));
+
+        let file = service
+            .get_vault_file(&auth, &NoteId::new(path))
+            .await
+            .expect("visible index should provide a safe read fallback");
+
+        assert!(file.content.contains("Stale indexed content."));
     }
 
     #[tokio::test]

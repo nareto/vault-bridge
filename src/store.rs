@@ -3087,6 +3087,41 @@ impl VaultStore {
         })
     }
 
+    pub(crate) async fn recovered_vault_file_from_index(
+        &self,
+        file_id: &NoteId,
+    ) -> Result<Option<RecoveredVaultFileState>, WriteError> {
+        let (frontmatter, body, tags, couchdb_rev, created_at, updated_at) = {
+            let guard = self.inner.read().await;
+            let Some(note) = guard.notes.get(file_id) else {
+                return Ok(None);
+            };
+            (
+                note.frontmatter.clone(),
+                note.content.clone(),
+                note.tags.clone(),
+                note.couchdb_rev.clone(),
+                note.created_at,
+                note.updated_at,
+            )
+        };
+        let content = UpdateNoteRequest {
+            content: None,
+            content_patch: None,
+            tags: None,
+            metadata: None,
+        }
+        .rebuild_markdown(&frontmatter, &body, &tags, updated_at)?;
+        Ok(Some(RecoveredVaultFileState {
+            path: file_id.as_str().to_string(),
+            content,
+            file_type: NewNoteFileType::Md,
+            couchdb_rev,
+            created_at,
+            updated_at,
+        }))
+    }
+
     pub(crate) async fn commit_recovered_vault_file(
         &self,
         recovered: RecoveredVaultFileState,
