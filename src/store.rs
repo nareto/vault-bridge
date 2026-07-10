@@ -6094,6 +6094,22 @@ fn stale_file_recovery_targets_locked(guard: &StoreInner) -> Vec<StaleFileRecove
         }
     }
 
+    let targeted_paths = stale_file_targets
+        .iter()
+        .map(|target| target.note_path.clone())
+        .collect::<HashSet<_>>();
+    for note in guard.notes.values() {
+        if !guard.vault_files.contains_key(note.path.as_str())
+            && !targeted_paths.contains(note.path.as_str())
+        {
+            stale_file_targets.push(StaleFileRecoveryTarget {
+                file_doc_id: note.path.clone(),
+                note_path: note.path.clone(),
+                child_doc_ids: Vec::new(),
+            });
+        }
+    }
+
     stale_file_targets.sort_by(|a, b| {
         a.file_doc_id
             .cmp(&b.file_doc_id)
@@ -6443,6 +6459,7 @@ mod tests {
         UnscopedRecentNoteSummary, VaultStore, find_case_insensitive, get_note_from_inner,
         neighbors_from_inner, note_readable_for_policy_from_inner,
         stale_file_recovery_targets_locked, status_from_inner, store_inner_from_persisted_notes,
+        upsert_note_locked,
     };
     use crate::authorization::{
         AccessMatcher, AccessPolicy, AccessRule, AuthContext, AuthorizationConfig, ContextName,
@@ -6491,6 +6508,26 @@ mod tests {
         assert!(stale_file_recovery_targets_locked(&inner).is_empty());
         inner.vault_files.remove(path);
         assert_eq!(stale_file_recovery_targets_locked(&inner).len(), 1);
+    }
+
+    #[test]
+    fn indexed_markdown_without_raw_file_is_recoverable_without_alias() {
+        let now = Utc::now();
+        let settings = StoreSettings::new(20);
+        let sync_state = RuntimeSyncState::new(now);
+        let mut inner = store_inner_from_persisted_notes(Vec::new(), &settings, &sync_state);
+        let path = "11New/missing-raw.md";
+        upsert_note_locked(
+            &mut inner,
+            note_input(path, "Missing Raw", vec!["shared"], now),
+            now,
+        );
+
+        let targets = stale_file_recovery_targets_locked(&inner);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_doc_id, path);
+        assert_eq!(targets[0].note_path, path);
+        assert!(targets[0].child_doc_ids.is_empty());
     }
 
     #[test]
