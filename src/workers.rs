@@ -21,6 +21,7 @@ use crate::livesync::{ChangeEvent, LivesyncDocument, is_deletion};
 use crate::store::{StaleFileRecoveryTarget, SyncBatchResult, VaultStore};
 
 const LOCALAI_HEALTH_PROBE_INPUT: &str = "vault bridge embedding health probe";
+const STALE_FILE_RECOVERY_TARGET_LIMIT: usize = 16;
 
 static DATA_URI_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"data:[^\s)>"']{128,}"#).expect("valid data URI regex"));
@@ -100,6 +101,11 @@ pub fn spawn_sync_worker(
         }
 
         let startup_stale_file_targets = store.stale_file_recovery_targets().await;
+        let startup_stale_file_total = startup_stale_file_targets.len();
+        let startup_stale_file_targets = take_stale_file_recovery_targets(
+            startup_stale_file_targets,
+            STALE_FILE_RECOVERY_TARGET_LIMIT,
+        );
         let startup_stale_file_docs = startup_stale_file_targets
             .iter()
             .map(|target| target.file_doc_id.clone())
@@ -107,7 +113,12 @@ pub fn spawn_sync_worker(
         let startup_remote_drift_file_docs = detect_remote_stale_file_docs(&store, &couch).await;
         let mut startup_recovery_lookup_ids =
             recovery_lookup_ids_for_stale_file_targets(&startup_stale_file_targets);
-        startup_recovery_lookup_ids.extend(startup_remote_drift_file_docs.iter().cloned());
+        startup_recovery_lookup_ids.extend(
+            startup_remote_drift_file_docs
+                .iter()
+                .take(STALE_FILE_RECOVERY_TARGET_LIMIT)
+                .cloned(),
+        );
         startup_recovery_lookup_ids.sort();
         startup_recovery_lookup_ids.dedup();
         let startup_recovery_child_ids =
@@ -115,11 +126,13 @@ pub fn spawn_sync_worker(
 
         if !startup_recovery_lookup_ids.is_empty() || !startup_recovery_child_ids.is_empty() {
             warn!(
+                stale_file_alias_total = startup_stale_file_total,
                 stale_file_doc_count = startup_stale_file_docs.len(),
+                stale_file_recovery_limit = STALE_FILE_RECOVERY_TARGET_LIMIT,
                 remote_drift_file_doc_count = startup_remote_drift_file_docs.len(),
                 recovery_lookup_count = startup_recovery_lookup_ids.len(),
                 recovery_child_count = startup_recovery_child_ids.len(),
-                "sync worker: startup detected stale file aliases or remote drift; queuing parent recovery"
+                "sync worker: startup detected stale file aliases or remote drift; queuing bounded parent recovery"
             );
             queue_parent_recovery(
                 &couch,
@@ -174,9 +187,10 @@ pub fn spawn_sync_worker(
                 purged_parent_count = batch.purged_parent_ids.len(),
                 recovery_parent_count = batch.recovery_parent_ids.len(),
                 orphan_leaf_parent_count = batch.orphan_leaf_parent_ids.len(),
+                stale_file_alias_total = startup_stale_file_total,
                 stale_file_doc_count = startup_stale_file_docs.len(),
                 remote_drift_file_doc_count = startup_remote_drift_file_docs.len(),
-                "sync worker: startup recovery replay completed"
+                "sync worker: bounded startup recovery replay completed"
             );
         }
 
@@ -508,6 +522,9 @@ async fn recover_stale_file_aliases_cooperatively(
     max_changes_per_batch: usize,
 ) -> SyncBatchResult {
     let stale_file_targets = store.stale_file_recovery_targets().await;
+    let stale_file_alias_total = stale_file_targets.len();
+    let stale_file_targets =
+        take_stale_file_recovery_targets(stale_file_targets, STALE_FILE_RECOVERY_TARGET_LIMIT);
     let stale_file_doc_ids = stale_file_targets
         .iter()
         .map(|target| target.file_doc_id.clone())
@@ -528,10 +545,12 @@ async fn recover_stale_file_aliases_cooperatively(
     let recovery_lookup_ids = recovery_lookup_ids_for_stale_file_targets(&stale_file_targets);
     let recovery_child_doc_ids = recovery_child_doc_ids_for_stale_file_targets(&stale_file_targets);
     warn!(
+        stale_file_alias_total,
         stale_file_alias_count = stale_file_doc_ids.len(),
+        stale_file_recovery_limit = STALE_FILE_RECOVERY_TARGET_LIMIT,
         recovery_lookup_count = recovery_lookup_ids.len(),
         recovery_child_count = recovery_child_doc_ids.len(),
-        "sync worker: idle detected stale file aliases; queuing parent recovery"
+        "sync worker: idle detected stale file aliases; queuing bounded parent recovery"
     );
 
     let mut recovered = fetch_parent_recovery_changes(couch, &recovery_lookup_ids).await;
@@ -666,6 +685,14 @@ async fn fetch_parent_recovery_changes(
     }
 
     recovered
+}
+
+fn take_stale_file_recovery_targets(
+    mut targets: Vec<StaleFileRecoveryTarget>,
+    limit: usize,
+) -> Vec<StaleFileRecoveryTarget> {
+    targets.truncate(limit.max(1));
+    targets
 }
 
 fn recovery_lookup_ids_for_stale_file_targets(targets: &[StaleFileRecoveryTarget]) -> Vec<String> {
@@ -1690,7 +1717,7 @@ mod tests {
         parse_localai_embeddings_for_test, queue_parent_recovery,
         recover_stale_chunk_staging_cooperatively, recover_stale_file_aliases_cooperatively,
         sample_note_chunks_for_embedding, should_flush_pending, spawn_embedding_worker,
-        split_note_for_localai, take_change_batch,
+        split_note_for_localai, take_change_batch, take_stale_file_recovery_targets,
     };
     use crate::authorization::{AccessPolicy, AuthContext, ContextName};
     use crate::config::{
@@ -1699,7 +1726,7 @@ mod tests {
     use crate::couchdb::{CouchDbClient, build_livesync_note_documents};
     use crate::livesync::ChangeEvent;
     use crate::model::NoteId;
-    use crate::store::{NoteInput, VaultStore};
+    use crate::store::{NoteInput, StaleFileRecoveryTarget, VaultStore};
 
     #[derive(Clone, Default)]
     struct MockCouchState {
@@ -2008,6 +2035,22 @@ mod tests {
         let rest = take_change_batch(&mut pending, 10);
         assert_eq!(rest, vec![3, 4, 5]);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn stale_file_recovery_targets_are_bounded_without_reordering() {
+        let targets = (0..5)
+            .map(|index| StaleFileRecoveryTarget {
+                file_doc_id: format!("f:{index}"),
+                note_path: format!("note-{index}.md"),
+                child_doc_ids: Vec::new(),
+            })
+            .collect();
+
+        let selected = take_stale_file_recovery_targets(targets, 2);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].file_doc_id, "f:0");
+        assert_eq!(selected[1].file_doc_id, "f:1");
     }
 
     #[test]

@@ -491,12 +491,20 @@ impl PostgresPersistence {
 
     pub async fn apply_content_delta(
         &self,
-        note_upserts: Vec<PersistedNoteRecord>,
-        note_deletes: Vec<String>,
+        mut note_upserts: Vec<PersistedNoteRecord>,
+        mut note_deletes: Vec<String>,
         sync_state: Option<PersistedSyncState>,
-        vault_file_upserts: Vec<PersistedVaultFile>,
-        vault_file_deletes: Vec<String>,
+        mut vault_file_upserts: Vec<PersistedVaultFile>,
+        mut vault_file_deletes: Vec<String>,
     ) -> Result<u64, PersistenceError> {
+        // Concurrent API/worker transactions lock rows in the same order.
+        note_upserts.sort_by(|a, b| a.id.cmp(&b.id));
+        note_deletes.sort();
+        note_deletes.dedup();
+        vault_file_upserts.sort_by(|a, b| a.path.cmp(&b.path));
+        vault_file_deletes.sort();
+        vault_file_deletes.dedup();
+
         let mut tx = self.pool.begin().await?;
 
         for note_id in note_deletes {
