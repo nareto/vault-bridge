@@ -156,7 +156,23 @@ recovery_max_backoff_seconds: 3600
 CouchDB when available; `current_seq_source` distinguishes `live` from the
 persisted `cached` fallback.
 
-Operators can inspect recovery metadata without reading note content:
+Operators can safely classify one path without reading note content:
+
+```bash
+vault_bridge --debug-note-scan "path/to/note.md"
+```
+
+The JSON report compares the current LiveSync file and child documents with the
+local alias, index, raw-file, staging, and recovery state. Missing and tombstoned
+children are reported separately. Full CouchDB documents and decrypted leaf
+payloads are printed only when `--include-raw-docs` is explicitly supplied;
+that mode can expose private note content.
+
+Status and Prometheus metrics expose aggregate blocked-alias and unavailable
+child counts without paths or document IDs. Worker warnings contain only a
+stable lookup fingerprint and fixed-cardinality counts.
+
+Operators can also inspect recovery metadata without reading note content:
 
 ```sql
 SELECT recovery_kind, failure_count, next_retry_at, quarantined_at

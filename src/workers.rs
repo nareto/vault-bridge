@@ -18,6 +18,7 @@ use crate::config::{AppConfig, EmbeddingConfig, EmbeddingMode};
 use crate::couchdb::{CouchDbClient, CouchDbError};
 use crate::encryption::Decryptor;
 use crate::livesync::{ChangeEvent, LivesyncDocument, is_deletion};
+use crate::persistence::RecoveryChildDiagnosis;
 use crate::store::{StaleFileRecoveryTarget, SyncBatchResult, VaultStore};
 
 const LOCALAI_HEALTH_PROBE_INPUT: &str = "vault bridge embedding health probe";
@@ -646,6 +647,15 @@ async fn run_bounded_sync_recovery(
             continue;
         }
 
+        let stale_alias_target = if target.recovery_kind == RECOVERY_KIND_FILE_ALIAS {
+            store
+                .stale_file_recovery_targets()
+                .await
+                .into_iter()
+                .find(|candidate| candidate.file_doc_id == target.target_id)
+        } else {
+            None
+        };
         let recovered = if target.recovery_kind == RECOVERY_KIND_FILE_ALIAS {
             fetch_stale_file_alias_recovery_changes(store, couch, &target.target_id, decryptor)
                 .await
@@ -653,7 +663,7 @@ async fn run_bounded_sync_recovery(
             fetch_parent_recovery_changes(couch, std::slice::from_ref(&target.target_id)).await
         };
 
-        let (resolved, failure_kind) = if recovered.is_empty() {
+        let (resolved, mut failure_kind) = if recovered.is_empty() {
             (false, "source_unresolved")
         } else {
             let replay = ingest_changes_cooperatively(
@@ -686,6 +696,37 @@ async fn run_bounded_sync_recovery(
             )
         };
 
+        let child_diagnosis = if !resolved {
+            if let Some(alias) = stale_alias_target.as_ref() {
+                match couch
+                    .diagnose_note_source(&alias.note_path, decryptor)
+                    .await
+                {
+                    Ok(diagnostic) => diagnostic.failure_kind().map(|classified_failure| {
+                        failure_kind = classified_failure;
+                        RecoveryChildDiagnosis {
+                            expected: diagnostic.expected_child_count,
+                            live: diagnostic.live_child_count,
+                            missing: diagnostic.missing_child_count,
+                            tombstoned: diagnostic.tombstoned_child_count,
+                        }
+                    }),
+                    Err(error) => {
+                        debug!(
+                            recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
+                            error = %error,
+                            "sync worker: unavailable-child classification failed"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if resolved {
             if let Err(error) = store
                 .resolve_sync_recovery(&target.recovery_kind, &target.target_id)
@@ -709,22 +750,54 @@ async fn run_bounded_sync_recovery(
                 next_retry_at,
                 recovery_max_failures,
                 failure_kind,
+                child_diagnosis.as_ref(),
             )
             .await
         {
             Ok(true) => warn!(
                 recovery_kind = target.recovery_kind,
                 recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
+                failure_kind,
+                expected_child_count = child_diagnosis.as_ref().map(|value| value.expected),
+                live_child_count = child_diagnosis.as_ref().map(|value| value.live),
+                missing_child_count = child_diagnosis.as_ref().map(|value| value.missing),
+                tombstoned_child_count = child_diagnosis.as_ref().map(|value| value.tombstoned),
                 attempts = target.failure_count + 1,
                 "sync worker: quarantined unrecoverable target"
             ),
-            Ok(false) => debug!(
-                recovery_kind = target.recovery_kind,
-                recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
-                attempts = target.failure_count + 1,
-                retry_after_seconds = delay_seconds,
-                "sync worker: deferred unresolved recovery target"
-            ),
+            Ok(false) => {
+                let classification_changed = target.last_failure_kind.as_deref()
+                    != Some(failure_kind)
+                    || child_diagnosis.as_ref().is_some_and(|diagnosis| {
+                        target.expected_child_count != Some(diagnosis.expected)
+                            || target.live_child_count != Some(diagnosis.live)
+                            || target.missing_child_count != Some(diagnosis.missing)
+                            || target.tombstoned_child_count != Some(diagnosis.tombstoned)
+                    });
+                if let Some(diagnosis) = child_diagnosis.as_ref().filter(|_| classification_changed)
+                {
+                    warn!(
+                        recovery_kind = target.recovery_kind,
+                        recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
+                        failure_kind,
+                        expected_child_count = diagnosis.expected,
+                        live_child_count = diagnosis.live,
+                        missing_child_count = diagnosis.missing,
+                        tombstoned_child_count = diagnosis.tombstoned,
+                        attempts = target.failure_count + 1,
+                        retry_after_seconds = delay_seconds,
+                        "sync worker: stale file alias blocked by unavailable children"
+                    );
+                } else {
+                    debug!(
+                        recovery_kind = target.recovery_kind,
+                        recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
+                        attempts = target.failure_count + 1,
+                        retry_after_seconds = delay_seconds,
+                        "sync worker: deferred unresolved recovery target"
+                    );
+                }
+            }
             Err(error) => warn!(error = %error, "sync worker: failed to defer recovery target"),
         }
     }

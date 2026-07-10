@@ -450,6 +450,9 @@ pub struct IndexStats {
     pub stale_file_aliases: usize,
     pub pending_sync_recoveries: usize,
     pub quarantined_sync_recoveries: usize,
+    pub stale_aliases_blocked_by_unavailable_children: usize,
+    pub missing_livesync_children: usize,
+    pub tombstoned_livesync_children: usize,
     pub missing_vault_files_for_notes: usize,
     pub unindexed_markdown_vault_files: usize,
 }
@@ -3781,8 +3784,7 @@ impl VaultStore {
                 pending_chunks,
                 orphan_leaf_staging_count,
                 stale_file_aliases,
-                recovery_queue_stats.pending,
-                recovery_queue_stats.quarantined,
+                &recovery_queue_stats,
                 &sync_state,
             );
             let auth_config = self.authorization_config().await;
@@ -3815,8 +3817,7 @@ impl VaultStore {
             guard.chunk_staging.pending_count(),
             orphan_leaf_staging_count_locked(&guard),
             stale_file_doc_ids_for_recovery_locked(&guard).len(),
-            0,
-            0,
+            &RecoveryQueueStats::default(),
             &sync_state,
         );
         let auth_config = self.authorization_config().await;
@@ -3971,6 +3972,7 @@ impl VaultStore {
         next_retry_at: DateTime<Utc>,
         max_failures: usize,
         failure_kind: &str,
+        child_diagnosis: Option<&crate::persistence::RecoveryChildDiagnosis>,
     ) -> Result<bool, crate::persistence::PersistenceError> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(false);
@@ -3982,6 +3984,7 @@ impl VaultStore {
                 next_retry_at,
                 max_failures,
                 failure_kind,
+                child_diagnosis,
             )
             .await
     }
@@ -5312,8 +5315,7 @@ fn status_from_inner(
     pending_chunks: usize,
     orphan_leaf_staging_count: usize,
     stale_file_aliases: usize,
-    pending_sync_recoveries: usize,
-    quarantined_sync_recoveries: usize,
+    recovery_queue_stats: &RecoveryQueueStats,
     sync_state: &RuntimeSyncState,
 ) -> StatusResponse {
     let total_notes = guard.notes.len();
@@ -5358,8 +5360,12 @@ fn status_from_inner(
             pending_chunks,
             orphan_leaf_staging_count,
             stale_file_aliases,
-            pending_sync_recoveries,
-            quarantined_sync_recoveries,
+            pending_sync_recoveries: recovery_queue_stats.pending,
+            quarantined_sync_recoveries: recovery_queue_stats.quarantined,
+            stale_aliases_blocked_by_unavailable_children: recovery_queue_stats
+                .aliases_blocked_by_unavailable_children,
+            missing_livesync_children: recovery_queue_stats.missing_children,
+            tombstoned_livesync_children: recovery_queue_stats.tombstoned_children,
             missing_vault_files_for_notes,
             unindexed_markdown_vault_files,
         },
@@ -7075,7 +7081,14 @@ views:
         };
         let inner =
             store_inner_from_persisted_notes(persisted_notes_fixture(now), &settings, &sync_state);
-        let status = status_from_inner(&inner, 7, 0, 0, 0, 0, &sync_state);
+        let status = status_from_inner(
+            &inner,
+            7,
+            0,
+            0,
+            &crate::persistence::RecoveryQueueStats::default(),
+            &sync_state,
+        );
 
         assert_eq!(status.index.total_notes, 3);
         assert_eq!(status.index.total_links, 4);

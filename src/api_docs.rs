@@ -588,7 +588,7 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "IndexStats": {
                     "type": "object",
-                    "required": ["total_notes", "total_links", "total_tags", "pending_embeddings", "quarantined_embeddings", "pending_chunk_embeddings", "quarantined_chunk_embeddings", "pending_chunks", "orphan_leaf_staging_count", "stale_file_aliases", "pending_sync_recoveries", "quarantined_sync_recoveries", "missing_vault_files_for_notes", "unindexed_markdown_vault_files"],
+                    "required": ["total_notes", "total_links", "total_tags", "pending_embeddings", "quarantined_embeddings", "pending_chunk_embeddings", "quarantined_chunk_embeddings", "pending_chunks", "orphan_leaf_staging_count", "stale_file_aliases", "pending_sync_recoveries", "quarantined_sync_recoveries", "stale_aliases_blocked_by_unavailable_children", "missing_livesync_children", "tombstoned_livesync_children", "missing_vault_files_for_notes", "unindexed_markdown_vault_files"],
                     "properties": {
                         "total_notes": {"type": "integer", "minimum": 0},
                         "total_links": {"type": "integer", "minimum": 0},
@@ -602,6 +602,9 @@ pub(crate) fn openapi_spec() -> Value {
                         "stale_file_aliases": {"type": "integer", "minimum": 0},
                         "pending_sync_recoveries": {"type": "integer", "minimum": 0},
                         "quarantined_sync_recoveries": {"type": "integer", "minimum": 0},
+                        "stale_aliases_blocked_by_unavailable_children": {"type": "integer", "minimum": 0},
+                        "missing_livesync_children": {"type": "integer", "minimum": 0},
+                        "tombstoned_livesync_children": {"type": "integer", "minimum": 0},
                         "missing_vault_files_for_notes": {"type": "integer", "minimum": 0},
                         "unindexed_markdown_vault_files": {"type": "integer", "minimum": 0}
                     }

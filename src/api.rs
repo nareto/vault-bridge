@@ -1106,6 +1106,22 @@ fn render_prometheus_metrics(status: &StatusResponse) -> String {
             "vault_bridge_stale_file_aliases {}",
             status.index.stale_file_aliases
         ),
+        "# HELP vault_bridge_stale_aliases_blocked_unavailable_children Stale LiveSync aliases diagnosed with missing or tombstoned children.".to_string(),
+        "# TYPE vault_bridge_stale_aliases_blocked_unavailable_children gauge".to_string(),
+        format!(
+            "vault_bridge_stale_aliases_blocked_unavailable_children {}",
+            status.index.stale_aliases_blocked_by_unavailable_children
+        ),
+        "# HELP vault_bridge_unavailable_livesync_children LiveSync child documents unavailable to note assembly by source state.".to_string(),
+        "# TYPE vault_bridge_unavailable_livesync_children gauge".to_string(),
+        format!(
+            "vault_bridge_unavailable_livesync_children{{state=\"missing\"}} {}",
+            status.index.missing_livesync_children
+        ),
+        format!(
+            "vault_bridge_unavailable_livesync_children{{state=\"tombstoned\"}} {}",
+            status.index.tombstoned_livesync_children
+        ),
         "# HELP vault_bridge_missing_vault_files_for_notes Indexed Markdown notes without a matching raw vault file.".to_string(),
         "# TYPE vault_bridge_missing_vault_files_for_notes gauge".to_string(),
         format!(

@@ -638,6 +638,30 @@
           "legendFormat": "quarantined embeddings",
           "range": true,
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "vault_bridge_stale_aliases_blocked_unavailable_children{job=~\"$job\", instance=~\"$instance\"}",
+          "hide": false,
+          "legendFormat": "aliases blocked by unavailable children",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "vault_bridge_unavailable_livesync_children{job=~\"$job\", instance=~\"$instance\"}",
+          "hide": false,
+          "legendFormat": "unavailable children: {{state}}",
+          "range": true,
+          "refId": "F"
         }
       ],
       "title": "Indexing Backlog",

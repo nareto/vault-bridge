@@ -64,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
         return unblock_embeddings(&config, &args).await;
     }
     if let Some(note_path) = flag_value(&args, "--debug-note-scan") {
-        return debug_note_scan(&config, &note_path).await;
+        let include_raw_docs = args.iter().any(|arg| arg == "--include-raw-docs");
+        return debug_note_scan(&config, &note_path, include_raw_docs).await;
     }
     if let Some(note_path) = flag_value(&args, "--delete-note-scan") {
         let keep_leaves = args.iter().any(|arg| arg == "--keep-leaves");
@@ -394,65 +395,102 @@ async fn build_livesync_decryptor(config: &AppConfig) -> anyhow::Result<Option<A
     ))))
 }
 
-async fn debug_note_scan(config: &AppConfig, note_path: &str) -> anyhow::Result<()> {
+async fn debug_note_scan(
+    config: &AppConfig,
+    note_path: &str,
+    include_raw_docs: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         config.couchdb.is_configured(),
         "couchdb must be configured for --debug-note-scan"
     );
 
+    let normalized_path = vault_bridge::livesync::normalize_note_path(note_path);
     let decryptor = build_livesync_decryptor(config).await?;
     let couch = vault_bridge::couchdb::CouchDbClient::new(&config.couchdb)
         .context("failed to build couchdb client for note scan")?;
-
-    println!("Debug note scan for path: {note_path}");
-    match couch
-        .find_file_document_by_note_path(note_path, decryptor.as_deref())
+    let source = couch
+        .diagnose_note_source(&normalized_path, decryptor.as_deref())
         .await
-        .context("failed to scan couchdb documents for note path")?
-    {
-        Some(file_doc) => {
-            println!("\n=== scanned file doc ===");
-            println!("{}", serde_json::to_string_pretty(&file_doc)?);
+        .context("failed to classify LiveSync source documents")?;
 
-            let mut metadata_children = Vec::new();
-            if let Ok(LivesyncDocument::File(file)) = LivesyncDocument::try_from(file_doc.clone()) {
-                if let Some(decryptor) = decryptor.as_deref()
-                    && vault_bridge::encryption::is_encrypted_meta_path(&file.path)
-                    && let Ok(meta) = decryptor.decrypt_meta_document(&file.path)
-                {
-                    println!("\n=== decrypted file metadata ===");
-                    println!("{}", serde_json::to_string_pretty(&meta)?);
-                    if let Some(children) = meta.get("children").and_then(Value::as_array) {
-                        metadata_children = children.clone();
-                    }
-                }
-            }
+    let local = if config.database.is_configured() {
+        let persistence =
+            PostgresPersistence::connect_and_migrate(&config.database, config.embedding.dimensions)
+                .await
+                .context("failed to connect to postgres for note diagnostics")?;
+        serde_json::to_value(
+            persistence
+                .note_source_diagnostic(&normalized_path, source.file_revision.as_deref())
+                .await
+                .context("failed to inspect local note state")?,
+        )?
+    } else {
+        serde_json::json!({
+            "database_configured": false,
+            "state": "unavailable"
+        })
+    };
 
-            if let Ok(LivesyncDocument::File(file)) = LivesyncDocument::try_from(file_doc.clone()) {
-                let child_list = if metadata_children.is_empty() {
-                    file.children
-                } else {
-                    metadata_children
-                };
-                for child in child_list {
-                    let Some(child_id) = child_doc_id(&child) else {
-                        continue;
-                    };
-                    println!("\n=== scanned child doc ({child_id}) ===");
-                    match couch.get_document(&child_id).await? {
-                        Some(child_doc) => {
-                            println!("{}", serde_json::to_string_pretty(&child_doc)?)
-                        }
-                        None => println!("not found"),
-                    }
-                }
-            }
-        }
-        None => {
-            println!("No CouchDB file doc matched the requested note path.");
-        }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "note_path": normalized_path,
+            "content_included": false,
+            "source": source,
+            "local": local
+        }))?
+    );
+
+    if include_raw_docs {
+        eprintln!(
+            "WARNING: --include-raw-docs prints decrypted metadata and LiveSync leaf content"
+        );
+        dump_raw_note_documents(&couch, &normalized_path, decryptor.as_deref()).await?;
     }
 
+    Ok(())
+}
+
+async fn dump_raw_note_documents(
+    couch: &vault_bridge::couchdb::CouchDbClient,
+    note_path: &str,
+    decryptor: Option<&Decryptor>,
+) -> anyhow::Result<()> {
+    let Some(file_doc) = couch
+        .find_file_document_by_note_path(note_path, decryptor)
+        .await
+        .context("failed to scan CouchDB documents for note path")?
+    else {
+        return Ok(());
+    };
+
+    println!("\n=== raw file document ===");
+    println!("{}", serde_json::to_string_pretty(&file_doc)?);
+    let mut children = Vec::new();
+    if let Ok(LivesyncDocument::File(file)) = LivesyncDocument::try_from(file_doc) {
+        children = file.children.clone();
+        if let Some(decryptor) = decryptor
+            && vault_bridge::encryption::is_encrypted_meta_path(&file.path)
+            && let Ok(meta) = decryptor.decrypt_meta_document(&file.path)
+        {
+            println!("\n=== decrypted file metadata ===");
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+            if let Some(metadata_children) = meta.get("children").and_then(Value::as_array) {
+                children = metadata_children.clone();
+            }
+        }
+    }
+    for child in children {
+        let Some(child_id) = child_doc_id(&child) else {
+            continue;
+        };
+        println!("\n=== raw child document ({child_id}) ===");
+        match couch.get_document(&child_id).await? {
+            Some(child_doc) => println!("{}", serde_json::to_string_pretty(&child_doc)?),
+            None => println!("not found"),
+        }
+    }
     Ok(())
 }
 

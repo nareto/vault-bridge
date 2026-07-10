@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::migrate::Migrator;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -76,12 +77,57 @@ pub struct PersistedRecoveryTarget {
     pub recovery_kind: String,
     pub target_id: String,
     pub failure_count: usize,
+    pub last_failure_kind: Option<String>,
+    pub expected_child_count: Option<usize>,
+    pub live_child_count: Option<usize>,
+    pub missing_child_count: Option<usize>,
+    pub tombstoned_child_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryChildDiagnosis {
+    pub expected: usize,
+    pub live: usize,
+    pub missing: usize,
+    pub tombstoned: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryQueueStats {
     pub pending: usize,
     pub quarantined: usize,
+    pub aliases_blocked_by_unavailable_children: usize,
+    pub missing_children: usize,
+    pub tombstoned_children: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalAliasDiagnostic {
+    pub file_document_id: String,
+    pub revision: String,
+    pub expected_child_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalRecoveryDiagnostic {
+    pub failure_count: usize,
+    pub failure_kind: Option<String>,
+    pub quarantined: bool,
+    pub next_retry_at: DateTime<Utc>,
+    pub last_diagnosed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalNoteDiagnostic {
+    pub database_configured: bool,
+    pub aliases: Vec<LocalAliasDiagnostic>,
+    pub index_state: String,
+    pub indexed_revision: Option<String>,
+    pub raw_file_state: String,
+    pub raw_file_revision: Option<String>,
+    pub staged_current_child_count: usize,
+    pub staged_stale_child_count: usize,
+    pub recovery: Option<LocalRecoveryDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -1480,7 +1526,9 @@ impl PostgresPersistence {
     ) -> Result<Vec<PersistedRecoveryTarget>, PersistenceError> {
         let rows = sqlx::query(
             r#"
-            SELECT recovery_kind, target_id, failure_count
+            SELECT recovery_kind, target_id, failure_count, last_failure_kind,
+                   expected_child_count, live_child_count, missing_child_count,
+                   tombstoned_child_count
             FROM sync_recovery_queue
             WHERE quarantined_at IS NULL
               AND next_retry_at <= $1
@@ -1496,10 +1544,19 @@ impl PostgresPersistence {
         rows.into_iter()
             .map(|row| {
                 let failure_count: i32 = row.try_get("failure_count")?;
+                let count = |name| -> Result<Option<usize>, sqlx::Error> {
+                    row.try_get::<Option<i32>, _>(name)
+                        .map(|value| value.map(|value| value.max(0) as usize))
+                };
                 Ok(PersistedRecoveryTarget {
                     recovery_kind: row.try_get("recovery_kind")?,
                     target_id: row.try_get("target_id")?,
                     failure_count: failure_count.max(0) as usize,
+                    last_failure_kind: row.try_get("last_failure_kind")?,
+                    expected_child_count: count("expected_child_count")?,
+                    live_child_count: count("live_child_count")?,
+                    missing_child_count: count("missing_child_count")?,
+                    tombstoned_child_count: count("tombstoned_child_count")?,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -1526,6 +1583,7 @@ impl PostgresPersistence {
         next_retry_at: DateTime<Utc>,
         max_failures: usize,
         failure_kind: &str,
+        child_diagnosis: Option<&RecoveryChildDiagnosis>,
     ) -> Result<bool, PersistenceError> {
         let row = sqlx::query(
             r#"
@@ -1537,6 +1595,11 @@ impl PostgresPersistence {
                     ELSE NULL
                 END,
                 last_failure_kind = $5,
+                expected_child_count = $6,
+                live_child_count = $7,
+                missing_child_count = $8,
+                tombstoned_child_count = $9,
+                last_diagnosed_at = CASE WHEN $6 IS NULL THEN last_diagnosed_at ELSE now() END,
                 updated_at = now()
             WHERE recovery_kind = $1 AND target_id = $2
             RETURNING quarantined_at IS NOT NULL AS quarantined
@@ -1547,6 +1610,10 @@ impl PostgresPersistence {
         .bind(next_retry_at)
         .bind(max_failures.max(1).min(i32::MAX as usize) as i32)
         .bind(failure_kind)
+        .bind(child_diagnosis.map(|diagnosis| diagnosis.expected.min(i32::MAX as usize) as i32))
+        .bind(child_diagnosis.map(|diagnosis| diagnosis.live.min(i32::MAX as usize) as i32))
+        .bind(child_diagnosis.map(|diagnosis| diagnosis.missing.min(i32::MAX as usize) as i32))
+        .bind(child_diagnosis.map(|diagnosis| diagnosis.tombstoned.min(i32::MAX as usize) as i32))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row
@@ -1579,7 +1646,20 @@ impl PostgresPersistence {
             r#"
             SELECT
                 COUNT(*) FILTER (WHERE quarantined_at IS NULL) AS pending,
-                COUNT(*) FILTER (WHERE quarantined_at IS NOT NULL) AS quarantined
+                COUNT(*) FILTER (WHERE quarantined_at IS NOT NULL) AS quarantined,
+                COUNT(*) FILTER (
+                    WHERE recovery_kind = 'file_alias'
+                      AND last_failure_kind IN (
+                          'missing_children', 'tombstoned_children',
+                          'mixed_unavailable_children'
+                      )
+                ) AS aliases_blocked,
+                COALESCE(SUM(missing_child_count) FILTER (
+                    WHERE recovery_kind = 'file_alias'
+                ), 0) AS missing_children,
+                COALESCE(SUM(tombstoned_child_count) FILTER (
+                    WHERE recovery_kind = 'file_alias'
+                ), 0) AS tombstoned_children
             FROM sync_recovery_queue
             "#,
         )
@@ -1587,9 +1667,124 @@ impl PostgresPersistence {
         .await?;
         let pending: i64 = row.try_get("pending")?;
         let quarantined: i64 = row.try_get("quarantined")?;
+        let aliases_blocked: i64 = row.try_get("aliases_blocked")?;
+        let missing_children: i64 = row.try_get("missing_children")?;
+        let tombstoned_children: i64 = row.try_get("tombstoned_children")?;
         Ok(RecoveryQueueStats {
             pending: pending.max(0) as usize,
             quarantined: quarantined.max(0) as usize,
+            aliases_blocked_by_unavailable_children: aliases_blocked.max(0) as usize,
+            missing_children: missing_children.max(0) as usize,
+            tombstoned_children: tombstoned_children.max(0) as usize,
+        })
+    }
+
+    pub async fn note_source_diagnostic(
+        &self,
+        note_path: &str,
+        source_revision: Option<&str>,
+    ) -> Result<LocalNoteDiagnostic, PersistenceError> {
+        let alias_rows = sqlx::query(
+            r#"
+            SELECT file_doc_id, couchdb_rev, cardinality(children) AS child_count
+            FROM file_aliases
+            WHERE note_path = $1
+            ORDER BY file_doc_id
+            "#,
+        )
+        .bind(note_path)
+        .fetch_all(&self.pool)
+        .await?;
+        let aliases = alias_rows
+            .into_iter()
+            .map(|row| {
+                let child_count: i32 = row.try_get("child_count")?;
+                Ok(LocalAliasDiagnostic {
+                    file_document_id: row.try_get("file_doc_id")?,
+                    revision: row.try_get("couchdb_rev")?,
+                    expected_child_count: child_count.max(0) as usize,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        let indexed_revision =
+            sqlx::query_scalar::<_, String>("SELECT couchdb_rev FROM notes WHERE id = $1")
+                .bind(note_path)
+                .fetch_optional(&self.pool)
+                .await?;
+        let raw_file_revision =
+            sqlx::query_scalar::<_, String>("SELECT couchdb_rev FROM vault_files WHERE path = $1")
+                .bind(note_path)
+                .fetch_optional(&self.pool)
+                .await?;
+        let state = |revision: Option<&str>| match (revision, source_revision) {
+            (None, _) => "missing",
+            (Some(local), Some(source)) if local == source => "current",
+            (Some(_), Some(_)) => "stale",
+            (Some(_), None) => "present_source_missing",
+        };
+
+        let staged_rows = sqlx::query(
+            "SELECT couchdb_rev, COUNT(*) AS chunk_count FROM chunk_staging WHERE parent_id = $1 GROUP BY couchdb_rev",
+        )
+        .bind(note_path)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut staged_current_child_count = 0usize;
+        let mut staged_stale_child_count = 0usize;
+        for row in staged_rows {
+            let revision: String = row.try_get("couchdb_rev")?;
+            let count: i64 = row.try_get("chunk_count")?;
+            if source_revision.is_some_and(|source| source == revision) {
+                staged_current_child_count += count.max(0) as usize;
+            } else {
+                staged_stale_child_count += count.max(0) as usize;
+            }
+        }
+
+        let alias_ids = aliases
+            .iter()
+            .map(|alias| alias.file_document_id.clone())
+            .collect::<Vec<_>>();
+        let recovery = if alias_ids.is_empty() {
+            None
+        } else {
+            sqlx::query(
+                r#"
+                SELECT failure_count, last_failure_kind, next_retry_at,
+                       quarantined_at IS NOT NULL AS quarantined, last_diagnosed_at
+                FROM sync_recovery_queue
+                WHERE recovery_kind = 'file_alias' AND target_id = ANY($1)
+                ORDER BY updated_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(&alias_ids)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| {
+                let failure_count: i32 = row.try_get("failure_count")?;
+                Ok::<LocalRecoveryDiagnostic, sqlx::Error>(LocalRecoveryDiagnostic {
+                    failure_count: failure_count.max(0) as usize,
+                    failure_kind: row.try_get("last_failure_kind")?,
+                    quarantined: row.try_get("quarantined")?,
+                    next_retry_at: row.try_get("next_retry_at")?,
+                    last_diagnosed_at: row.try_get("last_diagnosed_at")?,
+                })
+            })
+            .transpose()?
+        };
+
+        Ok(LocalNoteDiagnostic {
+            database_configured: true,
+            aliases,
+            index_state: state(indexed_revision.as_deref()).to_string(),
+            indexed_revision,
+            raw_file_state: state(raw_file_revision.as_deref()).to_string(),
+            raw_file_revision,
+            staged_current_child_count,
+            staged_stale_child_count,
+            recovery,
         })
     }
 

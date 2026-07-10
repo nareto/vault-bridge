@@ -6,8 +6,8 @@ use chrono::Utc;
 use hex::encode as hex_encode;
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -62,6 +62,51 @@ struct BulkAllDocsValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSyncWriteReceipt {
     pub couchdb_rev: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDocumentState {
+    Live,
+    Missing,
+    Tombstoned,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceChildState {
+    pub ordinal: usize,
+    pub document_id: String,
+    pub state: SourceDocumentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveSyncSourceDiagnostic {
+    pub file_document_exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_document_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_revision: Option<String>,
+    pub expected_child_count: usize,
+    pub live_child_count: usize,
+    pub missing_child_count: usize,
+    pub tombstoned_child_count: usize,
+    pub unknown_child_count: usize,
+    pub children: Vec<SourceChildState>,
+}
+
+impl LiveSyncSourceDiagnostic {
+    pub fn failure_kind(&self) -> Option<&'static str> {
+        match (
+            self.missing_child_count > 0,
+            self.tombstoned_child_count > 0,
+        ) {
+            (true, true) => Some("mixed_unavailable_children"),
+            (true, false) => Some("missing_children"),
+            (false, true) => Some("tombstoned_children"),
+            (false, false) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +494,112 @@ impl CouchDbClient {
         }
 
         Ok(documents)
+    }
+
+    pub async fn classify_document_states(
+        &self,
+        document_ids: &[String],
+    ) -> Result<Vec<SourceChildState>, CouchDbError> {
+        let mut states = Vec::with_capacity(document_ids.len());
+        for (chunk_index, chunk) in document_ids.chunks(500).enumerate() {
+            let response = self
+                .send_request_with_timeout(
+                    self.http
+                        .post(format!("{}/_all_docs", self.db_base_url()))
+                        .basic_auth(&self.username, Some(&self.password))
+                        .json(&serde_json::json!({ "keys": chunk, "include_docs": false })),
+                    COUCHDB_REQUEST_TIMEOUT,
+                )
+                .await?
+                .error_for_status()?;
+            let page: BulkAllDocsPage = self
+                .read_json_with_timeout(response, COUCHDB_REQUEST_TIMEOUT)
+                .await?;
+            for (row_index, row) in page.rows.into_iter().enumerate() {
+                let state = if row.value.as_ref().is_some_and(|value| value.deleted) {
+                    SourceDocumentState::Tombstoned
+                } else if row.error.as_deref() == Some("not_found") {
+                    SourceDocumentState::Missing
+                } else if row.value.is_some() {
+                    SourceDocumentState::Live
+                } else {
+                    SourceDocumentState::Unknown
+                };
+                states.push(SourceChildState {
+                    ordinal: chunk_index * 500 + row_index,
+                    document_id: row.id.unwrap_or(row.key),
+                    state,
+                });
+            }
+        }
+        Ok(states)
+    }
+
+    pub async fn diagnose_note_source(
+        &self,
+        note_path: &str,
+        decryptor: Option<&Decryptor>,
+    ) -> Result<LiveSyncSourceDiagnostic, CouchDbError> {
+        let Some(file_doc) = self
+            .find_file_document_by_note_path(note_path, decryptor)
+            .await?
+        else {
+            return Ok(LiveSyncSourceDiagnostic {
+                file_document_exists: false,
+                file_document_id: None,
+                file_revision: None,
+                expected_child_count: 0,
+                live_child_count: 0,
+                missing_child_count: 0,
+                tombstoned_child_count: 0,
+                unknown_child_count: 0,
+                children: Vec::new(),
+            });
+        };
+
+        let mut file = match LivesyncDocument::try_from(file_doc) {
+            Ok(LivesyncDocument::File(file)) => file,
+            _ => {
+                return Err(CouchDbError::InvalidResponse(
+                    "matched note path did not decode as a LiveSync file document".to_string(),
+                ));
+            }
+        };
+        hydrate_file_from_encrypted_metadata(&mut file, decryptor)?;
+        let child_ids = file
+            .children
+            .iter()
+            .filter_map(child_doc_id)
+            .collect::<Vec<_>>();
+        let children = self.classify_document_states(&child_ids).await?;
+        let live_child_count = children
+            .iter()
+            .filter(|child| child.state == SourceDocumentState::Live)
+            .count();
+        let missing_child_count = children
+            .iter()
+            .filter(|child| child.state == SourceDocumentState::Missing)
+            .count();
+        let tombstoned_child_count = children
+            .iter()
+            .filter(|child| child.state == SourceDocumentState::Tombstoned)
+            .count();
+        let unknown_child_count = children
+            .iter()
+            .filter(|child| child.state == SourceDocumentState::Unknown)
+            .count();
+
+        Ok(LiveSyncSourceDiagnostic {
+            file_document_exists: true,
+            file_document_id: Some(file.id),
+            file_revision: Some(file.rev),
+            expected_child_count: child_ids.len(),
+            live_child_count,
+            missing_child_count,
+            tombstoned_child_count,
+            unknown_child_count,
+            children,
+        })
     }
 
     pub async fn find_file_document_by_note_path(
@@ -1442,7 +1593,7 @@ mod tests {
     use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
     use axum::response::Response;
-    use axum::routing::{get, post};
+    use axum::routing::get;
     use axum::{Json, Router};
     use serde::Deserialize;
     use serde_json::Value;
@@ -1450,7 +1601,7 @@ mod tests {
     use tokio_stream::StreamExt;
 
     use super::{
-        CouchDbClient, CouchDbError, build_livesync_note_documents,
+        CouchDbClient, CouchDbError, SourceDocumentState, build_livesync_note_documents,
         build_livesync_note_documents_with_crypto, build_native_encrypted_livesync_note_documents,
         decode_changes_body,
     };
@@ -1526,6 +1677,37 @@ mod tests {
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     }
 
+    async fn mock_all_docs_scan(
+        State(state): State<MockCouchState>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        let include_docs = query
+            .get("include_docs")
+            .is_some_and(|value| value == "true");
+        let docs = state.docs.lock().await;
+        let mut keys = docs.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let rows = keys
+            .into_iter()
+            .filter_map(|key| {
+                let doc = docs.get(&key)?;
+                if doc.get("_deleted").and_then(Value::as_bool) == Some(true) {
+                    return None;
+                }
+                let mut row = serde_json::json!({
+                    "id": key,
+                    "key": key,
+                    "value": {"rev": doc.get("_rev").and_then(Value::as_str).unwrap_or("")}
+                });
+                if include_docs {
+                    row["doc"] = doc.clone();
+                }
+                Some(row)
+            })
+            .collect::<Vec<_>>();
+        Json(serde_json::json!({"rows": rows}))
+    }
+
     async fn mock_all_docs(
         State(state): State<MockCouchState>,
         Path(_db): Path<String>,
@@ -1551,11 +1733,16 @@ mod tests {
             .map(|key_string| match docs.get(&key_string) {
                 Some(doc) => {
                     let rev = doc.get("_rev").and_then(Value::as_str).unwrap_or("");
+                    let deleted = doc
+                        .get("_deleted")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     let mut row = serde_json::json!({
+                        "id": key_string,
                         "key": key_string,
-                        "value": { "rev": rev }
+                        "value": { "rev": rev, "deleted": deleted }
                     });
-                    if include_docs {
+                    if include_docs && !deleted {
                         row["doc"] = doc.clone();
                     }
                     row
@@ -1576,7 +1763,10 @@ mod tests {
             operations: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
-            .route("/{db}/_all_docs", post(mock_all_docs))
+            .route(
+                "/{db}/_all_docs",
+                get(mock_all_docs_scan).post(mock_all_docs),
+            )
             .route(
                 "/{db}/{doc_id}",
                 get(mock_get_document)
@@ -1599,6 +1789,81 @@ mod tests {
         });
 
         (format!("http://{addr}"), state)
+    }
+
+    #[tokio::test]
+    async fn classifies_live_missing_and_tombstoned_documents_without_content() {
+        let docs = HashMap::from([
+            (
+                "h:live".to_string(),
+                serde_json::json!({"_id": "h:live", "_rev": "1-live", "data": "private"}),
+            ),
+            (
+                "h:deleted".to_string(),
+                serde_json::json!({"_id": "h:deleted", "_rev": "2-deleted", "_deleted": true}),
+            ),
+        ]);
+        let (url, _) = spawn_mock_couchdb(docs);
+        let client = client_for(url);
+        let states = client
+            .classify_document_states(&[
+                "h:live".to_string(),
+                "h:missing".to_string(),
+                "h:deleted".to_string(),
+            ])
+            .await
+            .expect("classify documents");
+
+        assert_eq!(states[0].state, SourceDocumentState::Live);
+        assert_eq!(states[1].state, SourceDocumentState::Missing);
+        assert_eq!(states[2].state, SourceDocumentState::Tombstoned);
+        assert_eq!(states[0].ordinal, 0);
+    }
+
+    #[tokio::test]
+    async fn diagnoses_file_metadata_with_missing_and_tombstoned_children() {
+        let docs = HashMap::from([
+            (
+                "f:test".to_string(),
+                serde_json::json!({
+                    "_id": "f:test",
+                    "_rev": "7-file",
+                    "type": "newnote",
+                    "path": "Notes/partial.md",
+                    "children": ["h:live", "h:missing", "h:deleted"],
+                    "ctime": 0,
+                    "mtime": 0,
+                    "size": 10,
+                    "eden": {}
+                }),
+            ),
+            (
+                "h:live".to_string(),
+                serde_json::json!({"_id": "h:live", "_rev": "1-live", "type": "leaf", "data": "secret"}),
+            ),
+            (
+                "h:deleted".to_string(),
+                serde_json::json!({"_id": "h:deleted", "_rev": "2-deleted", "_deleted": true}),
+            ),
+        ]);
+        let (url, _) = spawn_mock_couchdb(docs);
+        let diagnostic = client_for(url)
+            .diagnose_note_source("Notes/partial.md", None)
+            .await
+            .expect("diagnose partial source");
+
+        assert!(diagnostic.file_document_exists);
+        assert_eq!(diagnostic.expected_child_count, 3);
+        assert_eq!(diagnostic.live_child_count, 1);
+        assert_eq!(diagnostic.missing_child_count, 1);
+        assert_eq!(diagnostic.tombstoned_child_count, 1);
+        assert_eq!(
+            diagnostic.failure_kind(),
+            Some("mixed_unavailable_children")
+        );
+        let safe_output = serde_json::to_string(&diagnostic).expect("serialize diagnostic");
+        assert!(!safe_output.contains("secret"));
+        assert!(!safe_output.contains("data"));
     }
 
     fn client_for(base_url: String) -> CouchDbClient {

@@ -12,7 +12,7 @@ use vault_bridge::model::NoteId;
 use vault_bridge::new_note::{
     ContentPatchOperation, NewNoteFileType, NewNoteRequest, UpdateNoteRequest, WriteError,
 };
-use vault_bridge::persistence::PostgresPersistence;
+use vault_bridge::persistence::{PostgresPersistence, RecoveryChildDiagnosis};
 use vault_bridge::store::{VaultFileVisibility, VaultStore};
 
 fn test_database_url() -> Option<String> {
@@ -252,6 +252,23 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
     .execute(persistence.pool())
     .await
     .expect("insert staged child before confirmed deletion");
+    sqlx::query(
+        "INSERT INTO chunk_staging (parent_id, chunk_index, chunk_count, content, couchdb_rev) VALUES ($1, 0, 2, 'current partial', 'remote-new')",
+    )
+    .bind(markdown_id.as_str())
+    .execute(persistence.pool())
+    .await
+    .expect("insert current-generation staged child");
+    let source_diagnostic = persistence
+        .note_source_diagnostic(markdown_id.as_str(), Some("remote-new"))
+        .await
+        .expect("load local source diagnostic");
+    assert_eq!(source_diagnostic.index_state, "stale");
+    assert_eq!(source_diagnostic.raw_file_state, "missing");
+    assert_eq!(source_diagnostic.staged_current_child_count, 1);
+    assert_eq!(source_diagnostic.aliases.len(), 1);
+    assert_eq!(source_diagnostic.aliases[0].expected_child_count, 1);
+
     persistence
         .apply_confirmed_vault_file_deletion(markdown_id.as_str())
         .await
@@ -297,6 +314,7 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
                 Utc::now() + chrono::Duration::seconds(30),
                 2,
                 "incomplete_source",
+                None,
             )
             .await
             .expect("defer first recovery failure")
@@ -309,6 +327,7 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
                 Utc::now() + chrono::Duration::seconds(60),
                 2,
                 "incomplete_source",
+                None,
             )
             .await
             .expect("quarantine repeated recovery failure")
@@ -323,6 +342,34 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
         .expect("read recovery queue stats");
     assert_eq!(recovery_stats.pending, 0);
     assert_eq!(recovery_stats.quarantined, 1);
+
+    persistence
+        .enqueue_recovery_targets("file_alias", &["deleted-file-doc".to_string()])
+        .await
+        .expect("enqueue unavailable-child alias");
+    persistence
+        .fail_recovery_target(
+            "file_alias",
+            "deleted-file-doc",
+            Utc::now() + chrono::Duration::seconds(30),
+            5,
+            "mixed_unavailable_children",
+            Some(&RecoveryChildDiagnosis {
+                expected: 4,
+                live: 2,
+                missing: 1,
+                tombstoned: 1,
+            }),
+        )
+        .await
+        .expect("persist unavailable-child diagnosis");
+    let diagnosed_stats = persistence
+        .recovery_queue_stats()
+        .await
+        .expect("read diagnosed recovery stats");
+    assert_eq!(diagnosed_stats.aliases_blocked_by_unavailable_children, 1);
+    assert_eq!(diagnosed_stats.missing_children, 1);
+    assert_eq!(diagnosed_stats.tombstoned_children, 1);
 
     sqlx::query(
         "INSERT INTO chunk_staging (parent_id, chunk_index, chunk_count, content, couchdb_rev) VALUES ('queued-parent', 0, 2, 'partial', '1-test')",
