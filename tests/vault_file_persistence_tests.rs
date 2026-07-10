@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::json;
 
 use vault_bridge::authorization::{AccessPolicy, AuthContext, ContextName};
 use vault_bridge::config::DatabaseConfig;
+use vault_bridge::livesync::ChangeEvent;
 use vault_bridge::model::NoteId;
 use vault_bridge::new_note::{
     ContentPatchOperation, NewNoteFileType, NewNoteRequest, UpdateNoteRequest, WriteError,
@@ -59,7 +61,7 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
         .expect("connect and migrate test postgres"),
     );
     sqlx::query(
-        "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
+        "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, sync_recovery_queue, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
     )
     .execute(persistence.pool())
     .await
@@ -277,6 +279,80 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
             .all(|chunk| chunk.parent_id != "h:deleted-child")
     );
 
+    let recovery_targets = vec!["parent-a".to_string(), "parent-b".to_string()];
+    persistence
+        .enqueue_recovery_targets("chunk_parent", &recovery_targets)
+        .await
+        .expect("enqueue recovery targets");
+    let due = persistence
+        .due_recovery_targets(10, Utc::now())
+        .await
+        .expect("load due recovery targets");
+    assert_eq!(due.len(), 2);
+    assert!(
+        !persistence
+            .fail_recovery_target(
+                "chunk_parent",
+                "parent-a",
+                Utc::now() + chrono::Duration::seconds(30),
+                2,
+                "incomplete_source",
+            )
+            .await
+            .expect("defer first recovery failure")
+    );
+    assert!(
+        persistence
+            .fail_recovery_target(
+                "chunk_parent",
+                "parent-a",
+                Utc::now() + chrono::Duration::seconds(60),
+                2,
+                "incomplete_source",
+            )
+            .await
+            .expect("quarantine repeated recovery failure")
+    );
+    persistence
+        .resolve_recovery_target("chunk_parent", "parent-b")
+        .await
+        .expect("resolve recovery target");
+    let recovery_stats = persistence
+        .recovery_queue_stats()
+        .await
+        .expect("read recovery queue stats");
+    assert_eq!(recovery_stats.pending, 0);
+    assert_eq!(recovery_stats.quarantined, 1);
+
+    sqlx::query(
+        "INSERT INTO chunk_staging (parent_id, chunk_index, chunk_count, content, couchdb_rev) VALUES ('queued-parent', 0, 2, 'partial', '1-test')",
+    )
+    .execute(persistence.pool())
+    .await
+    .expect("insert chunk before atomic recovery enqueue");
+    persistence
+        .purge_chunk_staging_and_enqueue_recovery(
+            vec!["queued-parent".to_string()],
+            "chunk_parent",
+            vec!["queued-parent".to_string()],
+        )
+        .await
+        .expect("atomically purge and enqueue recovery");
+    let staged_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chunk_staging WHERE parent_id = 'queued-parent'")
+            .fetch_one(persistence.pool())
+            .await
+            .expect("count purged staging rows");
+    assert_eq!(staged_count, 0);
+    assert!(
+        persistence
+            .due_recovery_targets(10, Utc::now())
+            .await
+            .expect("load atomically queued target")
+            .iter()
+            .any(|target| target.target_id == "queued-parent")
+    );
+
     let failed_write = store_e
         .prepare_create_vault_write_at(
             NewNoteRequest {
@@ -290,6 +366,24 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
         .await
         .expect("prepare write before closing pool");
     persistence.pool().close().await;
+    let failed_ingest = store_e
+        .ingest_changes_batch(
+            vec![ChangeEvent {
+                seq: json!("999-g1AAA"),
+                id: "unknown-doc".to_string(),
+                deleted: false,
+                doc: Some(json!({"_id": "unknown-doc", "type": "unknown"})),
+            }],
+            "999-g1AAA",
+            250,
+            Duration::from_secs(60),
+            None,
+        )
+        .await;
+    assert!(
+        !failed_ingest.durably_applied,
+        "worker must retain its previous cursor after an atomic ingest fails"
+    );
     assert!(matches!(
         store_e
             .commit_prepared_vault_write(failed_write, "1-test")

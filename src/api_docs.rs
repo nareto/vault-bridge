@@ -588,7 +588,7 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "IndexStats": {
                     "type": "object",
-                    "required": ["total_notes", "total_links", "total_tags", "pending_embeddings", "quarantined_embeddings", "pending_chunk_embeddings", "quarantined_chunk_embeddings", "pending_chunks", "orphan_leaf_staging_count", "stale_file_aliases", "missing_vault_files_for_notes", "unindexed_markdown_vault_files"],
+                    "required": ["total_notes", "total_links", "total_tags", "pending_embeddings", "quarantined_embeddings", "pending_chunk_embeddings", "quarantined_chunk_embeddings", "pending_chunks", "orphan_leaf_staging_count", "stale_file_aliases", "pending_sync_recoveries", "quarantined_sync_recoveries", "missing_vault_files_for_notes", "unindexed_markdown_vault_files"],
                     "properties": {
                         "total_notes": {"type": "integer", "minimum": 0},
                         "total_links": {"type": "integer", "minimum": 0},
@@ -600,6 +600,8 @@ pub(crate) fn openapi_spec() -> Value {
                         "pending_chunks": {"type": "integer", "minimum": 0},
                         "orphan_leaf_staging_count": {"type": "integer", "minimum": 0},
                         "stale_file_aliases": {"type": "integer", "minimum": 0},
+                        "pending_sync_recoveries": {"type": "integer", "minimum": 0},
+                        "quarantined_sync_recoveries": {"type": "integer", "minimum": 0},
                         "missing_vault_files_for_notes": {"type": "integer", "minimum": 0},
                         "unindexed_markdown_vault_files": {"type": "integer", "minimum": 0}
                     }
@@ -624,11 +626,13 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "SyncStats": {
                     "type": "object",
-                    "required": ["last_seq", "couchdb_current_seq", "behind_by", "last_sync_at"],
+                    "required": ["last_seq", "couchdb_current_seq", "behind_by", "current_seq_source", "current_seq_observed_at", "last_sync_at"],
                     "properties": {
                         "last_seq": {"type": "string"},
                         "couchdb_current_seq": {"type": "string"},
                         "behind_by": {"type": "integer"},
+                        "current_seq_source": {"type": "string", "enum": ["live", "cached"]},
+                        "current_seq_observed_at": {"type": "string", "format": "date-time"},
                         "last_sync_at": {"type": "string", "format": "date-time"}
                     }
                 },

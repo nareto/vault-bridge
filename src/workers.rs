@@ -23,6 +23,10 @@ use crate::store::{StaleFileRecoveryTarget, SyncBatchResult, VaultStore};
 const LOCALAI_HEALTH_PROBE_INPUT: &str = "vault bridge embedding health probe";
 const STALE_FILE_RECOVERY_TARGET_LIMIT: usize = 16;
 const STALE_FILE_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
+const REMOTE_DRIFT_RECOVERY_INTERVAL: Duration = Duration::from_secs(300);
+const RECOVERY_KIND_CHUNK_PARENT: &str = "chunk_parent";
+const RECOVERY_KIND_FILE_ALIAS: &str = "file_alias";
+const RECOVERY_KIND_REMOTE_DRIFT: &str = "remote_drift";
 
 static DATA_URI_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"data:[^\s)>"']{128,}"#).expect("valid data URI regex"));
@@ -30,6 +34,160 @@ static OPAQUE_TOKEN_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"[A-Za-z0-9_+/=-]{160,}").expect("valid opaque token regex"));
 
 pub fn spawn_sync_worker(
+    store: VaultStore,
+    config: &AppConfig,
+    decryptor: Option<Arc<Decryptor>>,
+) -> Result<Option<JoinHandle<()>>, WorkerError> {
+    if !config.couchdb.is_configured() {
+        return Ok(None);
+    }
+
+    let couch = CouchDbClient::new(&config.couchdb)?.with_livesync_crypto(decryptor.clone());
+    let context_window = config.indexer.max_link_context_chars;
+    let max_changes_per_batch = config.indexer.max_changes_per_batch.max(1);
+    let chunk_timeout = Duration::from_secs(config.indexer.chunk_staging_timeout_seconds.max(1));
+    let poll_interval = config.couchdb.poll_interval();
+    let recovery_batch_size = config.indexer.recovery_batch_size.max(1);
+    let recovery_max_failures = config.indexer.recovery_max_failures.max(1);
+    let recovery_base_backoff = config.indexer.recovery_base_backoff_seconds.max(1);
+    let recovery_max_backoff = config
+        .indexer
+        .recovery_max_backoff_seconds
+        .max(recovery_base_backoff);
+
+    Ok(Some(tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(1);
+        let mut poll_since = store.status().await.sync.last_seq;
+        let mut last_recovery_discovery_at = Instant::now() - STALE_FILE_RECOVERY_INTERVAL;
+        let mut last_remote_drift_check_at = Instant::now() - REMOTE_DRIFT_RECOVERY_INTERVAL;
+
+        loop {
+            let current_seq = match couch.current_sequence().await {
+                Ok(seq) => seq,
+                Err(error) => {
+                    warn!(error = %error, "sync worker: failed to fetch live CouchDB sequence");
+                    sleep(backoff).await;
+                    backoff = next_backoff(backoff);
+                    continue;
+                }
+            };
+
+            // Publish a fresh remote watermark before doing any potentially slow work.
+            if !store.set_sync_state(&poll_since, &current_seq).await {
+                sleep(backoff).await;
+                backoff = next_backoff(backoff);
+                continue;
+            }
+
+            let feed = match couch.poll_changes(&poll_since, poll_interval).await {
+                Ok(feed) => feed,
+                Err(error) => {
+                    warn!(error = %error, "sync worker: failed to poll _changes feed");
+                    sleep(backoff).await;
+                    backoff = next_backoff(backoff);
+                    continue;
+                }
+            };
+            let feed_last_seq = crate::livesync::sequence_to_string(&feed.last_seq);
+
+            if !feed.results.is_empty() {
+                let input_changes = feed.results.len();
+                let batch = ingest_changes_cooperatively(
+                    &store,
+                    &couch,
+                    feed.results,
+                    &current_seq,
+                    context_window,
+                    chunk_timeout,
+                    decryptor.as_deref(),
+                    max_changes_per_batch,
+                )
+                .await;
+
+                if let Err(error) = store
+                    .enqueue_sync_recoveries(RECOVERY_KIND_CHUNK_PARENT, &batch.recovery_parent_ids)
+                    .await
+                {
+                    warn!(error = %error, "sync worker: failed to queue chunk recovery targets");
+                }
+
+                if !batch.durably_applied {
+                    warn!(
+                        input_changes,
+                        durable_cursor = %poll_since,
+                        "sync worker: ingest persistence failed; retaining durable _changes cursor"
+                    );
+                    sleep(backoff).await;
+                    backoff = next_backoff(backoff);
+                    continue;
+                }
+
+                if let Some(last_seq) = batch.last_seq.clone() {
+                    poll_since = last_seq;
+                } else if !feed_last_seq.is_empty() {
+                    poll_since = feed_last_seq;
+                }
+                debug!(
+                    input_changes,
+                    indexed = batch.indexed_notes,
+                    deleted = batch.deleted_notes,
+                    pending_chunks = batch.pending_chunks,
+                    last_seq = %poll_since,
+                    live_current_seq = %current_seq,
+                    "sync worker: normal _changes batch durably applied"
+                );
+                backoff = Duration::from_secs(1);
+                continue;
+            }
+
+            // An empty feed cursor can advance safely because there was no content to apply.
+            if !feed_last_seq.is_empty() && feed_last_seq != poll_since {
+                if !store.set_sync_state(&feed_last_seq, &current_seq).await {
+                    sleep(backoff).await;
+                    backoff = next_backoff(backoff);
+                    continue;
+                }
+                poll_since = feed_last_seq;
+            }
+
+            // Recovery is strictly idle work. Any remote movement returns to `_changes` first.
+            if !sequence_is_caught_up(&poll_since, &current_seq) {
+                backoff = Duration::from_secs(1);
+                continue;
+            }
+
+            if last_recovery_discovery_at.elapsed() >= STALE_FILE_RECOVERY_INTERVAL {
+                last_recovery_discovery_at = Instant::now();
+                let check_remote_drift =
+                    last_remote_drift_check_at.elapsed() >= REMOTE_DRIFT_RECOVERY_INTERVAL;
+                if check_remote_drift {
+                    last_remote_drift_check_at = Instant::now();
+                }
+                discover_sync_recovery_targets(&store, &couch, chunk_timeout, check_remote_drift)
+                    .await;
+            }
+
+            run_bounded_sync_recovery(
+                &store,
+                &couch,
+                &current_seq,
+                context_window,
+                chunk_timeout,
+                decryptor.as_deref(),
+                max_changes_per_batch,
+                recovery_batch_size,
+                recovery_max_failures,
+                recovery_base_backoff,
+                recovery_max_backoff,
+            )
+            .await;
+            backoff = Duration::from_secs(1);
+        }
+    })))
+}
+
+#[allow(dead_code)]
+fn spawn_sync_worker_legacy(
     store: VaultStore,
     config: &AppConfig,
     decryptor: Option<Arc<Decryptor>>,
@@ -377,6 +535,239 @@ pub fn spawn_sync_worker(
     })))
 }
 
+fn sequence_is_caught_up(last_seq: &str, current_seq: &str) -> bool {
+    fn prefix(value: &str) -> Option<u64> {
+        value
+            .split_once('-')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(value)
+            .parse::<u64>()
+            .ok()
+    }
+
+    match (prefix(last_seq), prefix(current_seq)) {
+        (Some(last), Some(current)) => last >= current,
+        _ => last_seq == current_seq,
+    }
+}
+
+async fn discover_sync_recovery_targets(
+    store: &VaultStore,
+    couch: &CouchDbClient,
+    chunk_timeout: Duration,
+    check_remote_drift: bool,
+) {
+    let purged = store
+        .recover_stale_chunk_staging_at(chunk_timeout, Utc::now())
+        .await;
+    if !purged.is_empty() {
+        warn!(
+            purged_parent_count = purged.purged_parent_ids.len(),
+            recovery_parent_count = purged.recovery_parent_ids.len(),
+            orphan_leaf_parent_count = purged.orphan_leaf_parent_ids.len(),
+            "sync worker: quarantinable stale chunk targets discovered"
+        );
+        if let Err(error) = store
+            .enqueue_sync_recoveries(RECOVERY_KIND_CHUNK_PARENT, &purged.recovery_parent_ids)
+            .await
+        {
+            warn!(error = %error, "sync worker: failed to persist stale chunk recovery targets");
+        }
+    }
+
+    let stale_targets = store.stale_file_recovery_targets().await;
+    let active_ids = stale_targets
+        .iter()
+        .map(|target| target.file_doc_id.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = store
+        .enqueue_sync_recoveries(RECOVERY_KIND_FILE_ALIAS, &active_ids)
+        .await
+    {
+        warn!(error = %error, "sync worker: failed to persist stale file recovery targets");
+    }
+    if let Err(error) = store
+        .clear_resolved_sync_recoveries(RECOVERY_KIND_FILE_ALIAS, &active_ids)
+        .await
+    {
+        warn!(error = %error, "sync worker: failed to prune resolved file recovery targets");
+    }
+
+    if check_remote_drift {
+        // A cursor-safe feed should make drift rare; this periodic consistency
+        // check queues only tracked parents whose remote revision changed.
+        let remote_drift = detect_remote_stale_file_docs(store, couch).await;
+        if let Err(error) = store
+            .enqueue_sync_recoveries(RECOVERY_KIND_REMOTE_DRIFT, &remote_drift)
+            .await
+        {
+            warn!(error = %error, "sync worker: failed to persist remote drift recovery targets");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_bounded_sync_recovery(
+    store: &VaultStore,
+    couch: &CouchDbClient,
+    current_seq: &str,
+    context_window: usize,
+    chunk_timeout: Duration,
+    decryptor: Option<&Decryptor>,
+    max_changes_per_batch: usize,
+    recovery_batch_size: usize,
+    recovery_max_failures: usize,
+    recovery_base_backoff: u64,
+    recovery_max_backoff: u64,
+) {
+    let targets = match store
+        .due_sync_recoveries(recovery_batch_size, Utc::now())
+        .await
+    {
+        Ok(targets) => targets,
+        Err(error) => {
+            warn!(error = %error, "sync worker: failed to load due recovery targets");
+            return;
+        }
+    };
+
+    for target in targets {
+        if target.recovery_kind != RECOVERY_KIND_REMOTE_DRIFT
+            && !store
+                .sync_recovery_target_is_unresolved(&target.target_id)
+                .await
+        {
+            if let Err(error) = store
+                .resolve_sync_recovery(&target.recovery_kind, &target.target_id)
+                .await
+            {
+                warn!(error = %error, "sync worker: failed to prune obsolete recovery target");
+            }
+            continue;
+        }
+
+        let recovered = if target.recovery_kind == RECOVERY_KIND_FILE_ALIAS {
+            fetch_stale_file_alias_recovery_changes(store, couch, &target.target_id, decryptor)
+                .await
+        } else {
+            fetch_parent_recovery_changes(couch, std::slice::from_ref(&target.target_id)).await
+        };
+
+        let (resolved, failure_kind) = if recovered.is_empty() {
+            (false, "source_unresolved")
+        } else {
+            let replay = ingest_changes_cooperatively(
+                store,
+                couch,
+                recovered,
+                current_seq,
+                context_window,
+                chunk_timeout,
+                decryptor,
+                max_changes_per_batch,
+            )
+            .await;
+            if let Err(error) = store
+                .enqueue_sync_recoveries(RECOVERY_KIND_CHUNK_PARENT, &replay.recovery_parent_ids)
+                .await
+            {
+                warn!(error = %error, "sync worker: failed to persist replay recovery targets");
+            }
+            let unresolved = store
+                .sync_recovery_target_is_unresolved(&target.target_id)
+                .await;
+            (
+                replay.durably_applied && !unresolved,
+                if replay.durably_applied {
+                    "incomplete_source"
+                } else {
+                    "persistence_failed"
+                },
+            )
+        };
+
+        if resolved {
+            if let Err(error) = store
+                .resolve_sync_recovery(&target.recovery_kind, &target.target_id)
+                .await
+            {
+                warn!(error = %error, "sync worker: failed to clear resolved recovery target");
+            }
+            continue;
+        }
+
+        let multiplier = 1u64 << target.failure_count.min(20);
+        let delay_seconds = recovery_base_backoff
+            .saturating_mul(multiplier)
+            .min(recovery_max_backoff);
+        let next_retry_at =
+            Utc::now() + chrono::Duration::seconds(delay_seconds.min(i64::MAX as u64) as i64);
+        match store
+            .fail_sync_recovery(
+                &target.recovery_kind,
+                &target.target_id,
+                next_retry_at,
+                recovery_max_failures,
+                failure_kind,
+            )
+            .await
+        {
+            Ok(true) => warn!(
+                recovery_kind = target.recovery_kind,
+                recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
+                attempts = target.failure_count + 1,
+                "sync worker: quarantined unrecoverable target"
+            ),
+            Ok(false) => debug!(
+                recovery_kind = target.recovery_kind,
+                recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
+                attempts = target.failure_count + 1,
+                retry_after_seconds = delay_seconds,
+                "sync worker: deferred unresolved recovery target"
+            ),
+            Err(error) => warn!(error = %error, "sync worker: failed to defer recovery target"),
+        }
+    }
+}
+
+async fn fetch_stale_file_alias_recovery_changes(
+    store: &VaultStore,
+    couch: &CouchDbClient,
+    file_doc_id: &str,
+    decryptor: Option<&Decryptor>,
+) -> Vec<ChangeEvent> {
+    let Some(target) = store
+        .stale_file_recovery_targets()
+        .await
+        .into_iter()
+        .find(|target| target.file_doc_id == file_doc_id)
+    else {
+        return Vec::new();
+    };
+    let targets = vec![target];
+    let mut recovered =
+        fetch_parent_recovery_changes(couch, &recovery_lookup_ids_for_stale_file_targets(&targets))
+            .await;
+    append_missing_changes(
+        &mut recovered,
+        fetch_exact_recovery_changes(
+            couch,
+            &recovery_child_doc_ids_for_stale_file_targets(&targets),
+        )
+        .await,
+    );
+    append_missing_changes(
+        &mut recovered,
+        fetch_path_scan_recovery_changes(
+            couch,
+            &fallback_stale_file_recovery_targets(&targets),
+            decryptor,
+        )
+        .await,
+    );
+    recovered
+}
+
 async fn ingest_changes_cooperatively(
     store: &VaultStore,
     couch: &CouchDbClient,
@@ -395,6 +786,7 @@ async fn ingest_changes_cooperatively(
         recovery_parent_ids: Vec::new(),
         orphan_leaf_parent_ids: Vec::new(),
         last_seq: None,
+        durably_applied: true,
     };
     let mut seen_purged_parent_ids = HashSet::new();
     let mut seen_recovery_parent_ids = HashSet::new();
@@ -412,6 +804,11 @@ async fn ingest_changes_cooperatively(
                 decryptor,
             )
             .await;
+
+        if !batch.durably_applied {
+            aggregate.durably_applied = false;
+            break;
+        }
 
         aggregate.indexed_notes += batch.indexed_notes;
         aggregate.deleted_notes += batch.deleted_notes;
@@ -436,11 +833,7 @@ async fn ingest_changes_cooperatively(
             }
         }
 
-        let recovered = fetch_parent_recovery_changes(couch, &batch.recovery_parent_ids).await;
-        if !recovered.is_empty() {
-            pending.extend(recovered);
-        }
-
+        // Recovery is queued separately and never recursively extends a feed batch.
         if !pending.is_empty() {
             yield_now().await;
         }
@@ -469,6 +862,7 @@ async fn recover_stale_chunk_staging_cooperatively(
         recovery_parent_ids: purged.recovery_parent_ids,
         orphan_leaf_parent_ids: purged.orphan_leaf_parent_ids,
         last_seq: None,
+        durably_applied: true,
     };
     if aggregate.purged_parent_ids.is_empty() {
         return aggregate;
@@ -515,6 +909,7 @@ async fn recover_stale_chunk_staging_cooperatively(
     if replay.last_seq.is_some() {
         aggregate.last_seq = replay.last_seq;
     }
+    aggregate.durably_applied = replay.durably_applied;
 
     aggregate
 }
@@ -559,6 +954,7 @@ async fn recover_stale_file_aliases_cooperatively(
         recovery_parent_ids: stale_file_doc_ids.clone(),
         orphan_leaf_parent_ids: Vec::new(),
         last_seq: None,
+        durably_applied: true,
     };
     if stale_file_doc_ids.is_empty() {
         return aggregate;
@@ -614,6 +1010,7 @@ async fn recover_stale_file_aliases_cooperatively(
     if replay.last_seq.is_some() {
         aggregate.last_seq = replay.last_seq;
     }
+    aggregate.durably_applied = replay.durably_applied;
 
     aggregate
 }
@@ -1766,8 +2163,8 @@ mod tests {
         queue_parent_recovery, recover_stale_chunk_staging_cooperatively,
         recover_stale_file_aliases_cooperatively, recovery_child_doc_ids_for_stale_file_targets,
         recovery_lookup_ids_for_stale_file_targets, sample_note_chunks_for_embedding,
-        should_flush_pending, spawn_embedding_worker, split_note_for_localai, take_change_batch,
-        take_stale_file_recovery_targets,
+        sequence_is_caught_up, should_flush_pending, spawn_embedding_worker, spawn_sync_worker,
+        split_note_for_localai, take_change_batch, take_stale_file_recovery_targets,
     };
     use crate::authorization::{AccessPolicy, AuthContext, ContextName};
     use crate::config::{
@@ -1782,6 +2179,8 @@ mod tests {
     struct MockCouchState {
         docs: Arc<HashMap<String, serde_json::Value>>,
         requested: Arc<Mutex<Vec<String>>>,
+        current_seq: Arc<String>,
+        changes: Arc<Vec<ChangeEvent>>,
     }
 
     #[derive(Clone)]
@@ -1791,6 +2190,46 @@ mod tests {
         requests: Arc<AtomicUsize>,
         chunk_lengths: Arc<Mutex<Vec<usize>>>,
         requested_dimensions: Arc<Mutex<Vec<Option<u64>>>>,
+    }
+
+    async fn mock_database_info(State(state): State<MockCouchState>) -> Json<serde_json::Value> {
+        Json(serde_json::json!({"update_seq": state.current_seq.as_str()}))
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct MockChangesQuery {
+        #[serde(default)]
+        since: String,
+    }
+
+    async fn mock_changes(
+        State(state): State<MockCouchState>,
+        Query(query): Query<MockChangesQuery>,
+    ) -> Json<serde_json::Value> {
+        let since = query
+            .since
+            .split_once('-')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(query.since.as_str())
+            .parse::<u64>()
+            .unwrap_or(0);
+        let results = state
+            .changes
+            .iter()
+            .filter(|change| {
+                change
+                    .seq
+                    .as_str()
+                    .and_then(|seq| seq.split_once('-').map(|(prefix, _)| prefix).or(Some(seq)))
+                    .and_then(|prefix| prefix.parse::<u64>().ok())
+                    .is_some_and(|seq| seq > since)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Json(serde_json::json!({
+            "last_seq": state.current_seq.as_str(),
+            "results": results,
+        }))
     }
 
     async fn mock_get_document(
@@ -1896,11 +2335,23 @@ mod tests {
     }
 
     fn spawn_mock_couchdb(docs: HashMap<String, serde_json::Value>) -> (String, MockCouchState) {
+        spawn_mock_couchdb_with_changes(docs, Vec::new(), "0-g1AAA")
+    }
+
+    fn spawn_mock_couchdb_with_changes(
+        docs: HashMap<String, serde_json::Value>,
+        changes: Vec<ChangeEvent>,
+        current_seq: &str,
+    ) -> (String, MockCouchState) {
         let state = MockCouchState {
             docs: Arc::new(docs),
             requested: Arc::new(Mutex::new(Vec::new())),
+            current_seq: Arc::new(current_seq.to_string()),
+            changes: Arc::new(changes),
         };
         let app = Router::new()
+            .route("/{db}", get(mock_database_info))
+            .route("/{db}/_changes", get(mock_changes))
             .route(
                 "/{db}/_all_docs",
                 get(mock_all_docs_scan).post(mock_all_docs),
@@ -2072,6 +2523,16 @@ mod tests {
 
         let parsed = parse_localai_embeddings_for_test(payload, 2).expect("parse embeddings");
         assert_eq!(parsed, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+    }
+
+    #[test]
+    fn equivalent_clustered_sequence_tokens_are_caught_up_by_numeric_prefix() {
+        assert!(sequence_is_caught_up(
+            "186787-g1AAA-left",
+            "186787-g1AAA-right"
+        ));
+        assert!(!sequence_is_caught_up("186786-g1AAA", "186787-g1AAA"));
+        assert!(sequence_is_caught_up("186788-g1AAA", "186787-g1AAA"));
     }
 
     #[test]
@@ -2368,6 +2829,173 @@ mod tests {
         assert!(ids.contains(&docs.leaf_id));
         assert_eq!(pending_seq, "42-g1AAA");
         assert!(last_event_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_worker_prioritizes_later_changes_over_preexisting_stale_aliases() {
+        let store = VaultStore::new(20);
+        let stale_docs =
+            build_livesync_note_documents("11New/preexisting-stale.md", "# Preexisting Stale");
+        let mut stale_file = stale_docs.file_doc.clone();
+        stale_file["_rev"] = serde_json::Value::String("1-stale-file".to_string());
+        store
+            .ingest_changes_batch(
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String("1-g1AAA".to_string()),
+                    id: stale_docs.file_id.clone(),
+                    deleted: false,
+                    doc: Some(stale_file.clone()),
+                }],
+                "1-g1AAA",
+                250,
+                Duration::from_secs(60),
+                None,
+            )
+            .await;
+        assert_eq!(store.status().await.index.stale_file_aliases, 1);
+
+        let valid_path = "11New/priority-valid.md";
+        let valid_docs = build_livesync_note_documents(
+            valid_path,
+            "# Priority Valid\n\nNormal changes are never starved.",
+        );
+        let mut valid_file = valid_docs.file_doc.clone();
+        let mut valid_leaf = valid_docs.leaf_doc.clone();
+        valid_file["_rev"] = serde_json::Value::String("2-valid-file".to_string());
+        valid_leaf["_rev"] = serde_json::Value::String("2-valid-leaf".to_string());
+        let changes = vec![
+            ChangeEvent {
+                seq: serde_json::Value::String("2-g1AAA".to_string()),
+                id: valid_docs.file_id.clone(),
+                deleted: false,
+                doc: Some(valid_file.clone()),
+            },
+            ChangeEvent {
+                seq: serde_json::Value::String("3-g1AAA".to_string()),
+                id: valid_docs.leaf_id.clone(),
+                deleted: false,
+                doc: Some(valid_leaf.clone()),
+            },
+        ];
+        let mut server_docs = HashMap::new();
+        server_docs.insert(stale_docs.file_id, stale_file);
+        server_docs.insert(valid_docs.file_id.clone(), valid_file);
+        server_docs.insert(valid_docs.leaf_id.clone(), valid_leaf);
+        let (url, _state) =
+            spawn_mock_couchdb_with_changes(server_docs, changes, "3-g1AAA-current");
+
+        let config = AppConfig {
+            couchdb: CouchDbConfig {
+                url,
+                database: "mainvault".to_string(),
+                username: "user".to_string(),
+                password: "pass".to_string(),
+                poll_interval_seconds: 1,
+                feed_mode: FeedMode::Longpoll,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let handle = spawn_sync_worker(store.clone(), &config, None)
+            .expect("spawn sync worker")
+            .expect("configured CouchDB starts worker");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && get_local_note(&store, valid_path).await.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handle.abort();
+        let _ = handle.await;
+
+        let note = get_local_note(&store, valid_path)
+            .await
+            .expect("later valid note should be indexed before stale recovery");
+        assert!(note.content.contains("never starved"));
+        assert!(sequence_is_caught_up(
+            &store.status().await.sync.last_seq,
+            "3-g1AAA-current"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_never_recursively_starves_a_later_valid_change() {
+        let store = VaultStore::new(20);
+        let stale_path = "11New/stale-partial.md";
+        let stale_at = Utc::now() - chrono::Duration::seconds(70);
+        let stale_leaf = serde_json::json!({
+            "_id": "h:stale-partial",
+            "_rev": "1-stale-leaf",
+            "type": "leaf",
+            "e_": true,
+            "data": serde_json::json!({
+                "parent_id": stale_path,
+                "chunk_index": 0,
+                "chunk_count": 2,
+                "content": "# stale partial"
+            }).to_string()
+        });
+        store
+            .ingest_changes_batch_at(
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String("80-g1AAA".to_string()),
+                    id: "h:stale-partial".to_string(),
+                    deleted: false,
+                    doc: Some(stale_leaf),
+                }],
+                "80-g1AAA",
+                250,
+                Duration::from_secs(60),
+                stale_at,
+                None,
+            )
+            .await;
+
+        let stale_docs = build_livesync_note_documents(stale_path, "# Still incomplete");
+        let valid_path = "11New/later-valid.md";
+        let valid_docs =
+            build_livesync_note_documents(valid_path, "# Later Valid\n\nIndexed first.");
+        let mut valid_file = valid_docs.file_doc.clone();
+        let mut valid_leaf = valid_docs.leaf_doc.clone();
+        valid_file["_rev"] = serde_json::Value::String("2-valid-file".to_string());
+        valid_leaf["_rev"] = serde_json::Value::String("2-valid-leaf".to_string());
+
+        let mut server_docs = HashMap::new();
+        server_docs.insert(stale_docs.file_id.clone(), stale_docs.file_doc);
+        server_docs.insert(stale_docs.leaf_id.clone(), stale_docs.leaf_doc);
+        server_docs.insert(valid_docs.file_id.clone(), valid_file.clone());
+        server_docs.insert(valid_docs.leaf_id.clone(), valid_leaf);
+        let (url, state) = spawn_mock_couchdb(server_docs);
+        let couch = couchdb_client(url);
+
+        let batch = tokio::time::timeout(
+            Duration::from_secs(2),
+            ingest_changes_cooperatively(
+                &store,
+                &couch,
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String("81-g1AAA".to_string()),
+                    id: valid_docs.file_id.clone(),
+                    deleted: false,
+                    doc: Some(valid_file),
+                }],
+                "81-g1AAA",
+                250,
+                Duration::from_secs(60),
+                None,
+                1,
+            ),
+        )
+        .await
+        .expect("normal ingest must not loop through stale recovery");
+
+        assert!(batch.durably_applied);
+        assert_eq!(batch.indexed_notes, 1);
+        assert!(batch.recovery_parent_ids.contains(&stale_path.to_string()));
+        assert!(get_local_note(&store, valid_path).await.is_some());
+        let requested = state.requested.lock().await.clone();
+        assert!(requested.contains(&valid_docs.file_id));
+        assert!(!requested.contains(&stale_docs.file_id));
+        assert!(!requested.contains(&stale_docs.leaf_id));
     }
 
     #[tokio::test]

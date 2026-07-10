@@ -235,7 +235,27 @@ impl VaultBridgeService {
     }
 
     pub async fn status(&self) -> StatusResponse {
-        self.store.status().await
+        let mut status = self.store.status().await;
+        let Some(couchdb) = self.couchdb.as_ref() else {
+            return status;
+        };
+
+        match tokio::time::timeout(Duration::from_secs(3), couchdb.current_sequence()).await {
+            Ok(Ok(current_seq)) => {
+                status.sync.behind_by = sequence_lag(&status.sync.last_seq, &current_seq);
+                status.sync.couchdb_current_seq = current_seq;
+                status.sync.current_seq_source = "live";
+                status.sync.current_seq_observed_at = Utc::now();
+            }
+            Ok(Err(error)) => warn!(
+                error = %error,
+                "status could not refresh live CouchDB sequence; reporting cached watermark"
+            ),
+            Err(_) => warn!(
+                "status timed out refreshing live CouchDB sequence; reporting cached watermark"
+            ),
+        }
+        status
     }
 
     pub async fn get_vault_file(
@@ -629,6 +649,19 @@ fn log_vault_file_lookup_miss(
     );
 }
 
+fn sequence_lag(last_seq: &str, current_seq: &str) -> i64 {
+    fn prefix(value: &str) -> i64 {
+        value
+            .split_once('-')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(value)
+            .parse::<i64>()
+            .unwrap_or(0)
+    }
+
+    (prefix(current_seq) - prefix(last_seq)).max(0)
+}
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error("not found")]
@@ -767,6 +800,10 @@ mod tests {
         serde_json::json!({ "key": key, "error": "not_found" })
     }
 
+    async fn database_info() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"update_seq": "8-g1AAA-live"}))
+    }
+
     async fn get_document(
         State(state): State<MockCouchState>,
         Path((_db, doc_id)): Path<(String, String)>,
@@ -808,6 +845,7 @@ mod tests {
             requests: Arc::new(AtomicUsize::new(0)),
         };
         let app = Router::new()
+            .route("/{db}", get(database_info))
             .route("/{db}/_all_docs", get(all_docs_scan).post(all_docs_by_key))
             .route(
                 "/{db}/{doc_id}",
@@ -836,6 +874,20 @@ mod tests {
         })
         .expect("couch client");
         (Arc::new(couch), state)
+    }
+
+    #[tokio::test]
+    async fn status_uses_live_couchdb_sequence_instead_of_cached_watermark() {
+        let store = VaultStore::new(20);
+        store.set_sync_state("5-g1AAA", "5-g1AAA").await;
+        let (couch, _) = spawn_mock_couchdb(HashMap::new(), HashSet::new());
+        let service = VaultBridgeService::new(store, Some(couch));
+
+        let status = service.status().await;
+
+        assert_eq!(status.sync.couchdb_current_seq, "8-g1AAA-live");
+        assert_eq!(status.sync.behind_by, 3);
+        assert_eq!(status.sync.current_seq_source, "live");
     }
 
     async fn indexed_store(path: &str, couchdb_rev: &str) -> (VaultStore, AuthContext) {
@@ -931,7 +983,7 @@ mod tests {
             .expect("test postgres"),
         );
         sqlx::query(
-            "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
+            "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, sync_recovery_queue, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
         )
         .execute(persistence.pool())
         .await

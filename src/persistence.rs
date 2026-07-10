@@ -58,6 +58,32 @@ pub struct PersistedStagedChunk {
     pub received_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PersistedIngestDelta {
+    pub note_upserts: Vec<PersistedNoteRecord>,
+    pub note_deletes: Vec<String>,
+    pub sync_state: Option<PersistedSyncState>,
+    pub chunk_upserts: Vec<PersistedStagedChunk>,
+    pub chunk_deletes: Vec<String>,
+    pub alias_upserts: Vec<PersistedFileAlias>,
+    pub alias_deletes: Vec<String>,
+    pub vault_file_upserts: Vec<PersistedVaultFile>,
+    pub vault_file_deletes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedRecoveryTarget {
+    pub recovery_kind: String,
+    pub target_id: String,
+    pub failure_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryQueueStats {
+    pub pending: usize,
+    pub quarantined: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PersistedFileAlias {
     pub file_doc_id: String,
@@ -535,6 +561,128 @@ impl PostgresPersistence {
         Ok(generation)
     }
 
+    /// Persist one `_changes` batch and its cursor in a single transaction.
+    pub async fn apply_ingest_delta(
+        &self,
+        mut delta: PersistedIngestDelta,
+    ) -> Result<u64, PersistenceError> {
+        delta.note_upserts.sort_by(|a, b| a.id.cmp(&b.id));
+        delta.note_deletes.sort();
+        delta.note_deletes.dedup();
+        delta.chunk_upserts.sort_by(|a, b| {
+            a.parent_id
+                .cmp(&b.parent_id)
+                .then(a.chunk_index.cmp(&b.chunk_index))
+        });
+        delta.chunk_deletes.sort();
+        delta.chunk_deletes.dedup();
+        delta
+            .alias_upserts
+            .sort_by(|a, b| a.file_doc_id.cmp(&b.file_doc_id));
+        delta.alias_deletes.sort();
+        delta.alias_deletes.dedup();
+        delta.vault_file_upserts.sort_by(|a, b| a.path.cmp(&b.path));
+        delta.vault_file_deletes.sort();
+        delta.vault_file_deletes.dedup();
+
+        let mut tx = self.pool.begin().await?;
+
+        for note_id in delta.note_deletes {
+            sqlx::query("DELETE FROM notes WHERE id = $1")
+                .bind(note_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for note in &delta.note_upserts {
+            upsert_note_tx(&mut tx, note).await?;
+        }
+        for path in delta.vault_file_deletes {
+            delete_vault_file_tx(&mut tx, &path).await?;
+        }
+        for file in &delta.vault_file_upserts {
+            upsert_vault_file_tx(&mut tx, file).await?;
+        }
+
+        for parent_id in delta.chunk_deletes {
+            sqlx::query("DELETE FROM chunk_staging WHERE parent_id = $1")
+                .bind(parent_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for chunk in delta.chunk_upserts {
+            let chunk_index = chunk.chunk_index.min(i32::MAX as usize) as i32;
+            let chunk_count = chunk.chunk_count.min(i32::MAX as usize).max(1) as i32;
+            sqlx::query("DELETE FROM chunk_staging WHERE parent_id = $1 AND couchdb_rev <> $2")
+                .bind(&chunk.parent_id)
+                .bind(&chunk.couchdb_rev)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO chunk_staging (
+                    parent_id, chunk_index, chunk_count, content, couchdb_rev, received_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (parent_id, chunk_index)
+                DO UPDATE SET
+                    chunk_count = EXCLUDED.chunk_count,
+                    content = EXCLUDED.content,
+                    couchdb_rev = EXCLUDED.couchdb_rev,
+                    received_at = EXCLUDED.received_at
+                "#,
+            )
+            .bind(&chunk.parent_id)
+            .bind(chunk_index)
+            .bind(chunk_count)
+            .bind(&chunk.content)
+            .bind(&chunk.couchdb_rev)
+            .bind(chunk.received_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for file_doc_id in delta.alias_deletes {
+            sqlx::query("DELETE FROM file_aliases WHERE file_doc_id = $1")
+                .bind(file_doc_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for alias in delta.alias_upserts {
+            sqlx::query(
+                r#"
+                INSERT INTO file_aliases (
+                    file_doc_id, note_path, couchdb_rev, children, ctime, mtime, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, now())
+                ON CONFLICT (file_doc_id)
+                DO UPDATE SET
+                    note_path = EXCLUDED.note_path,
+                    couchdb_rev = EXCLUDED.couchdb_rev,
+                    children = EXCLUDED.children,
+                    ctime = EXCLUDED.ctime,
+                    mtime = EXCLUDED.mtime,
+                    updated_at = EXCLUDED.updated_at
+                "#,
+            )
+            .bind(&alias.file_doc_id)
+            .bind(&alias.note_path)
+            .bind(&alias.couchdb_rev)
+            .bind(&alias.children)
+            .bind(alias.ctime)
+            .bind(alias.mtime)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if let Some(sync_state) = delta.sync_state {
+            upsert_sync_state_tx(&mut tx, &sync_state).await?;
+        }
+
+        let generation = bump_store_generation_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(generation)
+    }
+
     pub async fn apply_confirmed_vault_file_deletion(
         &self,
         path: &str,
@@ -626,6 +774,41 @@ impl PostgresPersistence {
                 .await?;
         }
 
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn purge_chunk_staging_and_enqueue_recovery(
+        &self,
+        mut delete_parents: Vec<String>,
+        recovery_kind: &str,
+        mut recovery_targets: Vec<String>,
+    ) -> Result<(), PersistenceError> {
+        delete_parents.sort();
+        delete_parents.dedup();
+        recovery_targets.sort();
+        recovery_targets.dedup();
+        let mut tx = self.pool.begin().await?;
+        for parent_id in delete_parents {
+            sqlx::query("DELETE FROM chunk_staging WHERE parent_id = $1")
+                .bind(parent_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !recovery_targets.is_empty() {
+            sqlx::query(
+                r#"
+                INSERT INTO sync_recovery_queue (recovery_kind, target_id)
+                SELECT $1, target_id
+                FROM unnest($2::text[]) AS target_id
+                ON CONFLICT (recovery_kind, target_id) DO NOTHING
+                "#,
+            )
+            .bind(recovery_kind)
+            .bind(&recovery_targets)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1265,6 +1448,149 @@ impl PostgresPersistence {
             })),
             None => Ok(None),
         }
+    }
+
+    pub async fn enqueue_recovery_targets(
+        &self,
+        recovery_kind: &str,
+        target_ids: &[String],
+    ) -> Result<(), PersistenceError> {
+        if target_ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO sync_recovery_queue (recovery_kind, target_id)
+            SELECT $1, target_id
+            FROM unnest($2::text[]) AS target_id
+            ON CONFLICT (recovery_kind, target_id) DO NOTHING
+            "#,
+        )
+        .bind(recovery_kind)
+        .bind(target_ids)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn due_recovery_targets(
+        &self,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PersistedRecoveryTarget>, PersistenceError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT recovery_kind, target_id, failure_count
+            FROM sync_recovery_queue
+            WHERE quarantined_at IS NULL
+              AND next_retry_at <= $1
+            ORDER BY next_retry_at ASC, recovery_kind ASC, target_id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(now)
+        .bind(limit.max(1).min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let failure_count: i32 = row.try_get("failure_count")?;
+                Ok(PersistedRecoveryTarget {
+                    recovery_kind: row.try_get("recovery_kind")?,
+                    target_id: row.try_get("target_id")?,
+                    failure_count: failure_count.max(0) as usize,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(PersistenceError::Sqlx)
+    }
+
+    pub async fn resolve_recovery_target(
+        &self,
+        recovery_kind: &str,
+        target_id: &str,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query("DELETE FROM sync_recovery_queue WHERE recovery_kind = $1 AND target_id = $2")
+            .bind(recovery_kind)
+            .bind(target_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn fail_recovery_target(
+        &self,
+        recovery_kind: &str,
+        target_id: &str,
+        next_retry_at: DateTime<Utc>,
+        max_failures: usize,
+        failure_kind: &str,
+    ) -> Result<bool, PersistenceError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE sync_recovery_queue
+            SET failure_count = failure_count + 1,
+                next_retry_at = $3,
+                quarantined_at = CASE
+                    WHEN failure_count + 1 >= $4 THEN now()
+                    ELSE NULL
+                END,
+                last_failure_kind = $5,
+                updated_at = now()
+            WHERE recovery_kind = $1 AND target_id = $2
+            RETURNING quarantined_at IS NOT NULL AS quarantined
+            "#,
+        )
+        .bind(recovery_kind)
+        .bind(target_id)
+        .bind(next_retry_at)
+        .bind(max_failures.max(1).min(i32::MAX as usize) as i32)
+        .bind(failure_kind)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|row| row.try_get::<bool, _>("quarantined"))
+            .transpose()?
+            .unwrap_or(false))
+    }
+
+    pub async fn clear_recovery_targets_not_in(
+        &self,
+        recovery_kind: &str,
+        active_target_ids: &[String],
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            r#"
+            DELETE FROM sync_recovery_queue
+            WHERE recovery_kind = $1
+              AND NOT (target_id = ANY($2::text[]))
+            "#,
+        )
+        .bind(recovery_kind)
+        .bind(active_target_ids)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn recovery_queue_stats(&self) -> Result<RecoveryQueueStats, PersistenceError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE quarantined_at IS NULL) AS pending,
+                COUNT(*) FILTER (WHERE quarantined_at IS NOT NULL) AS quarantined
+            FROM sync_recovery_queue
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let pending: i64 = row.try_get("pending")?;
+        let quarantined: i64 = row.try_get("quarantined")?;
+        Ok(RecoveryQueueStats {
+            pending: pending.max(0) as usize,
+            quarantined: quarantined.max(0) as usize,
+        })
     }
 
     pub async fn log_access(
@@ -2138,7 +2464,7 @@ impl PostgresPersistence {
     #[cfg(test)]
     pub async fn reset_for_test(&self) -> Result<(), PersistenceError> {
         sqlx::query(
-            "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
+            "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, sync_recovery_queue, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
         )
         .execute(&self.pool)
         .await?;

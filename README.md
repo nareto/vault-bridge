@@ -131,7 +131,48 @@ This split keeps the expensive and security-sensitive note logic in one backend.
 | REST context assembly | Builds compact bundles from note seeds, semantic queries, and graph expansion for REST clients |
 | Write support | Creates notes in a configured inbox path and updates eligible notes back through CouchDB |
 | MCP resources | Exposes a tooling catalog, OpenAPI schema, note resource templates, and primitive note/query/graph tools to agents |
-| Observability | Publishes status and Prometheus metrics for sync lag, embeddings, notes, links, tags, and context counts |
+| Observability | Publishes live sync lag, recovery queue, embeddings, notes, links, tags, and context counts |
+
+### Sync ingestion and recovery
+
+Normal CouchDB `_changes` ingestion always runs before historical repair. Each
+feed batch persists notes, raw files, aliases, chunk staging, and its cursor in
+one PostgreSQL transaction; a failed transaction leaves the durable cursor in
+place for retry. Recovery targets are processed only after the live feed is
+caught up, with a bounded batch, exponential backoff, and quarantine after the
+configured failure limit.
+
+The recovery controls live under `indexer`:
+
+```yaml
+recovery_batch_size: 4
+recovery_max_failures: 5
+recovery_base_backoff_seconds: 30
+recovery_max_backoff_seconds: 3600
+```
+
+`GET /api/v1/status` reports `pending_sync_recoveries` and
+`quarantined_sync_recoveries`. Its sync watermark is refreshed directly from
+CouchDB when available; `current_seq_source` distinguishes `live` from the
+persisted `cached` fallback.
+
+Operators can inspect recovery metadata without reading note content:
+
+```sql
+SELECT recovery_kind, failure_count, next_retry_at, quarantined_at
+FROM sync_recovery_queue
+ORDER BY quarantined_at NULLS FIRST, next_retry_at;
+```
+
+After repairing the source, reset quarantined targets for an immediate bounded
+retry:
+
+```sql
+UPDATE sync_recovery_queue
+SET failure_count = 0, next_retry_at = now(), quarantined_at = NULL,
+    last_failure_kind = NULL, updated_at = now()
+WHERE quarantined_at IS NOT NULL;
+```
 
 ## Access Contexts
 
@@ -677,6 +718,9 @@ scrape_configs:
 Metrics exposed by `GET /api/v1/metrics` include:
 
 - `vault_bridge_sync_behind_by`
+- `vault_bridge_sync_current_sequence_live`
+- `vault_bridge_pending_sync_recoveries`
+- `vault_bridge_quarantined_sync_recoveries`
 - `vault_bridge_pending_embeddings`
 - `vault_bridge_quarantined_embeddings`
 - `vault_bridge_pending_chunk_embeddings`

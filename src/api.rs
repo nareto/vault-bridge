@@ -1014,6 +1014,24 @@ fn render_prometheus_metrics(status: &StatusResponse) -> String {
         "# HELP vault_bridge_sync_behind_by CouchDB change-sequence lag.".to_string(),
         "# TYPE vault_bridge_sync_behind_by gauge".to_string(),
         format!("vault_bridge_sync_behind_by {}", status.sync.behind_by),
+        "# HELP vault_bridge_sync_current_sequence_live Whether sync lag uses a live CouchDB watermark.".to_string(),
+        "# TYPE vault_bridge_sync_current_sequence_live gauge".to_string(),
+        format!(
+            "vault_bridge_sync_current_sequence_live {}",
+            usize::from(status.sync.current_seq_source == "live")
+        ),
+        "# HELP vault_bridge_pending_sync_recoveries Unresolved sync recovery targets waiting for retry.".to_string(),
+        "# TYPE vault_bridge_pending_sync_recoveries gauge".to_string(),
+        format!(
+            "vault_bridge_pending_sync_recoveries {}",
+            status.index.pending_sync_recoveries
+        ),
+        "# HELP vault_bridge_quarantined_sync_recoveries Sync recovery targets quarantined after repeated failures.".to_string(),
+        "# TYPE vault_bridge_quarantined_sync_recoveries gauge".to_string(),
+        format!(
+            "vault_bridge_quarantined_sync_recoveries {}",
+            status.index.quarantined_sync_recoveries
+        ),
         "# HELP vault_bridge_pending_embeddings Notes missing embeddings.".to_string(),
         "# TYPE vault_bridge_pending_embeddings gauge".to_string(),
         format!(

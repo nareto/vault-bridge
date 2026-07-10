@@ -38,8 +38,9 @@ use crate::new_note::{
 };
 use crate::persistence::{
     BlockEmbeddingStats, BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias,
-    PersistedLinkRecord, PersistedNoteRecord, PersistedSearchNote, PersistedStagedChunk,
-    PersistedSyncState, PersistedVaultFile, PostgresPersistence,
+    PersistedIngestDelta, PersistedLinkRecord, PersistedNoteRecord, PersistedRecoveryTarget,
+    PersistedSearchNote, PersistedStagedChunk, PersistedSyncState, PersistedVaultFile,
+    PostgresPersistence, RecoveryQueueStats,
 };
 use crate::runtime_config::{ConfigReloadStatus, RuntimeAuthConfig};
 use crate::search::{
@@ -447,6 +448,8 @@ pub struct IndexStats {
     pub pending_chunks: usize,
     pub orphan_leaf_staging_count: usize,
     pub stale_file_aliases: usize,
+    pub pending_sync_recoveries: usize,
+    pub quarantined_sync_recoveries: usize,
     pub missing_vault_files_for_notes: usize,
     pub unindexed_markdown_vault_files: usize,
 }
@@ -476,6 +479,8 @@ pub struct SyncStats {
     pub last_seq: String,
     pub couchdb_current_seq: String,
     pub behind_by: i64,
+    pub current_seq_source: &'static str,
+    pub current_seq_observed_at: DateTime<Utc>,
     pub last_sync_at: DateTime<Utc>,
 }
 
@@ -504,6 +509,7 @@ pub struct SyncBatchResult {
     pub recovery_parent_ids: Vec<String>,
     pub orphan_leaf_parent_ids: Vec<String>,
     pub last_seq: Option<String>,
+    pub durably_applied: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1269,6 +1275,7 @@ impl VaultStore {
             recovery_parent_ids: Vec::new(),
             orphan_leaf_parent_ids: Vec::new(),
             last_seq: None,
+            durably_applied: true,
         };
         let mut changed_note_ids: HashSet<NoteId> = HashSet::new();
         let mut deleted_note_ids: HashSet<NoteId> = HashSet::new();
@@ -1637,48 +1644,32 @@ impl VaultStore {
                 vault_file_deletes,
             )) = persistence_batch
         {
-            if !upserts.is_empty()
-                || !deletes.is_empty()
-                || sync_state.is_some()
-                || !vault_file_upserts.is_empty()
-                || !vault_file_deletes.is_empty()
-            {
-                match persistence
-                    .apply_content_delta(
-                        upserts,
-                        deletes,
-                        sync_state,
-                        vault_file_upserts,
-                        vault_file_deletes,
-                    )
-                    .await
-                {
-                    Ok(generation) => self.cache_generation.store(generation, Ordering::Release),
-                    Err(error) => warn!(error = %error, "failed to persist sync content batch"),
+            let delta = PersistedIngestDelta {
+                note_upserts: upserts,
+                note_deletes: deletes,
+                sync_state,
+                chunk_upserts,
+                chunk_deletes,
+                alias_upserts,
+                alias_deletes,
+                vault_file_upserts,
+                vault_file_deletes,
+            };
+            match persistence.apply_ingest_delta(delta).await {
+                Ok(generation) => self.cache_generation.store(generation, Ordering::Release),
+                Err(error) => {
+                    result.durably_applied = false;
+                    warn!(error = %error, "failed to persist atomic sync ingest batch");
                 }
-            }
-
-            if (!chunk_upserts.is_empty() || !chunk_deletes.is_empty())
-                && let Err(error) = persistence
-                    .apply_chunk_staging_delta(chunk_upserts, chunk_deletes)
-                    .await
-            {
-                warn!(error = %error, "failed to persist chunk staging batch");
-            }
-
-            if (!alias_upserts.is_empty() || !alias_deletes.is_empty())
-                && let Err(error) = persistence
-                    .apply_file_alias_delta(alias_upserts, alias_deletes)
-                    .await
-            {
-                warn!(error = %error, "failed to persist file alias batch");
             }
         }
 
-        // Sync blocks for changed notes (after persistence so CASCADE FK is satisfied).
-        for (note_id, path, title, content) in block_sync_notes {
-            self.sync_blocks_for_note(&note_id, &path, &title, &content)
-                .await;
+        // Blocks reference persisted notes, so do not advance them after a failed ingest.
+        if result.durably_applied {
+            for (note_id, path, title, content) in block_sync_notes {
+                self.sync_blocks_for_note(&note_id, &path, &title, &content)
+                    .await;
+            }
         }
 
         result
@@ -3731,6 +3722,16 @@ impl VaultStore {
                     stale_file_doc_ids_for_recovery_locked(&guard).len()
                 }
             };
+            let recovery_queue_stats = match persistence.recovery_queue_stats().await {
+                Ok(stats) => stats,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "failed postgres-backed sync recovery queue stats; using zero"
+                    );
+                    RecoveryQueueStats::default()
+                }
+            };
             let max_failures = self.settings.read().await.max_embedding_failures;
             let pending_embeddings = match persistence.pending_embedding_count().await {
                 Ok(count) => count,
@@ -3780,6 +3781,8 @@ impl VaultStore {
                 pending_chunks,
                 orphan_leaf_staging_count,
                 stale_file_aliases,
+                recovery_queue_stats.pending,
+                recovery_queue_stats.quarantined,
                 &sync_state,
             );
             let auth_config = self.authorization_config().await;
@@ -3812,6 +3815,8 @@ impl VaultStore {
             guard.chunk_staging.pending_count(),
             orphan_leaf_staging_count_locked(&guard),
             stale_file_doc_ids_for_recovery_locked(&guard).len(),
+            0,
+            0,
             &sync_state,
         );
         let auth_config = self.authorization_config().await;
@@ -3853,10 +3858,14 @@ impl VaultStore {
 
         if let Some(persistence) = self.persistence.as_ref()
             && let Err(error) = persistence
-                .apply_chunk_staging_delta(Vec::new(), purge_result.purged_parent_ids.clone())
+                .purge_chunk_staging_and_enqueue_recovery(
+                    purge_result.purged_parent_ids.clone(),
+                    "chunk_parent",
+                    purge_result.recovery_parent_ids.clone(),
+                )
                 .await
         {
-            warn!(error = %error, "failed to persist chunk staging purge");
+            warn!(error = %error, "failed to atomically persist chunk purge and recovery queue");
         }
 
         purge_result
@@ -3875,6 +3884,14 @@ impl VaultStore {
         stale_file_recovery_targets_locked(&guard)
     }
 
+    pub async fn sync_recovery_target_is_unresolved(&self, target_id: &str) -> bool {
+        let guard = self.inner.read().await;
+        guard.chunk_staging.parent_ids().any(|id| id == target_id)
+            || stale_file_recovery_targets_locked(&guard)
+                .iter()
+                .any(|target| target.file_doc_id == target_id || target.note_path == target_id)
+    }
+
     pub async fn tracked_file_doc_revs(&self) -> Vec<(String, String)> {
         let guard = self.inner.read().await;
         let mut tracked = guard
@@ -3886,7 +3903,7 @@ impl VaultStore {
         tracked
     }
 
-    pub async fn set_sync_state(&self, last_seq: &str, couchdb_current_seq: &str) {
+    pub async fn set_sync_state(&self, last_seq: &str, couchdb_current_seq: &str) -> bool {
         let mut guard = self.inner.write().await;
         let now = Utc::now();
         guard.last_seq = last_seq.to_string();
@@ -3905,7 +3922,81 @@ impl VaultStore {
                 .await
         {
             warn!(error = %error, "failed to persist sync_state");
+            return false;
         }
+        true
+    }
+
+    pub async fn enqueue_sync_recoveries(
+        &self,
+        recovery_kind: &str,
+        target_ids: &[String],
+    ) -> Result<(), crate::persistence::PersistenceError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence
+            .enqueue_recovery_targets(recovery_kind, target_ids)
+            .await
+    }
+
+    pub async fn due_sync_recoveries(
+        &self,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PersistedRecoveryTarget>, crate::persistence::PersistenceError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(Vec::new());
+        };
+        persistence.due_recovery_targets(limit, now).await
+    }
+
+    pub async fn resolve_sync_recovery(
+        &self,
+        recovery_kind: &str,
+        target_id: &str,
+    ) -> Result<(), crate::persistence::PersistenceError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence
+            .resolve_recovery_target(recovery_kind, target_id)
+            .await
+    }
+
+    pub async fn fail_sync_recovery(
+        &self,
+        recovery_kind: &str,
+        target_id: &str,
+        next_retry_at: DateTime<Utc>,
+        max_failures: usize,
+        failure_kind: &str,
+    ) -> Result<bool, crate::persistence::PersistenceError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(false);
+        };
+        persistence
+            .fail_recovery_target(
+                recovery_kind,
+                target_id,
+                next_retry_at,
+                max_failures,
+                failure_kind,
+            )
+            .await
+    }
+
+    pub async fn clear_resolved_sync_recoveries(
+        &self,
+        recovery_kind: &str,
+        active_target_ids: &[String],
+    ) -> Result<(), crate::persistence::PersistenceError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence
+            .clear_recovery_targets_not_in(recovery_kind, active_target_ids)
+            .await
     }
 
     pub async fn log_access(
@@ -5221,6 +5312,8 @@ fn status_from_inner(
     pending_chunks: usize,
     orphan_leaf_staging_count: usize,
     stale_file_aliases: usize,
+    pending_sync_recoveries: usize,
+    quarantined_sync_recoveries: usize,
     sync_state: &RuntimeSyncState,
 ) -> StatusResponse {
     let total_notes = guard.notes.len();
@@ -5265,6 +5358,8 @@ fn status_from_inner(
             pending_chunks,
             orphan_leaf_staging_count,
             stale_file_aliases,
+            pending_sync_recoveries,
+            quarantined_sync_recoveries,
             missing_vault_files_for_notes,
             unindexed_markdown_vault_files,
         },
@@ -5287,6 +5382,8 @@ fn status_from_inner(
             last_seq: sync_state.last_seq.clone(),
             couchdb_current_seq: sync_state.couchdb_current_seq.clone(),
             behind_by: (current_seq_n - last_seq_n).max(0),
+            current_seq_source: "cached",
+            current_seq_observed_at: sync_state.last_sync_at,
             last_sync_at: sync_state.last_sync_at,
         },
         context_stats: HashMap::new(),
@@ -6978,7 +7075,7 @@ views:
         };
         let inner =
             store_inner_from_persisted_notes(persisted_notes_fixture(now), &settings, &sync_state);
-        let status = status_from_inner(&inner, 7, 0, 0, &sync_state);
+        let status = status_from_inner(&inner, 7, 0, 0, 0, 0, &sync_state);
 
         assert_eq!(status.index.total_notes, 3);
         assert_eq!(status.index.total_links, 4);

@@ -41,6 +41,10 @@ indexer:
     - "MOC/"
     - "44MOC/"
   chunk_staging_timeout_seconds: 60
+  recovery_batch_size: 4             # recovery runs only when the normal CouchDB feed is caught up
+  recovery_max_failures: 5           # unresolved targets are then quarantined for operator review
+  recovery_base_backoff_seconds: 30
+  recovery_max_backoff_seconds: 3600
 
 embedding:
   mode: "local" # disabled | local | localai

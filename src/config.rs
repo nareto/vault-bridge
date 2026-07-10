@@ -322,6 +322,10 @@ pub struct IndexerConfig {
     pub hub_note_fanout: usize,
     pub hub_note_folders: Vec<String>,
     pub chunk_staging_timeout_seconds: u64,
+    pub recovery_batch_size: usize,
+    pub recovery_max_failures: usize,
+    pub recovery_base_backoff_seconds: u64,
+    pub recovery_max_backoff_seconds: u64,
 }
 
 impl Default for IndexerConfig {
@@ -334,6 +338,10 @@ impl Default for IndexerConfig {
             hub_note_fanout: 6,
             hub_note_folders: vec!["MOC/".to_string(), "99MOC/".to_string()],
             chunk_staging_timeout_seconds: 60,
+            recovery_batch_size: 4,
+            recovery_max_failures: 5,
+            recovery_base_backoff_seconds: 30,
+            recovery_max_backoff_seconds: 3_600,
         }
     }
 }
