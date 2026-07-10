@@ -1,6 +1,6 @@
 [package]
 name = "vault_bridge"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 description = "Self-hosted bridge from Obsidian LiveSync vaults to scoped REST and MCP context for agents."
 license = "Apache-2.0"

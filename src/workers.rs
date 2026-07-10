@@ -106,6 +106,7 @@ pub fn spawn_sync_worker(
         let startup_stale_file_targets = take_stale_file_recovery_targets(
             startup_stale_file_targets,
             STALE_FILE_RECOVERY_TARGET_LIMIT,
+            0,
         );
         let startup_stale_file_docs = startup_stale_file_targets
             .iter()
@@ -196,6 +197,8 @@ pub fn spawn_sync_worker(
                 "sync worker: bounded startup recovery replay completed"
             );
         }
+
+        let mut stale_file_recovery_offset = startup_stale_file_targets.len();
 
         loop {
             let current_seq = match couch.current_sequence().await {
@@ -316,6 +319,7 @@ pub fn spawn_sync_worker(
                                 chunk_timeout,
                                 decryptor.as_deref(),
                                 max_changes_per_batch,
+                                &mut stale_file_recovery_offset,
                             )
                             .await;
                             if batch.indexed_notes > 0 || batch.deleted_notes > 0 {
@@ -523,11 +527,26 @@ async fn recover_stale_file_aliases_cooperatively(
     chunk_timeout: Duration,
     decryptor: Option<&Decryptor>,
     max_changes_per_batch: usize,
+    recovery_offset: &mut usize,
 ) -> SyncBatchResult {
     let stale_file_targets = store.stale_file_recovery_targets().await;
     let stale_file_alias_total = stale_file_targets.len();
-    let stale_file_targets =
-        take_stale_file_recovery_targets(stale_file_targets, STALE_FILE_RECOVERY_TARGET_LIMIT);
+    let recovery_start_offset = if stale_file_alias_total == 0 {
+        0
+    } else {
+        *recovery_offset % stale_file_alias_total
+    };
+    let stale_file_targets = take_stale_file_recovery_targets(
+        stale_file_targets,
+        STALE_FILE_RECOVERY_TARGET_LIMIT,
+        recovery_start_offset,
+    );
+    if stale_file_alias_total == 0 {
+        *recovery_offset = 0;
+    } else {
+        *recovery_offset =
+            (recovery_start_offset + stale_file_targets.len()) % stale_file_alias_total;
+    }
     let stale_file_doc_ids = stale_file_targets
         .iter()
         .map(|target| target.file_doc_id.clone())
@@ -552,6 +571,7 @@ async fn recover_stale_file_aliases_cooperatively(
         stale_file_alias_total,
         stale_file_alias_count = stale_file_doc_ids.len(),
         stale_file_recovery_limit = STALE_FILE_RECOVERY_TARGET_LIMIT,
+        recovery_start_offset,
         recovery_lookup_count = recovery_lookup_ids.len(),
         recovery_child_count = recovery_child_doc_ids.len(),
         "sync worker: idle detected stale file aliases; queuing bounded parent recovery"
@@ -694,7 +714,13 @@ async fn fetch_parent_recovery_changes(
 fn take_stale_file_recovery_targets(
     mut targets: Vec<StaleFileRecoveryTarget>,
     limit: usize,
+    offset: usize,
 ) -> Vec<StaleFileRecoveryTarget> {
+    if targets.is_empty() {
+        return targets;
+    }
+    let start = offset % targets.len();
+    targets.rotate_left(start);
     targets.truncate(limit.max(1));
     targets
 }
@@ -2062,8 +2088,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_file_recovery_targets_are_bounded_without_reordering() {
-        let targets = (0..5)
+    fn stale_file_recovery_targets_are_bounded_and_rotate_without_reordering() {
+        let targets: Vec<_> = (0..5)
             .map(|index| StaleFileRecoveryTarget {
                 file_doc_id: format!("f:{index}"),
                 note_path: format!("note-{index}.md"),
@@ -2072,10 +2098,14 @@ mod tests {
             })
             .collect();
 
-        let selected = take_stale_file_recovery_targets(targets, 2);
+        let selected = take_stale_file_recovery_targets(targets.clone(), 2, 2);
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].file_doc_id, "f:0");
-        assert_eq!(selected[1].file_doc_id, "f:1");
+        assert_eq!(selected[0].file_doc_id, "f:2");
+        assert_eq!(selected[1].file_doc_id, "f:3");
+
+        let wrapped = take_stale_file_recovery_targets(targets, 2, 4);
+        assert_eq!(wrapped[0].file_doc_id, "f:4");
+        assert_eq!(wrapped[1].file_doc_id, "f:0");
     }
 
     #[test]
@@ -2594,6 +2624,7 @@ mod tests {
         let (url, state) = spawn_mock_couchdb(server_docs);
         let couch = couchdb_client(url);
 
+        let mut recovery_offset = 0;
         let recovered = recover_stale_file_aliases_cooperatively(
             &store,
             &couch,
@@ -2602,6 +2633,7 @@ mod tests {
             Duration::from_secs(60),
             None,
             64,
+            &mut recovery_offset,
         )
         .await;
 
@@ -2667,6 +2699,7 @@ mod tests {
         let (url, state) = spawn_mock_couchdb(server_docs);
         let couch = couchdb_client(url);
 
+        let mut recovery_offset = 0;
         let recovered = recover_stale_file_aliases_cooperatively(
             &store,
             &couch,
@@ -2675,6 +2708,7 @@ mod tests {
             Duration::from_secs(60),
             None,
             64,
+            &mut recovery_offset,
         )
         .await;
 
@@ -2732,6 +2766,7 @@ mod tests {
         let (url, state) = spawn_mock_couchdb(server_docs);
         let couch = couchdb_client(url);
 
+        let mut recovery_offset = 0;
         let recovered = recover_stale_file_aliases_cooperatively(
             &store,
             &couch,
@@ -2740,6 +2775,7 @@ mod tests {
             Duration::from_secs(60),
             None,
             64,
+            &mut recovery_offset,
         )
         .await;
 
@@ -2806,6 +2842,7 @@ mod tests {
         let (url, state) = spawn_mock_couchdb(server_docs);
         let couch = couchdb_client(url);
 
+        let mut recovery_offset = 0;
         let recovered = recover_stale_file_aliases_cooperatively(
             &store,
             &couch,
@@ -2814,6 +2851,7 @@ mod tests {
             Duration::from_secs(60),
             None,
             64,
+            &mut recovery_offset,
         )
         .await;
 
