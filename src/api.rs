@@ -377,7 +377,12 @@ fn service_error_legacy_error(error: &ServiceError) -> String {
             crate::new_note::WriteError::NotFound { .. } => "not found".to_string(),
             other => other.to_string(),
         },
-        ServiceError::CouchDbWrite(error) | ServiceError::CouchDbUpdate(error) => error.to_string(),
+        ServiceError::CouchDbWrite(error)
+        | ServiceError::CouchDbUpdate(error)
+        | ServiceError::VaultFileRepair(error) => error.to_string(),
+        ServiceError::VaultFileTemporarilyUnavailable => {
+            "raw vault file is temporarily unavailable".to_string()
+        }
     }
 }
 

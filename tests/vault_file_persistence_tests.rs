@@ -237,6 +237,46 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
         VaultFileVisibility::MissingRawWithIndexedNote
     );
 
+    sqlx::query(
+        "INSERT INTO file_aliases (file_doc_id, note_path, couchdb_rev, children, ctime, mtime) VALUES ('deleted-file-doc', $1, 'local-edit-file', ARRAY['h:deleted-child']::TEXT[], 0, 0)",
+    )
+    .bind(markdown_id.as_str())
+    .execute(persistence.pool())
+    .await
+    .expect("insert alias before confirmed deletion");
+    sqlx::query(
+        "INSERT INTO chunk_staging (parent_id, chunk_index, chunk_count, content, couchdb_rev) VALUES ('h:deleted-child', 0, 2, 'partial', 'local-edit-file')",
+    )
+    .execute(persistence.pool())
+    .await
+    .expect("insert staged child before confirmed deletion");
+    persistence
+        .apply_confirmed_vault_file_deletion(markdown_id.as_str())
+        .await
+        .expect("persist confirmed source deletion");
+    let deleted_snapshot = persistence
+        .load_snapshot()
+        .await
+        .expect("load snapshot after confirmed deletion");
+    assert!(
+        deleted_snapshot
+            .notes
+            .iter()
+            .all(|note| note.id != markdown_id.as_str())
+    );
+    assert!(
+        deleted_snapshot
+            .file_aliases
+            .iter()
+            .all(|alias| alias.note_path != markdown_id.as_str())
+    );
+    assert!(
+        deleted_snapshot
+            .staged_chunks
+            .iter()
+            .all(|chunk| chunk.parent_id != "h:deleted-child")
+    );
+
     let failed_write = store_e
         .prepare_create_vault_write_at(
             NewNoteRequest {

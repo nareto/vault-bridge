@@ -55,6 +55,8 @@ struct BulkAllDocsRow {
 #[derive(Debug, Deserialize)]
 struct BulkAllDocsValue {
     rev: String,
+    #[serde(default)]
+    deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +111,10 @@ impl CouchDbClient {
 
     pub fn db_base_url(&self) -> String {
         format!("{}/{}", self.base_url, self.database)
+    }
+
+    pub fn livesync_decryptor(&self) -> Option<&Decryptor> {
+        self.livesync_crypto.as_deref()
     }
 
     pub fn changes_url(&self) -> String {
@@ -909,6 +915,45 @@ impl CouchDbClient {
         }
 
         Ok(events)
+    }
+
+    pub async fn deleted_recovery_document_id(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<String>, CouchDbError> {
+        let document_ids = self.recovery_candidate_doc_ids(parent_id);
+        if document_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let response = self
+            .send_request_with_timeout(
+                self.http
+                    .post(format!("{}/_all_docs", self.db_base_url()))
+                    .basic_auth(&self.username, Some(&self.password))
+                    .json(&serde_json::json!({
+                        "keys": document_ids,
+                        "include_docs": false
+                    })),
+                COUCHDB_REQUEST_TIMEOUT,
+            )
+            .await?
+            .error_for_status()?;
+        let page: BulkAllDocsPage = self
+            .read_json_with_timeout(response, COUCHDB_REQUEST_TIMEOUT)
+            .await?;
+
+        let mut deleted_document_id = None;
+        for row in page.rows {
+            let Some(value) = row.value else {
+                continue;
+            };
+            if !value.deleted {
+                return Ok(None);
+            }
+            deleted_document_id.get_or_insert_with(|| row.id.unwrap_or(row.key));
+        }
+        Ok(deleted_document_id)
     }
 
     pub async fn find_file_document_changes_by_note_paths(

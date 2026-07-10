@@ -124,6 +124,16 @@ pub struct PreparedVaultWrite {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct RecoveredVaultFileState {
+    path: String,
+    content: String,
+    file_type: NewNoteFileType,
+    couchdb_rev: String,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 struct PreparedNoteUpsert {
     note: StoredNote,
     links: Vec<LinkRecord>,
@@ -3043,6 +3053,138 @@ impl VaultStore {
         } else {
             VaultFileVisibility::Filtered
         }
+    }
+
+    pub async fn vault_file_recovery_target(
+        &self,
+        file_id: &NoteId,
+    ) -> Option<StaleFileRecoveryTarget> {
+        self.prepare_cached_read("vault file recovery target lookup")
+            .await;
+        let guard = self.inner.read().await;
+        stale_file_recovery_targets_locked(&guard)
+            .into_iter()
+            .find(|target| target.note_path == file_id.as_str())
+    }
+
+    pub(crate) async fn recovered_vault_file_state(
+        &self,
+        file_id: &NoteId,
+    ) -> Option<RecoveredVaultFileState> {
+        let guard = self.inner.read().await;
+        let file = guard.vault_files.get(file_id.as_str())?;
+        Some(RecoveredVaultFileState {
+            path: file.path.clone(),
+            content: file.content.clone(),
+            file_type: if is_markdown_note_path(&file.path) {
+                NewNoteFileType::Md
+            } else {
+                NewNoteFileType::Base
+            },
+            couchdb_rev: file.couchdb_rev.clone(),
+            created_at: file.created_at,
+            updated_at: file.updated_at,
+        })
+    }
+
+    pub(crate) async fn commit_recovered_vault_file(
+        &self,
+        recovered: RecoveredVaultFileState,
+    ) -> Result<(), WriteError> {
+        let note = if recovered.file_type.is_markdown() {
+            let max_link_context_chars = self.settings.read().await.max_link_context_chars;
+            Some(note_input_from_raw_markdown(
+                &recovered.path,
+                &recovered.content,
+                &recovered.couchdb_rev,
+                recovered.created_at,
+                recovered.updated_at,
+                max_link_context_chars,
+            ))
+        } else {
+            None
+        };
+        let couchdb_rev = recovered.couchdb_rev.clone();
+        self.commit_prepared_vault_write(
+            PreparedVaultWrite {
+                path: recovered.path,
+                content: recovered.content,
+                file_type: recovered.file_type,
+                created_at: recovered.created_at,
+                updated_at: recovered.updated_at,
+                note,
+                mark_created: false,
+            },
+            &couchdb_rev,
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_confirmed_vault_file_deletion(
+        &self,
+        file_id: &NoteId,
+    ) -> Result<(), WriteError> {
+        self.prepare_cached_read("confirmed vault file deletion")
+            .await;
+        let path = file_id.as_str().to_string();
+        let refresh_guard = self.read_refresh_lock.lock().await;
+        let (file_doc_ids, child_doc_ids) = {
+            let guard = self.inner.read().await;
+            let file_doc_ids = guard
+                .file_doc_paths
+                .iter()
+                .filter(|(_, note_path)| *note_path == &path)
+                .map(|(file_doc_id, _)| file_doc_id.clone())
+                .collect::<Vec<_>>();
+            let child_doc_ids = file_doc_ids
+                .iter()
+                .flat_map(|file_doc_id| {
+                    guard
+                        .file_children
+                        .get(file_doc_id)
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            (file_doc_ids, child_doc_ids)
+        };
+
+        let generation = if let Some(persistence) = self.persistence.as_ref() {
+            match persistence.apply_confirmed_vault_file_deletion(&path).await {
+                Ok(generation) => Some(generation),
+                Err(error) => {
+                    warn!(error = %error, "failed to persist confirmed vault file deletion");
+                    return Err(WriteError::Persistence);
+                }
+            }
+        } else {
+            None
+        };
+
+        {
+            let mut guard = self.inner.write().await;
+            let note_deleted = delete_note_locked(&mut guard, file_id);
+            delete_vault_file_locked(&mut guard, &path);
+            guard.created_file_paths.remove(&path);
+            for parent_id in std::iter::once(path.clone())
+                .chain(file_doc_ids.iter().cloned())
+                .chain(child_doc_ids)
+            {
+                guard.chunk_staging.take_parent_chunks(&parent_id);
+            }
+            for file_doc_id in file_doc_ids {
+                unregister_file_aliases_locked(&mut guard, &file_doc_id);
+            }
+            if note_deleted {
+                rebuild_graph_cache_locked(&mut guard);
+            }
+        }
+        if let Some(generation) = generation {
+            self.cache_generation.store(generation, Ordering::Release);
+        }
+        drop(refresh_guard);
+        Ok(())
     }
 
     /// Create a raw vault file (md or base) with policy enforcement.

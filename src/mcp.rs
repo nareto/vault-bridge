@@ -1849,9 +1849,17 @@ impl IntoResponse for McpError {
             McpError::Service(ServiceError::Write(WriteError::AlreadyExists { .. })) => {
                 StatusCode::CONFLICT
             }
+            McpError::Service(ServiceError::Write(WriteError::Persistence)) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             McpError::Service(ServiceError::Write(_)) => StatusCode::BAD_REQUEST,
-            McpError::Service(ServiceError::CouchDbWrite(_) | ServiceError::CouchDbUpdate(_))
-            | McpError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            McpError::Service(
+                ServiceError::CouchDbWrite(_)
+                | ServiceError::CouchDbUpdate(_)
+                | ServiceError::VaultFileRepair(_)
+                | ServiceError::VaultFileTemporarilyUnavailable,
+            ) => StatusCode::SERVICE_UNAVAILABLE,
+            McpError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             McpError::MissingEnvironment(_)
             | McpError::InvalidEnvironment(_)
             | McpError::HttpClientBuild(_)

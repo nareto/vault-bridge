@@ -130,6 +130,14 @@ pub(crate) fn service_error_metadata(
         ServiceError::Write(error) => write_error_metadata(error),
         ServiceError::CouchDbWrite(error) => couchdb_error_metadata(error),
         ServiceError::CouchDbUpdate(error) => couchdb_error_metadata(error),
+        ServiceError::VaultFileRepair(error) => couchdb_error_metadata(error),
+        ServiceError::VaultFileTemporarilyUnavailable => ErrorMetadata::new(
+            ErrorCategory::Transient,
+            true,
+            "raw vault file unavailable",
+            "The policy-visible file could not be reconstructed from CouchDB; retry after source reconciliation",
+        )
+        .with_http_status(503),
     };
     if let Some(tool_name) = tool_name {
         metadata = metadata.with_tool(tool_name);

@@ -535,6 +535,45 @@ impl PostgresPersistence {
         Ok(generation)
     }
 
+    pub async fn apply_confirmed_vault_file_deletion(
+        &self,
+        path: &str,
+    ) -> Result<u64, PersistenceError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM chunk_staging cs
+            USING file_aliases fa
+            WHERE fa.note_path = $1
+              AND (
+                  cs.parent_id = fa.file_doc_id
+                  OR cs.parent_id = ANY(fa.children)
+              )
+            "#,
+        )
+        .bind(path)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM chunk_staging WHERE parent_id = $1")
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM notes WHERE id = $1")
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+        delete_vault_file_tx(&mut tx, path).await?;
+        sqlx::query("DELETE FROM file_aliases WHERE note_path = $1")
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+
+        let generation = bump_store_generation_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(generation)
+    }
+
     pub async fn apply_chunk_staging_delta(
         &self,
         upserts: Vec<PersistedStagedChunk>,
