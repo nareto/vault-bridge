@@ -22,6 +22,7 @@ use crate::store::{StaleFileRecoveryTarget, SyncBatchResult, VaultStore};
 
 const LOCALAI_HEALTH_PROBE_INPUT: &str = "vault bridge embedding health probe";
 const STALE_FILE_RECOVERY_TARGET_LIMIT: usize = 16;
+const STALE_FILE_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 static DATA_URI_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"data:[^\s)>"']{128,}"#).expect("valid data URI regex"));
@@ -41,7 +42,7 @@ pub fn spawn_sync_worker(
     let context_window = config.indexer.max_link_context_chars;
     let max_changes_per_batch = config.indexer.max_changes_per_batch.max(1);
     let chunk_timeout = Duration::from_secs(config.indexer.chunk_staging_timeout_seconds.max(1));
-    let stale_file_alias_recovery_interval = chunk_timeout.max(Duration::from_secs(60));
+    let stale_file_alias_recovery_interval = STALE_FILE_RECOVERY_INTERVAL;
     let poll_interval = config.couchdb.poll_interval();
     let debounce_window = Duration::from_secs(config.indexer.debounce_seconds.max(1));
 
@@ -110,6 +111,8 @@ pub fn spawn_sync_worker(
             .iter()
             .map(|target| target.file_doc_id.clone())
             .collect::<Vec<_>>();
+        let startup_fallback_targets =
+            fallback_stale_file_recovery_targets(&startup_stale_file_targets);
         let startup_remote_drift_file_docs = detect_remote_stale_file_docs(&store, &couch).await;
         let mut startup_recovery_lookup_ids =
             recovery_lookup_ids_for_stale_file_targets(&startup_stale_file_targets);
@@ -154,7 +157,7 @@ pub fn spawn_sync_worker(
             .await;
             queue_path_scan_recovery(
                 &couch,
-                &startup_stale_file_targets,
+                &startup_fallback_targets,
                 decryptor.as_deref(),
                 &mut pending,
                 &mut pending_current_seq,
@@ -542,6 +545,7 @@ async fn recover_stale_file_aliases_cooperatively(
         return aggregate;
     }
 
+    let fallback_targets = fallback_stale_file_recovery_targets(&stale_file_targets);
     let recovery_lookup_ids = recovery_lookup_ids_for_stale_file_targets(&stale_file_targets);
     let recovery_child_doc_ids = recovery_child_doc_ids_for_stale_file_targets(&stale_file_targets);
     warn!(
@@ -557,7 +561,7 @@ async fn recover_stale_file_aliases_cooperatively(
     let child_recovered = fetch_exact_recovery_changes(couch, &recovery_child_doc_ids).await;
     append_missing_changes(&mut recovered, child_recovered);
     let path_recovered =
-        fetch_path_scan_recovery_changes(couch, &stale_file_targets, decryptor).await;
+        fetch_path_scan_recovery_changes(couch, &fallback_targets, decryptor).await;
     append_missing_changes(&mut recovered, path_recovered);
     if recovered.is_empty() {
         return aggregate;
@@ -695,9 +699,22 @@ fn take_stale_file_recovery_targets(
     targets
 }
 
+fn fallback_stale_file_recovery_targets(
+    targets: &[StaleFileRecoveryTarget],
+) -> Vec<StaleFileRecoveryTarget> {
+    targets
+        .iter()
+        .filter(|target| target.needs_file_document || target.child_doc_ids.is_empty())
+        .cloned()
+        .collect()
+}
+
 fn recovery_lookup_ids_for_stale_file_targets(targets: &[StaleFileRecoveryTarget]) -> Vec<String> {
     let mut lookup_ids = Vec::with_capacity(targets.len() * 2);
-    for target in targets {
+    for target in targets
+        .iter()
+        .filter(|target| target.needs_file_document || target.child_doc_ids.is_empty())
+    {
         lookup_ids.push(target.note_path.clone());
         lookup_ids.push(target.file_doc_id.clone());
     }
@@ -710,7 +727,12 @@ fn recovery_child_doc_ids_for_stale_file_targets(
     targets: &[StaleFileRecoveryTarget],
 ) -> Vec<String> {
     let mut child_doc_ids = Vec::new();
-    for target in targets {
+    for target in targets
+        .iter()
+        .filter(|target| !target.child_doc_ids.is_empty())
+    {
+        // Persisted aliases provide path/revision/chunk hints. Raw-only gaps
+        // need just these children; stale indexes also use them as fallback.
         child_doc_ids.extend(target.child_doc_ids.iter().cloned());
     }
     let mut seen = HashSet::new();
@@ -1713,11 +1735,13 @@ mod tests {
 
     use super::{
         LocalAiEmbeddingClient, aggregate_chunk_embeddings, detect_remote_stale_file_docs,
-        embed_note_with_chunks, ingest_changes_cooperatively, normalize_localai_embedding_input,
-        parse_localai_embeddings_for_test, queue_parent_recovery,
-        recover_stale_chunk_staging_cooperatively, recover_stale_file_aliases_cooperatively,
-        sample_note_chunks_for_embedding, should_flush_pending, spawn_embedding_worker,
-        split_note_for_localai, take_change_batch, take_stale_file_recovery_targets,
+        embed_note_with_chunks, fallback_stale_file_recovery_targets, ingest_changes_cooperatively,
+        normalize_localai_embedding_input, parse_localai_embeddings_for_test,
+        queue_parent_recovery, recover_stale_chunk_staging_cooperatively,
+        recover_stale_file_aliases_cooperatively, recovery_child_doc_ids_for_stale_file_targets,
+        recovery_lookup_ids_for_stale_file_targets, sample_note_chunks_for_embedding,
+        should_flush_pending, spawn_embedding_worker, split_note_for_localai, take_change_batch,
+        take_stale_file_recovery_targets,
     };
     use crate::authorization::{AccessPolicy, AuthContext, ContextName};
     use crate::config::{
@@ -2044,6 +2068,7 @@ mod tests {
                 file_doc_id: format!("f:{index}"),
                 note_path: format!("note-{index}.md"),
                 child_doc_ids: Vec::new(),
+                needs_file_document: true,
             })
             .collect();
 
@@ -2051,6 +2076,34 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].file_doc_id, "f:0");
         assert_eq!(selected[1].file_doc_id, "f:1");
+    }
+
+    #[test]
+    fn stale_file_recovery_uses_bulk_fetch_when_children_are_known() {
+        let targets = vec![
+            StaleFileRecoveryTarget {
+                file_doc_id: "f:known".to_string(),
+                note_path: "known.md".to_string(),
+                child_doc_ids: vec!["h:1".to_string(), "h:2".to_string()],
+                needs_file_document: false,
+            },
+            StaleFileRecoveryTarget {
+                file_doc_id: "missing.md".to_string(),
+                note_path: "missing.md".to_string(),
+                child_doc_ids: Vec::new(),
+                needs_file_document: true,
+            },
+        ];
+
+        assert_eq!(
+            recovery_child_doc_ids_for_stale_file_targets(&targets),
+            vec!["h:1", "h:2"]
+        );
+        assert_eq!(
+            recovery_lookup_ids_for_stale_file_targets(&targets),
+            vec!["missing.md"]
+        );
+        assert_eq!(fallback_stale_file_recovery_targets(&targets).len(), 1);
     }
 
     #[test]

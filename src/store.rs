@@ -530,6 +530,7 @@ pub struct StaleFileRecoveryTarget {
     pub file_doc_id: String,
     pub note_path: String,
     pub child_doc_ids: Vec<String>,
+    pub needs_file_document: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -6090,6 +6091,7 @@ fn stale_file_recovery_targets_locked(guard: &StoreInner) -> Vec<StaleFileRecove
                     .get(file_doc_id)
                     .cloned()
                     .unwrap_or_default(),
+                needs_file_document: note_is_stale,
             });
         }
     }
@@ -6106,6 +6108,7 @@ fn stale_file_recovery_targets_locked(guard: &StoreInner) -> Vec<StaleFileRecove
                 file_doc_id: note.path.clone(),
                 note_path: note.path.clone(),
                 child_doc_ids: Vec::new(),
+                needs_file_document: true,
             });
         }
     }
@@ -6528,6 +6531,7 @@ mod tests {
         assert_eq!(targets[0].file_doc_id, path);
         assert_eq!(targets[0].note_path, path);
         assert!(targets[0].child_doc_ids.is_empty());
+        assert!(targets[0].needs_file_document);
     }
 
     #[test]
