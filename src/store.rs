@@ -4048,11 +4048,14 @@ impl VaultStore {
     }
 
     pub async fn stale_file_recovery_targets(&self) -> Vec<StaleFileRecoveryTarget> {
+        self.prepare_cached_read("stale_file_recovery_targets")
+            .await;
         let guard = self.inner.read().await;
         stale_file_recovery_targets_locked(&guard)
     }
 
     pub async fn sync_recovery_target_is_unresolved(&self, target_id: &str) -> bool {
+        self.prepare_cached_read("sync_recovery_target_state").await;
         let guard = self.inner.read().await;
         guard.chunk_staging.parent_ids().any(|id| id == target_id)
             || stale_file_recovery_targets_locked(&guard)
