@@ -131,13 +131,23 @@ pub(crate) fn service_error_metadata(
         ServiceError::CouchDbWrite(error) => couchdb_error_metadata(error),
         ServiceError::CouchDbUpdate(error) => couchdb_error_metadata(error),
         ServiceError::VaultFileRepair(error) => couchdb_error_metadata(error),
-        ServiceError::VaultFileTemporarilyUnavailable => ErrorMetadata::new(
+        ServiceError::VaultFileTemporarilyUnavailable {
+            target_hash,
+            source_state,
+        } => ErrorMetadata::new(
             ErrorCategory::Transient,
             true,
             "raw vault file unavailable",
-            "The policy-visible file could not be reconstructed from CouchDB; retry after source reconciliation",
+            "The authoritative CouchDB file is incomplete or unavailable; repair the reported source state before retrying",
         )
-        .with_http_status(503),
+        .with_http_status(503)
+        .with_details(serde_json::json!({
+            "component": "couchdb",
+            "phase": "source_reconciliation",
+            "sourceState": source_state,
+            "targetHash": target_hash,
+            "action": "inspect the source diagnostic and restore missing LiveSync documents"
+        })),
     };
     if let Some(tool_name) = tool_name {
         metadata = metadata.with_tool(tool_name);
@@ -184,13 +194,40 @@ fn write_error_metadata(error: &WriteError) -> ErrorMetadata {
             error.to_string(),
         )
         .with_http_status(400),
-        WriteError::Persistence => ErrorMetadata::new(
-            ErrorCategory::Transient,
-            true,
-            "persistence failed",
-            "The durable local content transaction failed; retry after source reconciliation",
-        )
-        .with_http_status(503),
+        WriteError::Persistence { kind } => {
+            let (description, action) = match kind {
+                crate::new_note::PersistenceFailureKind::InsufficientStorage => (
+                    "PostgreSQL cannot persist the write because storage capacity is exhausted",
+                    "restore database storage capacity and verify PostgreSQL recovery before retrying",
+                ),
+                crate::new_note::PersistenceFailureKind::DatabaseUnavailable => (
+                    "PostgreSQL is unavailable; no authoritative source write was committed",
+                    "restore PostgreSQL availability and retry with backoff",
+                ),
+                crate::new_note::PersistenceFailureKind::TransactionConflict => (
+                    "The PostgreSQL transaction conflicted with concurrent work",
+                    "retry the operation with backoff",
+                ),
+                crate::new_note::PersistenceFailureKind::Unknown => (
+                    "The durable local content transaction failed before a source commit",
+                    "inspect the correlated server log before retrying",
+                ),
+            };
+            ErrorMetadata::new(
+                ErrorCategory::Transient,
+                kind.caller_retryable(),
+                "persistence failed",
+                description,
+            )
+            .with_http_status(503)
+            .with_details(serde_json::json!({
+                "component": "postgres",
+                "phase": "local_persistence",
+                "failureKind": kind.as_str(),
+                "sourceCommitted": false,
+                "action": action
+            }))
+        }
     }
 }
 
@@ -210,6 +247,21 @@ fn couchdb_error_metadata(error: &CouchDbError) -> ErrorMetadata {
             error.to_string(),
         )
         .with_http_status(404),
+        CouchDbError::RevisionConflict { .. } | CouchDbError::Conflict { .. } => {
+            ErrorMetadata::new(
+                ErrorCategory::Business,
+                false,
+                "source revision conflict",
+                "The authoritative CouchDB revision changed while the edit was being prepared; read the latest file and reapply the edit",
+            )
+            .with_http_status(409)
+            .with_details(serde_json::json!({
+                "component": "couchdb",
+                "phase": "source_commit",
+                "sourceState": "revision_conflict",
+                "action": "read the latest source-backed file and reapply the exact edit"
+            }))
+        }
         _ => ErrorMetadata::new(
             ErrorCategory::Transient,
             true,
@@ -217,5 +269,31 @@ fn couchdb_error_metadata(error: &CouchDbError) -> ErrorMetadata {
             error.to_string(),
         )
         .with_http_status(503),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::service_error_metadata;
+    use crate::new_note::{PersistenceFailureKind, WriteError};
+    use crate::service::ServiceError;
+
+    #[test]
+    fn insufficient_storage_is_actionable_and_not_blindly_retryable() {
+        let metadata = service_error_metadata(
+            &ServiceError::Write(WriteError::Persistence {
+                kind: PersistenceFailureKind::InsufficientStorage,
+            }),
+            None,
+        );
+        let value = serde_json::to_value(metadata).expect("serialize metadata");
+
+        assert_eq!(value["isRetryable"], false);
+        assert_eq!(value["httpStatus"], 503);
+        assert_eq!(value["details"]["failureKind"], "insufficient_storage");
+        assert_eq!(value["details"]["sourceCommitted"], false);
+        assert_ne!(value["details"]["action"], json!(null));
     }
 }

@@ -451,12 +451,14 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "NewNoteResponse": {
                     "type": "object",
-                    "required": ["id", "status", "file_type", "indexed_as_note"],
+                    "required": ["id", "status", "file_type", "indexed_as_note", "local_projection", "operation_id"],
                     "properties": {
                         "id": {"type": "string"},
-                        "status": {"type": "string"},
+                        "status": {"type": "string", "enum": ["created", "accepted"]},
                         "file_type": {"type": "string", "enum": ["md", "base"]},
-                        "indexed_as_note": {"type": "boolean"}
+                        "indexed_as_note": {"type": "boolean"},
+                        "local_projection": {"type": "string", "enum": ["applied", "pending"]},
+                        "operation_id": {"type": "string"}
                     }
                 },
                 "ContentPatchOperation": {
@@ -524,10 +526,12 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "UpdateNoteResponse": {
                     "type": "object",
-                    "required": ["id", "status"],
+                    "required": ["id", "status", "local_projection", "operation_id"],
                     "properties": {
                         "id": {"type": "string"},
-                        "status": {"type": "string"}
+                        "status": {"type": "string", "enum": ["updated", "accepted"]},
+                        "local_projection": {"type": "string", "enum": ["applied", "pending"]},
+                        "operation_id": {"type": "string"}
                     }
                 },
                 "ContextFormat": {
@@ -664,11 +668,31 @@ pub(crate) fn openapi_spec() -> Value {
                         "failure_count": {"type": "integer", "minimum": 0}
                     }
                 },
+                "DependencyStatus": {
+                    "type": "object",
+                    "required": ["postgres", "couchdb"],
+                    "properties": {
+                        "postgres": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]},
+                        "couchdb": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]}
+                    }
+                },
+                "WriteProjectionStatus": {
+                    "type": "object",
+                    "required": ["pending"],
+                    "properties": {
+                        "pending": {"type": "integer", "minimum": 0},
+                        "last_success_at": {"type": ["string", "null"], "format": "date-time"},
+                        "last_failure_at": {"type": ["string", "null"], "format": "date-time"},
+                        "last_failure_kind": {"type": ["string", "null"]}
+                    }
+                },
                 "StatusResponse": {
                     "type": "object",
-                    "required": ["status", "index", "embedding", "sync", "context_stats", "config_reload"],
+                    "required": ["status", "dependencies", "write_projection", "index", "embedding", "sync", "context_stats", "config_reload"],
                     "properties": {
-                        "status": {"type": "string"},
+                        "status": {"type": "string", "enum": ["ok", "degraded"]},
+                        "dependencies": {"$ref": "#/components/schemas/DependencyStatus"},
+                        "write_projection": {"$ref": "#/components/schemas/WriteProjectionStatus"},
                         "index": {"$ref": "#/components/schemas/IndexStats"},
                         "embedding": {"$ref": "#/components/schemas/EmbeddingStatus"},
                         "sync": {"$ref": "#/components/schemas/SyncStats"},
@@ -682,6 +706,23 @@ pub(crate) fn openapi_spec() -> Value {
             }
         },
         "paths": {
+            "/health/live": {
+                "get": {
+                    "tags": ["health"],
+                    "summary": "Process liveness",
+                    "responses": {"200": {"description": "Process is running"}}
+                }
+            },
+            "/health/ready": {
+                "get": {
+                    "tags": ["health"],
+                    "summary": "Dependency and projection readiness",
+                    "responses": {
+                        "200": {"description": "Service is ready"},
+                        "503": {"description": "A dependency is unavailable or a write projection is pending"}
+                    }
+                }
+            },
             "/api/v1/notes/{id}": {
                 "get": {
                     "tags": ["vault_bridge"],
@@ -724,12 +765,14 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     },
                     "responses": {
-                        "200": json_response("#/components/schemas/UpdateNoteResponse", "Note updated"),
+                        "200": json_response("#/components/schemas/UpdateNoteResponse", "Note updated and locally projected"),
+                        "202": json_response("#/components/schemas/UpdateNoteResponse", "Source committed; local projection pending"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid update request or content patch"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "403": json_response("#/components/schemas/ApiError", "Edit denied by context policy"),
                         "404": json_response("#/components/schemas/ApiError", "Note not found or not editable in this context"),
-                        "503": json_response("#/components/schemas/ApiError", "CouchDB write-through failed")
+                        "409": json_response("#/components/schemas/ApiError", "Authoritative source revision changed"),
+                        "503": json_response("#/components/schemas/ApiError", "Dependency or source reconciliation unavailable")
                     }
                 }
             },
@@ -941,12 +984,85 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     },
                     "responses": {
-                        "200": json_response("#/components/schemas/NewNoteResponse", "File created"),
+                        "200": json_response("#/components/schemas/NewNoteResponse", "File created and locally projected"),
+                        "202": json_response("#/components/schemas/NewNoteResponse", "Source committed; local projection pending"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid note payload"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "403": json_response("#/components/schemas/ApiError", "Write path not allowed for context"),
                         "409": json_response("#/components/schemas/ApiError", "A note with the generated path already exists"),
-                        "503": json_response("#/components/schemas/ApiError", "CouchDB write-through failed")
+                        "503": json_response("#/components/schemas/ApiError", "Dependency or source write unavailable")
+                    }
+                }
+            },
+            "/api/v1/vault-files": {
+                "post": {
+                    "tags": ["vault_bridge"],
+                    "summary": "Create a raw Markdown or Base vault file",
+                    "security": [{"api_key": []}],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/NewNoteRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": json_response("#/components/schemas/NewNoteResponse", "File created and locally projected"),
+                        "202": json_response("#/components/schemas/NewNoteResponse", "Source committed; local projection pending"),
+                        "400": json_response("#/components/schemas/ApiError", "Invalid file payload"),
+                        "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
+                        "403": json_response("#/components/schemas/ApiError", "Create denied by context policy"),
+                        "409": json_response("#/components/schemas/ApiError", "File already exists"),
+                        "503": json_response("#/components/schemas/ApiError", "Dependency or source write unavailable")
+                    }
+                }
+            },
+            "/api/v1/vault-files/{id}": {
+                "get": {
+                    "tags": ["vault_bridge"],
+                    "summary": "Read a raw vault file",
+                    "security": [{"api_key": []}],
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    }],
+                    "responses": {
+                        "200": {"description": "Raw vault file"},
+                        "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
+                        "404": json_response("#/components/schemas/ApiError", "File not found or not visible"),
+                        "503": json_response("#/components/schemas/ApiError", "Source reconciliation unavailable")
+                    }
+                },
+                "put": {
+                    "tags": ["vault_bridge"],
+                    "summary": "Edit a raw vault file",
+                    "security": [{"api_key": []}],
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/UpdateNoteRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": json_response("#/components/schemas/UpdateNoteResponse", "File updated and locally projected"),
+                        "202": json_response("#/components/schemas/UpdateNoteResponse", "Source committed; local projection pending"),
+                        "400": json_response("#/components/schemas/ApiError", "Invalid edit or content patch"),
+                        "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
+                        "403": json_response("#/components/schemas/ApiError", "Edit denied by context policy"),
+                        "404": json_response("#/components/schemas/ApiError", "File not found or not editable"),
+                        "409": json_response("#/components/schemas/ApiError", "Authoritative source revision changed"),
+                        "503": json_response("#/components/schemas/ApiError", "Dependency or source reconciliation unavailable")
                     }
                 }
             },

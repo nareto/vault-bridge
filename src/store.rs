@@ -7,6 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
@@ -33,14 +34,14 @@ use crate::markdown::{
 };
 use crate::model::{Note, NoteId, UnscopedNote, VaultFile};
 use crate::new_note::{
-    NewNoteFileType, NewNotePathSettings, NewNoteRequest, UpdateNoteRequest, WriteError,
-    apply_content_patch,
+    NewNoteFileType, NewNotePathSettings, NewNoteRequest, PersistenceFailureKind,
+    UpdateNoteRequest, WriteError, apply_content_patch,
 };
 use crate::persistence::{
-    BlockEmbeddingStats, BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias,
-    PersistedIngestDelta, PersistedLinkRecord, PersistedNoteRecord, PersistedRecoveryTarget,
-    PersistedSearchNote, PersistedStagedChunk, PersistedSyncState, PersistedVaultFile,
-    PostgresPersistence, RecoveryQueueStats,
+    BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias, PersistedIngestDelta,
+    PersistedLinkRecord, PersistedNoteRecord, PersistedRecoveryTarget, PersistedSearchNote,
+    PersistedStagedChunk, PersistedSyncState, PersistedVaultFile, PostgresPersistence,
+    RecoveryQueueStats,
 };
 use crate::runtime_config::{ConfigReloadStatus, RuntimeAuthConfig};
 use crate::search::{
@@ -122,6 +123,40 @@ pub struct PreparedVaultWrite {
     pub(crate) updated_at: DateTime<Utc>,
     pub(crate) note: Option<NoteInput>,
     pub(crate) mark_created: bool,
+    pub(crate) expected_couchdb_rev: Option<String>,
+    pub(crate) operation_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalProjectionOutcome {
+    Applied,
+    Pending {
+        failure_kind: PersistenceFailureKind,
+    },
+}
+
+impl LocalProjectionOutcome {
+    pub fn state(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Pending { .. } => "pending",
+        }
+    }
+
+    pub fn response_status(self, completed: &'static str) -> &'static str {
+        match self {
+            Self::Applied => completed,
+            Self::Pending { .. } => "accepted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectionHealthState {
+    pending: HashMap<String, String>,
+    last_success_at: Option<DateTime<Utc>>,
+    last_failure_at: Option<DateTime<Utc>>,
+    last_failure_kind: Option<PersistenceFailureKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -428,12 +463,16 @@ pub struct NewNoteResponse {
     pub status: &'static str,
     pub file_type: NewNoteFileType,
     pub indexed_as_note: bool,
+    pub local_projection: &'static str,
+    pub operation_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateNoteResponse {
     pub id: NoteId,
     pub status: &'static str,
+    pub local_projection: &'static str,
+    pub operation_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -496,11 +535,30 @@ pub struct ContextStats {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusResponse {
     pub status: &'static str,
+    pub dependencies: DependencyStatus,
+    pub write_projection: WriteProjectionStatus,
     pub index: IndexStats,
     pub embedding: EmbeddingStatus,
     pub sync: SyncStats,
     pub context_stats: HashMap<String, ContextStats>,
     pub config_reload: ConfigReloadStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DependencyStatus {
+    pub postgres: &'static str,
+    pub couchdb: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WriteProjectionStatus {
+    pub pending: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_kind: Option<PersistenceFailureKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -715,6 +773,9 @@ pub struct VaultStore {
     sync_state: Arc<RwLock<RuntimeSyncState>>,
     cache_generation: Arc<AtomicU64>,
     read_refresh_lock: Arc<Mutex<()>>,
+    projection_health: Arc<RwLock<ProjectionHealthState>>,
+    #[cfg(test)]
+    forced_projection_failure: Arc<RwLock<Option<PersistenceFailureKind>>>,
     persistence: Option<Arc<PostgresPersistence>>,
 }
 
@@ -817,6 +878,9 @@ impl VaultStore {
             sync_state: Arc::new(RwLock::new(sync_state)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             read_refresh_lock: Arc::new(Mutex::new(())),
+            projection_health: Arc::new(RwLock::new(ProjectionHealthState::default())),
+            #[cfg(test)]
+            forced_projection_failure: Arc::new(RwLock::new(None)),
             persistence,
         }
     }
@@ -1042,8 +1106,36 @@ impl VaultStore {
         }
         self.cache_generation
             .store(cache_generation, Ordering::Release);
+        self.reconcile_pending_projections_from_cache().await;
 
         Ok(())
+    }
+
+    async fn reconcile_pending_projections_from_cache(&self) {
+        let revisions = {
+            let guard = self.inner.read().await;
+            guard
+                .vault_files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.couchdb_rev.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+        let mut health = self.projection_health.write().await;
+        let before = health.pending.len();
+        health
+            .pending
+            .retain(|path, revision| revisions.get(path) != Some(revision));
+        if health.pending.len() < before {
+            health.last_success_at = Some(Utc::now());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn force_projection_failure_for_test(
+        &self,
+        failure: Option<PersistenceFailureKind>,
+    ) {
+        *self.forced_projection_failure.write().await = failure;
     }
 
     pub async fn set_authorization_config(&self, config: AuthorizationConfig) {
@@ -2756,6 +2848,8 @@ impl VaultStore {
             status: "created",
             file_type: write.file_type,
             indexed_as_note: write.note.is_some(),
+            local_projection: "applied",
+            operation_id: write.operation_id.clone(),
         };
         self.commit_prepared_vault_write(write, "local-new-note")
             .await?;
@@ -2785,6 +2879,7 @@ impl VaultStore {
             None
         };
 
+        let operation_id = write_operation_id(&path, &request.content, now);
         Ok(PreparedVaultWrite {
             path,
             content: request.content,
@@ -2793,14 +2888,42 @@ impl VaultStore {
             updated_at: now,
             note,
             mark_created: true,
+            expected_couchdb_rev: None,
+            operation_id,
         })
     }
 
     pub async fn commit_prepared_vault_write(
         &self,
-        mut write: PreparedVaultWrite,
+        write: PreparedVaultWrite,
         couchdb_rev: &str,
     ) -> Result<(), WriteError> {
+        match self
+            .apply_prepared_vault_write(write, couchdb_rev, false)
+            .await?
+        {
+            LocalProjectionOutcome::Applied => Ok(()),
+            LocalProjectionOutcome::Pending { failure_kind } => {
+                Err(WriteError::Persistence { kind: failure_kind })
+            }
+        }
+    }
+
+    pub async fn project_source_committed_vault_write(
+        &self,
+        write: PreparedVaultWrite,
+        couchdb_rev: &str,
+    ) -> Result<LocalProjectionOutcome, WriteError> {
+        self.apply_prepared_vault_write(write, couchdb_rev, true)
+            .await
+    }
+
+    async fn apply_prepared_vault_write(
+        &self,
+        mut write: PreparedVaultWrite,
+        couchdb_rev: &str,
+        publish_after_persistence_failure: bool,
+    ) -> Result<LocalProjectionOutcome, WriteError> {
         let couchdb_rev = couchdb_rev.to_string();
         if let Some(note) = write.note.as_mut() {
             note.couchdb_rev = couchdb_rev.clone();
@@ -2826,9 +2949,23 @@ impl VaultStore {
             updated_at: stored_file.updated_at,
             indexed_at: stored_file.indexed_at,
         };
+        let target_path = write.path.clone();
+        let target_hash = write_target_fingerprint(&target_path);
+        let operation_id = write.operation_id.clone();
 
         let refresh_guard = self.read_refresh_lock.lock().await;
-        let generation = if let Some(persistence) = self.persistence.as_ref() {
+        let mut persistence_failure = None;
+        #[cfg(test)]
+        let forced_failure = *self.forced_projection_failure.read().await;
+        #[cfg(not(test))]
+        let forced_failure: Option<PersistenceFailureKind> = None;
+        let generation = if let Some(failure_kind) = forced_failure {
+            if !publish_after_persistence_failure {
+                return Err(WriteError::Persistence { kind: failure_kind });
+            }
+            persistence_failure = Some(failure_kind);
+            None
+        } else if let Some(persistence) = self.persistence.as_ref() {
             match persistence
                 .apply_content_delta(
                     persisted_note.into_iter().collect(),
@@ -2841,8 +2978,20 @@ impl VaultStore {
             {
                 Ok(generation) => Some(generation),
                 Err(error) => {
-                    warn!(error = %error, "failed to persist direct vault write");
-                    return Err(WriteError::Persistence);
+                    let failure_kind = error.failure_kind();
+                    warn!(
+                        error = %error,
+                        failure_kind = failure_kind.as_str(),
+                        operation_id,
+                        target_hash,
+                        source_committed = publish_after_persistence_failure,
+                        "failed to persist direct vault write"
+                    );
+                    if !publish_after_persistence_failure {
+                        return Err(WriteError::Persistence { kind: failure_kind });
+                    }
+                    persistence_failure = Some(failure_kind);
+                    None
                 }
             }
         } else {
@@ -2873,11 +3022,26 @@ impl VaultStore {
         }
         drop(refresh_guard);
 
-        if let Some((note_id, path, title, content)) = block_data {
+        let outcome = if let Some(failure_kind) = persistence_failure {
+            let mut health = self.projection_health.write().await;
+            health.pending.insert(target_path, couchdb_rev);
+            health.last_failure_at = Some(Utc::now());
+            health.last_failure_kind = Some(failure_kind);
+            LocalProjectionOutcome::Pending { failure_kind }
+        } else {
+            let mut health = self.projection_health.write().await;
+            health.pending.remove(&target_path);
+            health.last_success_at = Some(Utc::now());
+            LocalProjectionOutcome::Applied
+        };
+
+        if matches!(outcome, LocalProjectionOutcome::Applied)
+            && let Some((note_id, path, title, content)) = block_data
+        {
             self.sync_blocks_for_note(&note_id, &path, &title, &content)
                 .await;
         }
-        Ok(())
+        Ok(outcome)
     }
 
     pub async fn prepare_update_note_request(
@@ -2947,7 +3111,13 @@ impl VaultStore {
         now: DateTime<Utc>,
     ) -> Result<PreparedVaultWrite, WriteError> {
         let path = note_id.as_str().to_string();
-        let (existing_frontmatter, existing_body, existing_tags, existing_created_at) = {
+        let (
+            existing_frontmatter,
+            existing_body,
+            existing_tags,
+            existing_created_at,
+            expected_couchdb_rev,
+        ) = {
             let guard = self.inner.read().await;
             let note = guard
                 .notes
@@ -2958,6 +3128,7 @@ impl VaultStore {
                 note.content.clone(),
                 note.tags.clone(),
                 note.created_at,
+                note.couchdb_rev.clone(),
             )
         };
         let markdown =
@@ -2972,6 +3143,7 @@ impl VaultStore {
             max_link_context_chars,
         );
 
+        let operation_id = write_operation_id(&path, &markdown, now);
         Ok(PreparedVaultWrite {
             path,
             content: markdown,
@@ -2980,6 +3152,8 @@ impl VaultStore {
             updated_at: now,
             note: Some(note),
             mark_created: false,
+            expected_couchdb_rev: Some(expected_couchdb_rev),
+            operation_id,
         })
     }
 
@@ -2993,12 +3167,15 @@ impl VaultStore {
             .prepare_update_note_write_at(note_id, request, now)
             .await?;
         let markdown = write.content.clone();
+        let operation_id = write.operation_id.clone();
         self.commit_prepared_vault_write(write, "local-update-note")
             .await?;
         Ok((
             UpdateNoteResponse {
                 id: note_id.clone(),
                 status: "updated",
+                local_projection: "applied",
+                operation_id,
             },
             markdown,
         ))
@@ -3116,10 +3293,20 @@ impl VaultStore {
         }))
     }
 
-    pub(crate) async fn commit_recovered_vault_file(
+    pub(crate) async fn project_recovered_vault_file(
         &self,
         recovered: RecoveredVaultFileState,
-    ) -> Result<(), WriteError> {
+    ) -> Result<LocalProjectionOutcome, WriteError> {
+        let couchdb_rev = recovered.couchdb_rev.clone();
+        let write = self.prepared_recovered_vault_file(recovered).await;
+        self.project_source_committed_vault_write(write, &couchdb_rev)
+            .await
+    }
+
+    async fn prepared_recovered_vault_file(
+        &self,
+        recovered: RecoveredVaultFileState,
+    ) -> PreparedVaultWrite {
         let note = if recovered.file_type.is_markdown() {
             let max_link_context_chars = self.settings.read().await.max_link_context_chars;
             Some(note_input_from_raw_markdown(
@@ -3133,20 +3320,19 @@ impl VaultStore {
         } else {
             None
         };
-        let couchdb_rev = recovered.couchdb_rev.clone();
-        self.commit_prepared_vault_write(
-            PreparedVaultWrite {
-                path: recovered.path,
-                content: recovered.content,
-                file_type: recovered.file_type,
-                created_at: recovered.created_at,
-                updated_at: recovered.updated_at,
-                note,
-                mark_created: false,
-            },
-            &couchdb_rev,
-        )
-        .await
+        let operation_id =
+            write_operation_id(&recovered.path, &recovered.content, recovered.updated_at);
+        PreparedVaultWrite {
+            path: recovered.path,
+            content: recovered.content,
+            file_type: recovered.file_type,
+            created_at: recovered.created_at,
+            updated_at: recovered.updated_at,
+            note,
+            mark_created: false,
+            expected_couchdb_rev: None,
+            operation_id,
+        }
     }
 
     pub(crate) async fn commit_confirmed_vault_file_deletion(
@@ -3183,8 +3369,9 @@ impl VaultStore {
             match persistence.apply_confirmed_vault_file_deletion(&path).await {
                 Ok(generation) => Some(generation),
                 Err(error) => {
-                    warn!(error = %error, "failed to persist confirmed vault file deletion");
-                    return Err(WriteError::Persistence);
+                    let kind = error.failure_kind();
+                    warn!(error = %error, failure_kind = kind.as_str(), "failed to persist confirmed vault file deletion");
+                    return Err(WriteError::Persistence { kind });
                 }
             }
         } else {
@@ -3270,6 +3457,8 @@ impl VaultStore {
             status: "created",
             file_type: write.file_type,
             indexed_as_note: write.note.is_some(),
+            local_projection: "applied",
+            operation_id: write.operation_id.clone(),
         };
         self.commit_prepared_vault_write(write, "local-new-file")
             .await?;
@@ -3286,7 +3475,13 @@ impl VaultStore {
         self.prepare_cached_read("prepare vault file edit").await;
         let path = file_id.as_str().to_string();
         let file_type = file_type_from_path(&path);
-        let (existing_content, existing_created_at, existing_frontmatter, policy_note) = {
+        let (
+            existing_content,
+            existing_created_at,
+            existing_frontmatter,
+            policy_note,
+            expected_couchdb_rev,
+        ) = {
             let guard = self.inner.read().await;
             let file = guard
                 .vault_files
@@ -3318,6 +3513,7 @@ impl VaultStore {
                 file.created_at,
                 stored_note.map(|note| note.frontmatter.clone()),
                 policy_note,
+                file.couchdb_rev.clone(),
             )
         };
 
@@ -3374,6 +3570,7 @@ impl VaultStore {
             (candidate_content, None)
         };
 
+        let operation_id = write_operation_id(&path, &content, now);
         Ok(PreparedVaultWrite {
             path,
             content,
@@ -3382,6 +3579,8 @@ impl VaultStore {
             updated_at: now,
             note,
             mark_created: false,
+            expected_couchdb_rev: Some(expected_couchdb_rev),
+            operation_id,
         })
     }
 
@@ -3396,12 +3595,15 @@ impl VaultStore {
             .prepare_edit_vault_file_write(auth, file_id, request, now)
             .await?;
         let content = write.content.clone();
+        let operation_id = write.operation_id.clone();
         self.commit_prepared_vault_write(write, "local-edit-file")
             .await?;
         Ok((
             UpdateNoteResponse {
                 id: file_id.clone(),
                 status: "updated",
+                local_projection: "applied",
+                operation_id,
             },
             content,
         ))
@@ -3687,125 +3889,69 @@ impl VaultStore {
     }
 
     pub async fn status(&self) -> StatusResponse {
-        self.prepare_cached_read("status query").await;
-
-        if let Some(persistence) = self.persistence.as_ref() {
-            let pending_chunks = match persistence.pending_chunk_parent_count().await {
-                Ok(count) => count,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "failed postgres-backed pending chunk count; using empty fallback"
-                    );
-                    0
-                }
-            };
-            let orphan_leaf_staging_count = match persistence
-                .orphan_leaf_staging_parent_count()
-                .await
-            {
-                Ok(count) => count,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "failed postgres-backed orphan leaf staging count; using in-memory fallback"
-                    );
-                    let guard = self.inner.read().await;
-                    orphan_leaf_staging_count_locked(&guard)
-                }
-            };
-            let stale_file_aliases = match persistence.stale_file_alias_count().await {
-                Ok(count) => count,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "failed postgres-backed stale file alias count; using in-memory fallback"
-                    );
-                    let guard = self.inner.read().await;
-                    stale_file_doc_ids_for_recovery_locked(&guard).len()
-                }
-            };
-            let recovery_queue_stats = match persistence.recovery_queue_stats().await {
-                Ok(stats) => stats,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "failed postgres-backed sync recovery queue stats; using zero"
-                    );
-                    RecoveryQueueStats::default()
-                }
-            };
-            let max_failures = self.settings.read().await.max_embedding_failures;
-            let pending_embeddings = match persistence.pending_embedding_count().await {
-                Ok(count) => count,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "failed postgres-backed pending embedding count; using in-memory fallback"
-                    );
-                    let guard = self.inner.read().await;
-                    guard
-                        .notes
-                        .values()
-                        .filter(|note| note.embedding.is_none())
-                        .count()
-                }
-            };
-            let quarantined = match persistence
-                .quarantined_embedding_count(max_failures.max(1) as i32)
-                .await
-            {
-                Ok(count) => count,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "failed postgres-backed quarantined embedding count; using zero"
-                    );
-                    0
-                }
-            };
-            let block_embedding_stats = match persistence
-                .block_embedding_stats(max_failures.max(1) as i32)
-                .await
-            {
-                Ok(stats) => stats,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "failed postgres-backed block embedding stats; using zero"
-                    );
-                    BlockEmbeddingStats::default()
-                }
-            };
-            let sync_state = self.sync_state.read().await.clone();
-            let guard = self.inner.read().await;
-            let mut status = status_from_inner(
-                &guard,
-                pending_chunks,
-                orphan_leaf_staging_count,
-                stale_file_aliases,
-                &recovery_queue_stats,
-                &sync_state,
+        let Some(persistence) = self.persistence.as_ref() else {
+            return self.in_memory_status("disabled").await;
+        };
+        if let Err(error) = persistence.health_check().await {
+            warn!(
+                error = %error,
+                failure_kind = error.failure_kind().as_str(),
+                "postgres dependency unavailable; reporting degraded cached status"
             );
-            let auth_config = self.authorization_config().await;
-            status.context_stats = context_stats_from_inner(&guard, &auth_config);
-            status.index.pending_embeddings = pending_embeddings;
-            status.index.quarantined_embeddings = quarantined;
-            status.index.pending_chunk_embeddings = block_embedding_stats.pending;
-            status.index.quarantined_chunk_embeddings = block_embedding_stats.quarantined;
-            status.embedding = embedding_status_from_inner(
-                &guard,
-                status.index.pending_embeddings,
-                status.index.quarantined_embeddings,
-                block_embedding_stats.pending,
-                block_embedding_stats.quarantined,
-                block_embedding_stats.last_success_at,
-                block_embedding_stats.last_error_at,
-                block_embedding_stats.last_error,
-            );
-            return status;
+            return self.in_memory_status("unavailable").await;
         }
 
+        self.prepare_cached_read("status query").await;
+        let pending_chunks = persistence.pending_chunk_parent_count().await.unwrap_or(0);
+        let orphan_leaf_staging_count = persistence
+            .orphan_leaf_staging_parent_count()
+            .await
+            .unwrap_or_else(|_| 0);
+        let stale_file_aliases = persistence.stale_file_alias_count().await.unwrap_or(0);
+        let recovery_queue_stats = persistence.recovery_queue_stats().await.unwrap_or_default();
+        let max_failures = self.settings.read().await.max_embedding_failures;
+        let pending_embeddings = persistence.pending_embedding_count().await.unwrap_or(0);
+        let quarantined = persistence
+            .quarantined_embedding_count(max_failures.max(1) as i32)
+            .await
+            .unwrap_or(0);
+        let block_embedding_stats = persistence
+            .block_embedding_stats(max_failures.max(1) as i32)
+            .await
+            .unwrap_or_default();
+        let sync_state = self.sync_state.read().await.clone();
+        let guard = self.inner.read().await;
+        let mut status = status_from_inner(
+            &guard,
+            pending_chunks,
+            orphan_leaf_staging_count,
+            stale_file_aliases,
+            &recovery_queue_stats,
+            &sync_state,
+        );
+        let auth_config = self.authorization_config().await;
+        status.context_stats = context_stats_from_inner(&guard, &auth_config);
+        status.index.pending_embeddings = pending_embeddings;
+        status.index.quarantined_embeddings = quarantined;
+        status.index.pending_chunk_embeddings = block_embedding_stats.pending;
+        status.index.quarantined_chunk_embeddings = block_embedding_stats.quarantined;
+        status.embedding = embedding_status_from_inner(
+            &guard,
+            status.index.pending_embeddings,
+            status.index.quarantined_embeddings,
+            block_embedding_stats.pending,
+            block_embedding_stats.quarantined,
+            block_embedding_stats.last_success_at,
+            block_embedding_stats.last_error_at,
+            block_embedding_stats.last_error,
+        );
+        drop(guard);
+        self.apply_projection_health_to_status(&mut status, "healthy")
+            .await;
+        status
+    }
+
+    async fn in_memory_status(&self, postgres_state: &'static str) -> StatusResponse {
         let guard = self.inner.read().await;
         let sync_state = RuntimeSyncState {
             last_seq: guard.last_seq.clone(),
@@ -3822,7 +3968,28 @@ impl VaultStore {
         );
         let auth_config = self.authorization_config().await;
         status.context_stats = context_stats_from_inner(&guard, &auth_config);
+        drop(guard);
+        self.apply_projection_health_to_status(&mut status, postgres_state)
+            .await;
         status
+    }
+
+    async fn apply_projection_health_to_status(
+        &self,
+        status: &mut StatusResponse,
+        postgres_state: &'static str,
+    ) {
+        let health = self.projection_health.read().await;
+        status.dependencies.postgres = postgres_state;
+        status.write_projection = WriteProjectionStatus {
+            pending: health.pending.len(),
+            last_success_at: health.last_success_at,
+            last_failure_at: health.last_failure_at,
+            last_failure_kind: health.last_failure_kind,
+        };
+        if postgres_state == "unavailable" || !health.pending.is_empty() {
+            status.status = "degraded";
+        }
     }
 
     pub async fn graph_cache_generation(&self) -> u64 {
@@ -4138,6 +4305,7 @@ impl VaultStore {
             let raw_content = markdown_from_seed_note(&note.frontmatter, &note.content);
             let created_at = note.created_at;
             let updated_at = note.updated_at;
+            let operation_id = write_operation_id(&path, &raw_content, updated_at);
             let write = PreparedVaultWrite {
                 path,
                 content: raw_content,
@@ -4146,6 +4314,8 @@ impl VaultStore {
                 updated_at,
                 note: Some(note),
                 mark_created: false,
+                expected_couchdb_rev: None,
+                operation_id,
             };
             if let Err(error) = self.commit_prepared_vault_write(write, "1-seed").await {
                 warn!(error = %error, "failed to persist seeded vault file");
@@ -5289,6 +5459,29 @@ fn policy_decision_for(
     allowed.then_some(decision)
 }
 
+fn write_operation_id(path: &str, content: &str, timestamp: DateTime<Utc>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"vault-write:");
+    hasher.update(path.as_bytes());
+    hasher.update(b":");
+    hasher.update(
+        timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .to_string(),
+    );
+    hasher.update(b":");
+    hasher.update(content.as_bytes());
+    format!("write-{}", &hex::encode(hasher.finalize())[..16])
+}
+
+fn write_target_fingerprint(path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"vault-write-target:");
+    hasher.update(path.as_bytes());
+    hex::encode(hasher.finalize())[..16].to_string()
+}
+
 fn merge_rule_decision(decision: &mut PolicyDecision, rule: &AccessRule) {
     for tag in &rule.add_tags {
         add_unique_tag(&mut decision.add_tags, tag);
@@ -5349,6 +5542,16 @@ fn status_from_inner(
 
     StatusResponse {
         status: "ok",
+        dependencies: DependencyStatus {
+            postgres: "disabled",
+            couchdb: "disabled",
+        },
+        write_projection: WriteProjectionStatus {
+            pending: 0,
+            last_success_at: None,
+            last_failure_at: None,
+            last_failure_kind: None,
+        },
         index: IndexStats {
             total_notes,
             total_links,

@@ -413,6 +413,9 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
         .await
         .expect("prepare write before closing pool");
     persistence.pool().close().await;
+    let degraded_status = store_e.status().await;
+    assert_eq!(degraded_status.status, "degraded");
+    assert_eq!(degraded_status.dependencies.postgres, "unavailable");
     let failed_ingest = store_e
         .ingest_changes_batch(
             vec![ChangeEvent {
@@ -435,6 +438,6 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
         store_e
             .commit_prepared_vault_write(failed_write, "1-test")
             .await,
-        Err(WriteError::Persistence)
+        Err(WriteError::Persistence { .. })
     ));
 }

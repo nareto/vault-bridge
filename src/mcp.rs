@@ -1849,7 +1849,17 @@ impl IntoResponse for McpError {
             McpError::Service(ServiceError::Write(WriteError::AlreadyExists { .. })) => {
                 StatusCode::CONFLICT
             }
-            McpError::Service(ServiceError::Write(WriteError::Persistence)) => {
+            McpError::Service(
+                ServiceError::CouchDbWrite(
+                    crate::couchdb::CouchDbError::NoteAlreadyExists { .. }
+                    | crate::couchdb::CouchDbError::Conflict { .. },
+                )
+                | ServiceError::CouchDbUpdate(
+                    crate::couchdb::CouchDbError::Conflict { .. }
+                    | crate::couchdb::CouchDbError::RevisionConflict { .. },
+                ),
+            ) => StatusCode::CONFLICT,
+            McpError::Service(ServiceError::Write(WriteError::Persistence { .. })) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             McpError::Service(ServiceError::Write(_)) => StatusCode::BAD_REQUEST,
@@ -1857,7 +1867,7 @@ impl IntoResponse for McpError {
                 ServiceError::CouchDbWrite(_)
                 | ServiceError::CouchDbUpdate(_)
                 | ServiceError::VaultFileRepair(_)
-                | ServiceError::VaultFileTemporarilyUnavailable,
+                | ServiceError::VaultFileTemporarilyUnavailable { .. },
             ) => StatusCode::SERVICE_UNAVAILABLE,
             McpError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             McpError::MissingEnvironment(_)

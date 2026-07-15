@@ -9,6 +9,7 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
 
 use crate::config::DatabaseConfig;
+use crate::new_note::PersistenceFailureKind;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const MAX_INDEXED_SEARCH_TEXT_BYTES: usize = 500_000;
 
@@ -266,6 +267,31 @@ pub enum PersistenceError {
     Migration(#[from] sqlx::migrate::MigrateError),
 }
 
+impl PersistenceError {
+    pub fn failure_kind(&self) -> PersistenceFailureKind {
+        let Self::Sqlx(error) = self else {
+            return PersistenceFailureKind::Unknown;
+        };
+        match error {
+            sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed => PersistenceFailureKind::DatabaseUnavailable,
+            sqlx::Error::Database(database) => match database.code().as_deref() {
+                Some("53100") => PersistenceFailureKind::InsufficientStorage,
+                Some("53200" | "53300" | "53400") => PersistenceFailureKind::DatabaseUnavailable,
+                Some("40001" | "40P01") => PersistenceFailureKind::TransactionConflict,
+                Some(code) if code.starts_with("08") || code.starts_with("57P") => {
+                    PersistenceFailureKind::DatabaseUnavailable
+                }
+                _ => PersistenceFailureKind::Unknown,
+            },
+            _ => PersistenceFailureKind::Unknown,
+        }
+    }
+}
+
 impl PostgresPersistence {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, PersistenceError> {
         Self::connect_with_url(&config.url, config.max_connections).await
@@ -292,6 +318,13 @@ impl PostgresPersistence {
             .await?;
         persistence.migrate().await?;
         Ok(persistence)
+    }
+
+    pub async fn health_check(&self) -> Result<(), PersistenceError> {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn migrate(&self) -> Result<(), PersistenceError> {

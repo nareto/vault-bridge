@@ -380,7 +380,7 @@ fn service_error_legacy_error(error: &ServiceError) -> String {
         ServiceError::CouchDbWrite(error)
         | ServiceError::CouchDbUpdate(error)
         | ServiceError::VaultFileRepair(error) => error.to_string(),
-        ServiceError::VaultFileTemporarilyUnavailable => {
+        ServiceError::VaultFileTemporarilyUnavailable { .. } => {
             "raw vault file is temporarily unavailable".to_string()
         }
     }
@@ -466,6 +466,8 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/assemble-context", post(assemble_context_endpoint))
         .route("/api/v1/graph/path", get(find_path))
         .route("/api/v1/tags", get(list_tags))
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness))
         .route("/api/v1/status", get(status))
         .route("/api/v1/metrics", get(metrics))
         .merge(api_docs::router::<AppState>())
@@ -783,7 +785,7 @@ async fn create_note(
     State(state): State<AppState>,
     headers: HeaderMap,
     payload: Result<Json<NewNoteRequest>, JsonRejection>,
-) -> Result<Json<crate::store::NewNoteResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = auth_from_headers(&state, &headers).await?;
     let request = decode_json(payload)?;
     let response = state
@@ -799,7 +801,7 @@ async fn create_note(
         &[response.id.clone()],
     )
     .await;
-    Ok(Json(response))
+    Ok(write_response(response.local_projection, response))
 }
 
 async fn update_note(
@@ -807,7 +809,7 @@ async fn update_note(
     headers: HeaderMap,
     Path(id): Path<String>,
     payload: Result<Json<UpdateNoteRequest>, JsonRejection>,
-) -> Result<Json<crate::store::UpdateNoteResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = auth_from_headers(&state, &headers).await?;
     let request = decode_json(payload)?;
     let note_id = NoteId::new(id);
@@ -824,14 +826,14 @@ async fn update_note(
         &[response.id.clone()],
     )
     .await;
-    Ok(Json(response))
+    Ok(write_response(response.local_projection, response))
 }
 
 async fn create_vault_file_endpoint(
     State(state): State<AppState>,
     headers: HeaderMap,
     payload: Result<Json<NewNoteRequest>, JsonRejection>,
-) -> Result<Json<crate::store::NewNoteResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = auth_from_headers(&state, &headers).await?;
     let request = decode_json(payload)?;
     let response = state
@@ -847,7 +849,7 @@ async fn create_vault_file_endpoint(
         &[response.id.clone()],
     )
     .await;
-    Ok(Json(response))
+    Ok(write_response(response.local_projection, response))
 }
 
 async fn get_vault_file_endpoint(
@@ -878,7 +880,7 @@ async fn edit_vault_file_endpoint(
     headers: HeaderMap,
     Path(id): Path<String>,
     payload: Result<Json<UpdateNoteRequest>, JsonRejection>,
-) -> Result<Json<crate::store::UpdateNoteResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = auth_from_headers(&state, &headers).await?;
     let request = decode_json(payload)?;
     let file_id = NoteId::new(id);
@@ -895,7 +897,38 @@ async fn edit_vault_file_endpoint(
         &[response.id.clone()],
     )
     .await;
-    Ok(Json(response))
+    Ok(write_response(response.local_projection, response))
+}
+
+fn write_response<T: Serialize>(local_projection: &str, response: T) -> Response {
+    let status = if local_projection == "pending" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(response)).into_response()
+}
+
+async fn liveness() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({"status": "ok"})))
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    let status = state.service.status().await;
+    let http_status = if status.status == "ok" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        http_status,
+        Json(json!({
+            "status": status.status,
+            "dependencies": status.dependencies,
+            "writeProjection": status.write_projection,
+        })),
+    )
+        .into_response()
 }
 
 async fn status(
@@ -1010,6 +1043,22 @@ fn render_prometheus_metrics(status: &StatusResponse) -> String {
             env!("CARGO_PKG_VERSION"),
             image_tag.as_deref(),
             git_commit.as_deref(),
+        ),
+        "# HELP vault_bridge_dependency_up Whether a required service dependency is available.".to_string(),
+        "# TYPE vault_bridge_dependency_up gauge".to_string(),
+        format!(
+            "vault_bridge_dependency_up{{dependency=\"postgres\"}} {}",
+            usize::from(status.dependencies.postgres != "unavailable")
+        ),
+        format!(
+            "vault_bridge_dependency_up{{dependency=\"couchdb\"}} {}",
+            usize::from(status.dependencies.couchdb != "unavailable")
+        ),
+        "# HELP vault_bridge_pending_write_projections Source-committed writes waiting for local PostgreSQL projection.".to_string(),
+        "# TYPE vault_bridge_pending_write_projections gauge".to_string(),
+        format!(
+            "vault_bridge_pending_write_projections {}",
+            status.write_projection.pending
         ),
         "# HELP vault_bridge_sync_behind_by CouchDB change-sequence lag.".to_string(),
         "# TYPE vault_bridge_sync_behind_by gauge".to_string(),
@@ -1253,9 +1302,12 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
-    use super::{ApiError, build_info_metric_line, commit_from_image_tag, prometheus_label_escape};
+    use super::{
+        ApiError, build_info_metric_line, commit_from_image_tag, prometheus_label_escape,
+        write_response,
+    };
 
     async fn api_error_body(error: ApiError) -> (StatusCode, Value) {
         let response = error.into_response();
@@ -1282,6 +1334,18 @@ mod tests {
         assert_eq!(body["message"], "internal server error");
         assert_eq!(body["description"], "unexpected failure");
         assert_eq!(body["httpStatus"], 500);
+    }
+
+    #[test]
+    fn write_response_uses_accepted_for_pending_projection() {
+        assert_eq!(
+            write_response("pending", json!({"status": "accepted"})).status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            write_response("applied", json!({"status": "updated"})).status(),
+            StatusCode::OK
+        );
     }
 
     #[test]

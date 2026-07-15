@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{CouchDbConfig, FeedMode};
 use crate::encryption::{Decryptor, EncryptionError};
@@ -823,6 +823,16 @@ impl CouchDbClient {
         note_path: &str,
         markdown: &str,
     ) -> Result<LiveSyncWriteReceipt, CouchDbError> {
+        self.update_livesync_note_if_revision(note_path, markdown, None)
+            .await
+    }
+
+    pub async fn update_livesync_note_if_revision(
+        &self,
+        note_path: &str,
+        markdown: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<LiveSyncWriteReceipt, CouchDbError> {
         let new_docs = match self.livesync_crypto.as_deref() {
             Some(crypto) => build_native_encrypted_livesync_note_documents(
                 note_path,
@@ -850,6 +860,15 @@ impl CouchDbClient {
                 ))
             })?
             .to_string();
+        if let Some(expected_revision) = expected_revision
+            && expected_revision != file_rev
+        {
+            return Err(CouchDbError::RevisionConflict {
+                note_path: note_path.to_string(),
+                expected_revision: expected_revision.to_string(),
+                actual_revision: file_rev,
+            });
+        }
 
         let old_leaf_ids = self.existing_file_leaf_ids(&existing_file)?;
 
@@ -885,8 +904,13 @@ impl CouchDbClient {
 
         // Delete stale old leaves that are no longer needed.
         for old_leaf_id in &old_leaf_ids {
-            if !new_leaf_ids.contains(old_leaf_id) {
-                self.delete_document(old_leaf_id).await?;
+            if !new_leaf_ids.contains(old_leaf_id)
+                && let Err(error) = self.delete_document(old_leaf_id).await
+            {
+                warn!(
+                    error = %error,
+                    "source committed; stale LiveSync leaf cleanup was deferred"
+                );
             }
         }
 
@@ -1578,6 +1602,14 @@ pub enum CouchDbError {
     Conflict { document_id: String },
     #[error("note already exists: {note_path}")]
     NoteAlreadyExists { note_path: String },
+    #[error(
+        "source revision conflict for {note_path}: expected {expected_revision}, found {actual_revision}"
+    )]
+    RevisionConflict {
+        note_path: String,
+        expected_revision: String,
+        actual_revision: String,
+    },
     #[error("note not found: {note_path}")]
     NoteNotFound { note_path: String },
 }
@@ -2296,6 +2328,37 @@ mod tests {
         let first_leaf_ids: Vec<_> = first.leaf_docs.iter().map(|(id, _)| id.clone()).collect();
         let second_leaf_ids: Vec<_> = second.leaf_docs.iter().map(|(id, _)| id.clone()).collect();
         assert_ne!(first_leaf_ids, second_leaf_ids);
+    }
+
+    #[tokio::test]
+    async fn update_livesync_note_rejects_stale_expected_revision_before_writes() {
+        let note_path = "11New/revision-conflict.md";
+        let mut original = build_livesync_note_documents(note_path, "original");
+        original.file_doc["_rev"] = Value::String("3-current".to_string());
+        let mut docs = HashMap::from([(original.file_id.clone(), original.file_doc)]);
+        for (leaf_id, mut leaf_doc) in original.leaf_docs {
+            leaf_doc["_rev"] = Value::String("1-leaf".to_string());
+            docs.insert(leaf_id, leaf_doc);
+        }
+        let (url, state) = spawn_mock_couchdb(docs);
+        let client = CouchDbClient::new(&CouchDbConfig {
+            url,
+            database: "mainvault".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            poll_interval_seconds: 1,
+            feed_mode: FeedMode::Longpoll,
+            ..Default::default()
+        })
+        .expect("build client");
+
+        let error = client
+            .update_livesync_note_if_revision(note_path, "new body", Some("2-stale"))
+            .await
+            .expect_err("stale revision must fail before a source mutation");
+
+        assert!(matches!(error, CouchDbError::RevisionConflict { .. }));
+        assert!(state.operations.lock().await.is_empty());
     }
 
     #[tokio::test]

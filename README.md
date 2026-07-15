@@ -154,7 +154,29 @@ recovery_max_backoff_seconds: 3600
 `GET /api/v1/status` reports `pending_sync_recoveries` and
 `quarantined_sync_recoveries`. Its sync watermark is refreshed directly from
 CouchDB when available; `current_seq_source` distinguishes `live` from the
-persisted `cached` fallback.
+persisted `cached` fallback. The same response reports PostgreSQL and CouchDB
+dependency health plus source-committed writes still awaiting local projection.
+
+### Write consistency
+
+CouchDB is the authoritative commit point for configured LiveSync writes. Before
+an edit, Vault Bridge reconstructs the current source file and uses its exact
+revision for optimistic concurrency. A source conflict returns HTTP 409 before
+changing the visible file.
+
+After CouchDB accepts a write, Vault Bridge projects the committed revision into
+PostgreSQL and its process cache. A successful projection returns HTTP 200. If
+PostgreSQL becomes unavailable after the source commit, the API returns HTTP 202
+with `status: accepted` and `local_projection: pending`; MCP returns the same
+structured success. The durable CouchDB changes feed completes the projection
+when PostgreSQL recovers, so callers must not blindly repeat an accepted write.
+Errors that occur before the source commit include a safe dependency, phase,
+failure kind, and recovery action rather than being mislabeled as source
+reconciliation.
+
+`GET /health/live` is a process liveness check. `GET /health/ready` returns 503
+while a required dependency is unavailable or a source-committed projection is
+pending. Neither endpoint exposes note content or credentials.
 
 Operators can safely classify one path without reading note content:
 

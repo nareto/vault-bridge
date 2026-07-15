@@ -96,6 +96,30 @@ pub enum ContentPatchOperation {
     Prepend { text: String },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceFailureKind {
+    DatabaseUnavailable,
+    InsufficientStorage,
+    TransactionConflict,
+    Unknown,
+}
+
+impl PersistenceFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DatabaseUnavailable => "database_unavailable",
+            Self::InsufficientStorage => "insufficient_storage",
+            Self::TransactionConflict => "transaction_conflict",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn caller_retryable(self) -> bool {
+        matches!(self, Self::DatabaseUnavailable | Self::TransactionConflict)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum WriteError {
     #[error("path '{path}' is not allowed under configured new note path")]
@@ -119,7 +143,7 @@ pub enum WriteError {
         reason: String,
     },
     #[error("persistence failed")]
-    Persistence,
+    Persistence { kind: PersistenceFailureKind },
 }
 
 impl NewNoteRequest {

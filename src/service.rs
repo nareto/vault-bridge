@@ -17,10 +17,10 @@ use crate::model::{Note, NoteId, VaultFile};
 use crate::new_note::{NewNoteRequest, UpdateNoteRequest, WriteError};
 use crate::search::{SearchMode, SearchResponse};
 use crate::store::{
-    BacklinksResponse, NeighborDirection, NeighborsResponse, NewNoteResponse, NoteTimeFilter,
-    NoteVisibility, PathResponse, QueryNotesRequest, RecentNotesResponse, RecoveredVaultFileState,
-    StaleFileRecoveryTarget, StatusResponse, TagsResponse, UpdateNoteResponse, VaultFileVisibility,
-    VaultStore,
+    BacklinksResponse, LocalProjectionOutcome, NeighborDirection, NeighborsResponse,
+    NewNoteResponse, NoteTimeFilter, NoteVisibility, PathResponse, PreparedVaultWrite,
+    QueryNotesRequest, RecentNotesResponse, RecoveredVaultFileState, StaleFileRecoveryTarget,
+    StatusResponse, TagsResponse, UpdateNoteResponse, VaultFileVisibility, VaultStore,
 };
 
 #[derive(Clone, Debug)]
@@ -176,26 +176,33 @@ impl VaultBridgeService {
             .prepare_create_vault_write_at(request, now)
             .await
             .map_err(ServiceError::Write)?;
-        let response = NewNoteResponse {
-            id: NoteId::new(write.path.clone()),
-            status: "created",
-            file_type: write.file_type,
-            indexed_as_note: write.note.is_some(),
-        };
-        let couchdb_rev = if let Some(couchdb) = self.couchdb.as_ref() {
-            couchdb
-                .write_livesync_note(&path, &write.content)
-                .await
-                .map_err(ServiceError::CouchDbWrite)?
-                .couchdb_rev
+        let response_id = NoteId::new(write.path.clone());
+        let file_type = write.file_type;
+        let indexed_as_note = write.note.is_some();
+        let operation_id = write.operation_id.clone();
+        let (couchdb_rev, source_committed) = if let Some(couchdb) = self.couchdb.as_ref() {
+            (
+                couchdb
+                    .write_livesync_note(&path, &write.content)
+                    .await
+                    .map_err(ServiceError::CouchDbWrite)?
+                    .couchdb_rev,
+                true,
+            )
         } else {
-            "local-new-note".to_string()
+            ("local-new-note".to_string(), false)
         };
-        self.store
-            .commit_prepared_vault_write(write, &couchdb_rev)
-            .await
-            .map_err(ServiceError::Write)?;
-        Ok(response)
+        let projection = self
+            .finalize_prepared_write(write, &couchdb_rev, source_committed)
+            .await?;
+        Ok(NewNoteResponse {
+            id: response_id,
+            status: projection.response_status("created"),
+            file_type,
+            indexed_as_note,
+            local_projection: projection.state(),
+            operation_id,
+        })
     }
 
     pub async fn update_note(
@@ -204,6 +211,9 @@ impl VaultBridgeService {
         note_id: &NoteId,
         request: UpdateNoteRequest,
     ) -> Result<UpdateNoteResponse, ServiceError> {
+        let write_lock = self.vault_file_repair_lock(note_id.as_str()).await;
+        let _write_guard = write_lock.lock().await;
+        self.refresh_vault_file_for_write(auth, note_id).await?;
         let now = Utc::now();
         let request = self
             .store
@@ -215,22 +225,31 @@ impl VaultBridgeService {
             .prepare_update_note_write_at(note_id, &request, now)
             .await
             .map_err(ServiceError::Write)?;
-        let couchdb_rev = if let Some(couchdb) = self.couchdb.as_ref() {
-            couchdb
-                .update_livesync_note(note_id.as_str(), &write.content)
-                .await
-                .map_err(ServiceError::CouchDbUpdate)?
-                .couchdb_rev
+        let operation_id = write.operation_id.clone();
+        let (couchdb_rev, source_committed) = if let Some(couchdb) = self.couchdb.as_ref() {
+            (
+                couchdb
+                    .update_livesync_note_if_revision(
+                        note_id.as_str(),
+                        &write.content,
+                        write.expected_couchdb_rev.as_deref(),
+                    )
+                    .await
+                    .map_err(ServiceError::CouchDbUpdate)?
+                    .couchdb_rev,
+                true,
+            )
         } else {
-            "local-update-note".to_string()
+            ("local-update-note".to_string(), false)
         };
-        self.store
-            .commit_prepared_vault_write(write, &couchdb_rev)
-            .await
-            .map_err(ServiceError::Write)?;
+        let projection = self
+            .finalize_prepared_write(write, &couchdb_rev, source_committed)
+            .await?;
         Ok(UpdateNoteResponse {
             id: note_id.clone(),
-            status: "updated",
+            status: projection.response_status("updated"),
+            local_projection: projection.state(),
+            operation_id,
         })
     }
 
@@ -242,18 +261,30 @@ impl VaultBridgeService {
 
         match tokio::time::timeout(Duration::from_secs(3), couchdb.current_sequence()).await {
             Ok(Ok(current_seq)) => {
+                status.dependencies.couchdb = "healthy";
                 status.sync.behind_by = sequence_lag(&status.sync.last_seq, &current_seq);
                 status.sync.couchdb_current_seq = current_seq;
                 status.sync.current_seq_source = "live";
                 status.sync.current_seq_observed_at = Utc::now();
+                if status.sync.behind_by > 0 {
+                    status.status = "degraded";
+                }
             }
-            Ok(Err(error)) => warn!(
-                error = %error,
-                "status could not refresh live CouchDB sequence; reporting cached watermark"
-            ),
-            Err(_) => warn!(
-                "status timed out refreshing live CouchDB sequence; reporting cached watermark"
-            ),
+            Ok(Err(error)) => {
+                status.dependencies.couchdb = "unavailable";
+                status.status = "degraded";
+                warn!(
+                    error = %error,
+                    "status could not refresh live CouchDB sequence; reporting cached watermark"
+                );
+            }
+            Err(_) => {
+                status.dependencies.couchdb = "unavailable";
+                status.status = "degraded";
+                warn!(
+                    "status timed out refreshing live CouchDB sequence; reporting cached watermark"
+                );
+            }
         }
         status
     }
@@ -288,26 +319,33 @@ impl VaultBridgeService {
             .prepare_create_vault_write_at(request, now)
             .await
             .map_err(ServiceError::Write)?;
-        let response = NewNoteResponse {
-            id: NoteId::new(write.path.clone()),
-            status: "created",
-            file_type: write.file_type,
-            indexed_as_note: write.note.is_some(),
-        };
-        let couchdb_rev = if let Some(couchdb) = self.couchdb.as_ref() {
-            couchdb
-                .write_livesync_note(&path, &write.content)
-                .await
-                .map_err(ServiceError::CouchDbWrite)?
-                .couchdb_rev
+        let response_id = NoteId::new(write.path.clone());
+        let file_type = write.file_type;
+        let indexed_as_note = write.note.is_some();
+        let operation_id = write.operation_id.clone();
+        let (couchdb_rev, source_committed) = if let Some(couchdb) = self.couchdb.as_ref() {
+            (
+                couchdb
+                    .write_livesync_note(&path, &write.content)
+                    .await
+                    .map_err(ServiceError::CouchDbWrite)?
+                    .couchdb_rev,
+                true,
+            )
         } else {
-            "local-new-file".to_string()
+            ("local-new-file".to_string(), false)
         };
-        self.store
-            .commit_prepared_vault_write(write, &couchdb_rev)
-            .await
-            .map_err(ServiceError::Write)?;
-        Ok(response)
+        let projection = self
+            .finalize_prepared_write(write, &couchdb_rev, source_committed)
+            .await?;
+        Ok(NewNoteResponse {
+            id: response_id,
+            status: projection.response_status("created"),
+            file_type,
+            indexed_as_note,
+            local_projection: projection.state(),
+            operation_id,
+        })
     }
 
     pub async fn edit_vault_file(
@@ -316,30 +354,61 @@ impl VaultBridgeService {
         file_id: &NoteId,
         request: UpdateNoteRequest,
     ) -> Result<UpdateNoteResponse, ServiceError> {
-        self.ensure_vault_file_available(auth, file_id).await?;
+        let write_lock = self.vault_file_repair_lock(file_id.as_str()).await;
+        let _write_guard = write_lock.lock().await;
+        self.refresh_vault_file_for_write(auth, file_id).await?;
         let now = Utc::now();
         let write = self
             .store
             .prepare_edit_vault_file_write(auth, file_id, request, now)
             .await
             .map_err(ServiceError::Write)?;
-        let couchdb_rev = if let Some(couchdb) = self.couchdb.as_ref() {
-            couchdb
-                .update_livesync_note(file_id.as_str(), &write.content)
-                .await
-                .map_err(ServiceError::CouchDbUpdate)?
-                .couchdb_rev
+        let operation_id = write.operation_id.clone();
+        let (couchdb_rev, source_committed) = if let Some(couchdb) = self.couchdb.as_ref() {
+            (
+                couchdb
+                    .update_livesync_note_if_revision(
+                        file_id.as_str(),
+                        &write.content,
+                        write.expected_couchdb_rev.as_deref(),
+                    )
+                    .await
+                    .map_err(ServiceError::CouchDbUpdate)?
+                    .couchdb_rev,
+                true,
+            )
         } else {
-            "local-edit-file".to_string()
+            ("local-edit-file".to_string(), false)
         };
-        self.store
-            .commit_prepared_vault_write(write, &couchdb_rev)
-            .await
-            .map_err(ServiceError::Write)?;
+        let projection = self
+            .finalize_prepared_write(write, &couchdb_rev, source_committed)
+            .await?;
         Ok(UpdateNoteResponse {
             id: file_id.clone(),
-            status: "updated",
+            status: projection.response_status("updated"),
+            local_projection: projection.state(),
+            operation_id,
         })
+    }
+
+    async fn finalize_prepared_write(
+        &self,
+        write: PreparedVaultWrite,
+        couchdb_rev: &str,
+        source_committed: bool,
+    ) -> Result<LocalProjectionOutcome, ServiceError> {
+        if source_committed {
+            return self
+                .store
+                .project_source_committed_vault_write(write, couchdb_rev)
+                .await
+                .map_err(ServiceError::Write);
+        }
+        self.store
+            .commit_prepared_vault_write(write, couchdb_rev)
+            .await
+            .map_err(ServiceError::Write)?;
+        Ok(LocalProjectionOutcome::Applied)
     }
 
     async fn ensure_vault_file_available(
@@ -350,7 +419,6 @@ impl VaultBridgeService {
         if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
             return Ok(file);
         }
-
         let visibility = self
             .store
             .vault_file_visibility_for_policy(auth, file_id)
@@ -365,19 +433,47 @@ impl VaultBridgeService {
             log_vault_file_lookup_miss(auth, file_id.as_str(), visibility);
             return Err(ServiceError::NotFound);
         }
-
-        let Some(couch) = self.couchdb.as_deref() else {
-            log_vault_file_lookup_miss(auth, file_id.as_str(), visibility);
+        let Some(_) = self.couchdb.as_deref() else {
             return Err(ServiceError::NotFound);
         };
         let repair_lock = self.vault_file_repair_lock(file_id.as_str()).await;
         let _repair_guard = repair_lock.lock().await;
-
-        // Another request may have repaired the same path while this one waited.
         if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
             return Ok(file);
         }
+        self.reconcile_vault_file_from_source(auth, file_id, true)
+            .await
+    }
 
+    async fn refresh_vault_file_for_write(
+        &self,
+        auth: &AuthContext,
+        file_id: &NoteId,
+    ) -> Result<VaultFile, ServiceError> {
+        let local_file = self.store.get_vault_file_for_policy(auth, file_id).await;
+        let indexed_note = self.store.get_note_for_policy(auth, file_id).await;
+        if local_file.is_none() && indexed_note.is_none() {
+            let visibility = self
+                .store
+                .vault_file_visibility_for_policy(auth, file_id)
+                .await;
+            log_vault_file_lookup_miss(auth, file_id.as_str(), visibility);
+            return Err(ServiceError::NotFound);
+        }
+        if self.couchdb.is_none() {
+            return local_file.ok_or(ServiceError::NotFound);
+        }
+        self.reconcile_vault_file_from_source(auth, file_id, false)
+            .await
+    }
+
+    async fn reconcile_vault_file_from_source(
+        &self,
+        auth: &AuthContext,
+        file_id: &NoteId,
+        allow_index_fallback: bool,
+    ) -> Result<VaultFile, ServiceError> {
+        let couch = self.couchdb.as_deref().ok_or(ServiceError::NotFound)?;
         let target = self.store.vault_file_recovery_target(file_id).await;
         let recovery = self
             .recover_vault_file_from_couch(couch, file_id, target.as_ref())
@@ -385,13 +481,13 @@ impl VaultBridgeService {
             .map_err(ServiceError::VaultFileRepair)?;
         if let Some(recovered) = recovery.recovered {
             self.store
-                .commit_recovered_vault_file(recovered)
+                .project_recovered_vault_file(recovered)
                 .await
                 .map_err(ServiceError::Write)?;
             if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
                 info!(
                     lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
-                    "repaired missing raw vault file during policy-visible read"
+                    "refreshed policy-visible vault file from CouchDB"
                 );
                 return Ok(file);
             }
@@ -421,7 +517,8 @@ impl VaultBridgeService {
             return Err(ServiceError::NotFound);
         }
 
-        if recovery.source_file_seen
+        if allow_index_fallback
+            && recovery.source_file_seen
             && let Some(recovered) = self
                 .store
                 .recovered_vault_file_from_index(file_id)
@@ -429,7 +526,7 @@ impl VaultBridgeService {
                 .map_err(ServiceError::Write)?
         {
             self.store
-                .commit_recovered_vault_file(recovered)
+                .project_recovered_vault_file(recovered)
                 .await
                 .map_err(ServiceError::Write)?;
             if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
@@ -441,11 +538,20 @@ impl VaultBridgeService {
             }
         }
 
+        let target_hash = lookup_fingerprint("vault_file", file_id.as_str());
+        let source_state = if recovery.source_file_seen {
+            "incomplete_live_source"
+        } else {
+            "source_missing"
+        };
         warn!(
-            lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
-            "policy-visible vault file could not be reconstructed from couchdb"
+            lookup_hash = target_hash,
+            source_state, "policy-visible vault file could not be reconstructed from CouchDB"
         );
-        Err(ServiceError::VaultFileTemporarilyUnavailable)
+        Err(ServiceError::VaultFileTemporarilyUnavailable {
+            target_hash,
+            source_state,
+        })
     }
 
     async fn vault_file_repair_lock(&self, path: &str) -> Arc<Mutex<()>> {
@@ -677,7 +783,10 @@ pub enum ServiceError {
     #[error("failed to repair raw vault file from couchdb: {0}")]
     VaultFileRepair(CouchDbError),
     #[error("raw vault file is temporarily unavailable while source reconciliation is incomplete")]
-    VaultFileTemporarilyUnavailable,
+    VaultFileTemporarilyUnavailable {
+        target_hash: String,
+        source_state: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -700,7 +809,7 @@ mod tests {
     use crate::couchdb::{CouchDbClient, build_livesync_note_documents};
     use crate::livesync::ChangeEvent;
     use crate::model::NoteId;
-    use crate::new_note::{ContentPatchOperation, UpdateNoteRequest};
+    use crate::new_note::{ContentPatchOperation, PersistenceFailureKind, UpdateNoteRequest};
     use crate::persistence::PostgresPersistence;
     use crate::store::{NoteInput, VaultStore};
 
@@ -1107,6 +1216,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_committed_edit_returns_accepted_when_projection_is_pending() {
+        let path = "11Active/pending-projection.md";
+        let (store, auth) = indexed_store(path, "1-stale").await;
+        let docs = build_livesync_note_documents(path, "# Pending Projection\n\nOriginal body.\n");
+        let mut file_doc = docs.file_doc;
+        let mut leaf_doc = docs.leaf_doc;
+        file_doc["_rev"] = serde_json::json!("2-file");
+        leaf_doc["_rev"] = serde_json::json!("2-leaf");
+        store
+            .ingest_changes_batch(
+                vec![ChangeEvent {
+                    seq: serde_json::Value::String(String::new()),
+                    id: docs.file_id.clone(),
+                    deleted: false,
+                    doc: Some(file_doc.clone()),
+                }],
+                "",
+                250,
+                Duration::from_secs(60),
+                None,
+            )
+            .await;
+        let source_docs = HashMap::from([(docs.file_id, file_doc), (docs.leaf_id, leaf_doc)]);
+        let (couch, _) = spawn_mock_couchdb(source_docs, HashSet::new());
+        store
+            .force_projection_failure_for_test(Some(PersistenceFailureKind::DatabaseUnavailable))
+            .await;
+        let service = VaultBridgeService::new(store, Some(couch));
+
+        let response = service
+            .edit_vault_file(
+                &auth,
+                &NoteId::new(path),
+                UpdateNoteRequest {
+                    content: None,
+                    content_patch: Some(vec![ContentPatchOperation::Replace {
+                        old: "Original body.".to_string(),
+                        new: "Committed source body.".to_string(),
+                    }]),
+                    tags: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .expect("source commit should be accepted while projection is pending");
+
+        assert_eq!(response.status, "accepted");
+        assert_eq!(response.local_projection, "pending");
+        assert!(response.operation_id.starts_with("write-"));
+        let file = service
+            .get_vault_file(&auth, &NoteId::new(path))
+            .await
+            .expect("source-committed content should be readable from process cache");
+        assert!(file.content.contains("Committed source body."));
+        let status = service.status().await;
+        assert_eq!(status.status, "degraded");
+        assert_eq!(status.write_projection.pending, 1);
+    }
+
+    #[tokio::test]
     async fn incomplete_live_source_falls_back_to_visible_index_content() {
         let path = "11Active/incomplete-live-source.md";
         let (store, auth) = indexed_store(path, "1-stale").await;
@@ -1153,7 +1322,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ServiceError::VaultFileTemporarilyUnavailable
+            ServiceError::VaultFileTemporarilyUnavailable { .. }
         ));
     }
 
