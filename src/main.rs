@@ -68,9 +68,11 @@ async fn main() -> anyhow::Result<()> {
         let include_raw_docs = args.iter().any(|arg| arg == "--include-raw-docs");
         return debug_note_scan(&config, &note_path, include_raw_docs).await;
     }
+    if let Some(note_path) = flag_value(&args, "--repair-note-source") {
+        return repair_note_source(&config, &note_path).await;
+    }
     if let Some(note_path) = flag_value(&args, "--delete-note-scan") {
-        let keep_leaves = args.iter().any(|arg| arg == "--keep-leaves");
-        return delete_note_scan(&config, &note_path, !keep_leaves).await;
+        return delete_note_scan(&config, &note_path).await;
     }
     let run_mode = parse_run_mode(&args)?;
 
@@ -495,11 +497,61 @@ async fn dump_raw_note_documents(
     Ok(())
 }
 
-async fn delete_note_scan(
-    config: &AppConfig,
-    note_path: &str,
-    delete_leaf: bool,
-) -> anyhow::Result<()> {
+async fn repair_note_source(config: &AppConfig, note_path: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.couchdb.is_configured(),
+        "couchdb must be configured for --repair-note-source"
+    );
+
+    let normalized_path = vault_bridge::livesync::normalize_note_path(note_path);
+    let decryptor = build_livesync_decryptor(config).await?;
+    let couch = vault_bridge::couchdb::CouchDbClient::new(&config.couchdb)
+        .context("failed to build couchdb client for source repair")?;
+    let before = couch
+        .diagnose_note_source(&normalized_path, decryptor.as_deref())
+        .await
+        .context("failed to diagnose LiveSync source before repair")?;
+    let expected_revision = before
+        .file_revision
+        .as_deref()
+        .context("no live CouchDB file document matched the requested note path")?;
+    anyhow::ensure!(
+        before.missing_child_count == 0 && before.unknown_child_count == 0,
+        "source repair is limited to referenced tombstones; missing or unknown children require an explicit content recovery"
+    );
+
+    let result = couch
+        .repair_tombstoned_note_children(&normalized_path, expected_revision, decryptor.as_deref())
+        .await
+        .context("failed to repair tombstoned LiveSync children")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "note_path": normalized_path,
+            "content_included": false,
+            "expected_parent_revision": result.expected_parent_revision,
+            "parent_revision_changed": result.parent_revision_changed,
+            "attempted_child_count": result.attempted_child_count,
+            "repaired_child_count": result.repaired_child_count,
+            "unrecoverable_child_count": result.unrecoverable_child_count,
+            "remaining_live_child_count": result.diagnostic.live_child_count,
+            "remaining_missing_child_count": result.diagnostic.missing_child_count,
+            "remaining_tombstoned_child_count": result.diagnostic.tombstoned_child_count,
+            "remaining_unknown_child_count": result.diagnostic.unknown_child_count
+        }))?
+    );
+    anyhow::ensure!(
+        !result.parent_revision_changed
+            && result.unrecoverable_child_count == 0
+            && result.diagnostic.missing_child_count == 0
+            && result.diagnostic.tombstoned_child_count == 0
+            && result.diagnostic.unknown_child_count == 0,
+        "LiveSync source repair remained incomplete"
+    );
+    Ok(())
+}
+
+async fn delete_note_scan(config: &AppConfig, note_path: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         config.couchdb.is_configured(),
         "couchdb must be configured for --delete-note-scan"
@@ -511,9 +563,9 @@ async fn delete_note_scan(
 
     println!("Delete note scan for path: {note_path}");
     let deleted = couch
-        .delete_note_documents_by_note_path(note_path, delete_leaf, decryptor.as_deref())
+        .delete_note_file_document_by_note_path(note_path, decryptor.as_deref())
         .await
-        .context("failed to delete couchdb documents for note path")?;
+        .context("failed to delete couchdb file document for note path")?;
 
     anyhow::ensure!(
         !deleted.is_empty(),

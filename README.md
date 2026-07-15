@@ -174,6 +174,12 @@ Errors that occur before the source commit include a safe dependency, phase,
 failure kind, and recovery action rather than being mislabeled as source
 reconciliation.
 
+LiveSync leaves are content-addressed and can be shared across files and reused
+by later revisions. Vault Bridge therefore never deletes leaves during an online
+write or note deletion; source writes are append-only at the leaf layer. Any
+future garbage collection must run under a separate, quiesced, globally
+reachability-aware maintenance protocol.
+
 `GET /health/live` is a process liveness check. `GET /health/ready` returns 503
 while a required dependency is unavailable or a source-committed projection is
 pending. Neither endpoint exposes note content or credentials.
@@ -190,6 +196,20 @@ children are reported separately. Full CouchDB documents and decrypted leaf
 payloads are printed only when `--include-raw-docs` is explicitly supplied;
 that mode can expose private note content.
 
+When a live parent references tombstoned children, Vault Bridge can restore the
+exact previous leaf bodies from CouchDB revision history without using indexed
+fallback content:
+
+```bash
+vault_bridge --repair-note-source "path/to/note.md"
+```
+
+The repair is parent-revision guarded, accepts only decodable prior leaf
+revisions, and creates ordinary live successors of the current tombstones. It
+fails closed when revision bodies were compacted, a child is truly missing, or
+the parent changes. Write reconciliation attempts this repair once before
+returning 503 and reactivates a quarantined target for bounded background retry.
+
 Status and Prometheus metrics expose aggregate blocked-alias and unavailable
 child counts without paths or document IDs. Worker warnings contain only a
 stable lookup fingerprint and fixed-cardinality counts.
@@ -202,15 +222,10 @@ FROM sync_recovery_queue
 ORDER BY quarantined_at NULLS FIRST, next_retry_at;
 ```
 
-After repairing the source, reset quarantined targets for an immediate bounded
-retry:
-
-```sql
-UPDATE sync_recovery_queue
-SET failure_count = 0, next_retry_at = now(), quarantined_at = NULL,
-    last_failure_kind = NULL, updated_at = now()
-WHERE quarantined_at IS NOT NULL;
-```
+A write against an incomplete authoritative source reactivates its exact
+quarantined target with a cooldown. Operators should use `--repair-note-source`
+rather than updating recovery rows manually; successful replay removes the
+queue row after the source becomes reconstructable.
 
 ## Access Contexts
 

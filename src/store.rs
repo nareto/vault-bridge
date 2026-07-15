@@ -4108,6 +4108,27 @@ impl VaultStore {
             .await
     }
 
+    pub async fn reactivate_sync_recovery(
+        &self,
+        recovery_kind: &str,
+        target_id: &str,
+        source_revision: &str,
+        cooldown_seconds: u64,
+    ) -> Result<bool, crate::persistence::PersistenceError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(false);
+        };
+        persistence
+            .reactivate_recovery_target(
+                recovery_kind,
+                target_id,
+                source_revision,
+                Utc::now(),
+                cooldown_seconds,
+            )
+            .await
+    }
+
     pub async fn due_sync_recoveries(
         &self,
         limit: usize,

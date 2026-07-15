@@ -344,6 +344,66 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
     assert_eq!(recovery_stats.quarantined, 1);
 
     persistence
+        .enqueue_recovery_targets("chunk_parent", &["parent-a".to_string()])
+        .await
+        .expect("ordinary enqueue remains idempotent");
+    assert!(
+        persistence
+            .due_recovery_targets(10, Utc::now())
+            .await
+            .expect("quarantined target remains excluded")
+            .is_empty()
+    );
+    assert!(
+        persistence
+            .reactivate_recovery_target("chunk_parent", "parent-a", "7-source", Utc::now(), 300,)
+            .await
+            .expect("reactivate quarantined target")
+    );
+    let reactivated = persistence
+        .due_recovery_targets(10, Utc::now())
+        .await
+        .expect("load reactivated target");
+    assert_eq!(reactivated.len(), 1);
+    assert_eq!(reactivated[0].target_id, "parent-a");
+    assert_eq!(reactivated[0].failure_count, 0);
+    assert!(
+        !persistence
+            .reactivate_recovery_target("chunk_parent", "parent-a", "7-source", Utc::now(), 300,)
+            .await
+            .expect("active target is not repeatedly reset")
+    );
+    assert!(
+        persistence
+            .fail_recovery_target(
+                "chunk_parent",
+                "parent-a",
+                Utc::now() + chrono::Duration::seconds(30),
+                1,
+                "incomplete_source",
+                None,
+            )
+            .await
+            .expect("re-quarantine reactivated target")
+    );
+    assert!(
+        !persistence
+            .reactivate_recovery_target("chunk_parent", "parent-a", "7-source", Utc::now(), 300,)
+            .await
+            .expect("same revision respects reactivation cooldown")
+    );
+    assert!(
+        persistence
+            .reactivate_recovery_target("chunk_parent", "parent-a", "8-source", Utc::now(), 300,)
+            .await
+            .expect("changed source revision bypasses cooldown")
+    );
+    persistence
+        .resolve_recovery_target("chunk_parent", "parent-a")
+        .await
+        .expect("resolve reactivated target");
+
+    persistence
         .enqueue_recovery_targets("file_alias", &["deleted-file-doc".to_string()])
         .await
         .expect("enqueue unavailable-child alias");
@@ -352,7 +412,7 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
             "file_alias",
             "deleted-file-doc",
             Utc::now() + chrono::Duration::seconds(30),
-            5,
+            1,
             "mixed_unavailable_children",
             Some(&RecoveryChildDiagnosis {
                 expected: 4,
@@ -370,6 +430,29 @@ async fn direct_vault_writes_survive_reload_and_refresh_other_processes() {
     assert_eq!(diagnosed_stats.aliases_blocked_by_unavailable_children, 1);
     assert_eq!(diagnosed_stats.missing_children, 1);
     assert_eq!(diagnosed_stats.tombstoned_children, 1);
+    assert!(
+        persistence
+            .reactivate_recovery_target(
+                "file_alias",
+                "deleted-file-doc",
+                "8-source",
+                Utc::now(),
+                300,
+            )
+            .await
+            .expect("reactivate diagnosed alias")
+    );
+    let reactivated_stats = persistence
+        .recovery_queue_stats()
+        .await
+        .expect("read reactivated recovery stats");
+    assert_eq!(reactivated_stats.aliases_blocked_by_unavailable_children, 0);
+    assert_eq!(reactivated_stats.missing_children, 0);
+    assert_eq!(reactivated_stats.tombstoned_children, 0);
+    persistence
+        .resolve_recovery_target("file_alias", "deleted-file-doc")
+        .await
+        .expect("resolve reactivated alias");
 
     sqlx::query(
         "INSERT INTO chunk_staging (parent_id, chunk_index, chunk_count, content, couchdb_rev) VALUES ('queued-parent', 0, 2, 'partial', '1-test')",

@@ -155,6 +155,9 @@ list-mcp-tokens:
 reindex-blocks:
     docker compose exec vault-bridge /usr/local/bin/vault_bridge --reindex-blocks
 
+repair-note-source note_path:
+    docker compose exec vault-bridge /usr/local/bin/vault_bridge --repair-note-source "{{note_path}}"
+
 [positional-arguments]
 delete-note *ARGS:
     #!/usr/bin/env bash
@@ -202,13 +205,16 @@ delete-note *ARGS:
 
     delete_leaf="${delete_leaf#\"}"
     delete_leaf="${delete_leaf%\"}"
-    [[ -n "${delete_leaf}" ]] || delete_leaf="true"
+    [[ -n "${delete_leaf}" ]] || delete_leaf="false"
 
     case "${delete_leaf,,}" in
-      1|true|yes) delete_leaf=true ;;
       0|false|no) delete_leaf=false ;;
+      1|true|yes)
+        echo "DELETE_LEAF=true is unsafe for shared content-addressed LiveSync leaves and is no longer supported" >&2
+        exit 1
+        ;;
       *)
-        echo "DELETE_LEAF must be one of: true, false" >&2
+        echo "DELETE_LEAF must be false" >&2
         exit 1
         ;;
     esac
@@ -333,11 +339,6 @@ delete-note *ARGS:
       "${lowercase_note_path}"
       "f:$(printf 'file:%s' "${note_path}" | sha256sum | awk '{print $1}')"
     )
-    leaf_ids=(
-      "h:$(printf '%s' "${lowercase_note_path}" | sha256sum | awk '{print substr($1,1,16)}')"
-      "h:+$(printf 'leaf:%s' "${note_path}" | sha256sum | awk '{print substr($1,1,16)}')"
-    )
-
     deleted_any=false
     deleted_doc_ids=()
 
@@ -349,21 +350,8 @@ delete-note *ARGS:
       fi
     done
 
-    if [[ "${delete_leaf}" == "true" ]]; then
-      for doc_id in "${leaf_ids[@]}"; do
-        if leaf_rev="$(fetch_rev "${doc_id}")"; then
-          delete_doc "${doc_id}" "${leaf_rev}"
-          deleted_any=true
-          deleted_doc_ids+=("${doc_id}")
-        fi
-      done
-    fi
-
     if [[ "${deleted_any}" != "true" ]]; then
       fallback_args=(run --rm --build --no-deps vault-bridge --delete-note-scan "${note_path}")
-      if [[ "${delete_leaf}" != "true" ]]; then
-        fallback_args+=(--keep-leaves)
-      fi
       if fallback_output="$(docker compose "${fallback_args[@]}" 2>&1)"; then
         printf '%s\n' "${fallback_output}"
         exit 0

@@ -12,6 +12,7 @@ use crate::config::DatabaseConfig;
 use crate::new_note::PersistenceFailureKind;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const MAX_INDEXED_SEARCH_TEXT_BYTES: usize = 500_000;
+pub const RECOVERY_KIND_FILE_ALIAS: &str = "file_alias";
 
 #[derive(Clone, Debug)]
 pub struct PostgresPersistence {
@@ -1550,6 +1551,57 @@ impl PostgresPersistence {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn reactivate_recovery_target(
+        &self,
+        recovery_kind: &str,
+        target_id: &str,
+        source_revision: &str,
+        now: DateTime<Utc>,
+        cooldown_seconds: u64,
+    ) -> Result<bool, PersistenceError> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO sync_recovery_queue (
+                recovery_kind, target_id, next_retry_at,
+                last_reactivated_at, reactivated_source_revision
+            )
+            VALUES ($1, $2, $4, $4, $3)
+            ON CONFLICT (recovery_kind, target_id) DO UPDATE
+            SET failure_count = 0,
+                next_retry_at = $4,
+                quarantined_at = NULL,
+                last_failure_kind = NULL,
+                expected_child_count = NULL,
+                live_child_count = NULL,
+                missing_child_count = NULL,
+                tombstoned_child_count = NULL,
+                last_diagnosed_at = NULL,
+                last_reactivated_at = $4,
+                reactivated_source_revision = $3,
+                updated_at = $4
+            WHERE sync_recovery_queue.quarantined_at IS NOT NULL
+              AND (
+                    sync_recovery_queue.reactivated_source_revision IS DISTINCT FROM $3
+                    OR sync_recovery_queue.last_reactivated_at IS NULL
+                    OR sync_recovery_queue.last_reactivated_at
+                       <= $4 - ($5 * INTERVAL '1 second')
+              )
+            RETURNING true AS reactivated
+            "#,
+        )
+        .bind(recovery_kind)
+        .bind(target_id)
+        .bind(source_revision)
+        .bind(now)
+        .bind(cooldown_seconds.min(i64::MAX as u64) as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|row| row.try_get::<bool, _>("reactivated"))
+            .transpose()?
+            .unwrap_or(false))
     }
 
     pub async fn due_recovery_targets(

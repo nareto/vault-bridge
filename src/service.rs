@@ -15,6 +15,7 @@ use crate::couchdb::{CouchDbClient, CouchDbError};
 use crate::livesync::{ChangeEvent, LivesyncDocument};
 use crate::model::{Note, NoteId, VaultFile};
 use crate::new_note::{NewNoteRequest, UpdateNoteRequest, WriteError};
+use crate::persistence::RECOVERY_KIND_FILE_ALIAS;
 use crate::search::{SearchMode, SearchResponse};
 use crate::store::{
     BacklinksResponse, LocalProjectionOutcome, NeighborDirection, NeighborsResponse,
@@ -475,23 +476,91 @@ impl VaultBridgeService {
     ) -> Result<VaultFile, ServiceError> {
         let couch = self.couchdb.as_deref().ok_or(ServiceError::NotFound)?;
         let target = self.store.vault_file_recovery_target(file_id).await;
-        let recovery = self
-            .recover_vault_file_from_couch(couch, file_id, target.as_ref())
-            .await
-            .map_err(ServiceError::VaultFileRepair)?;
-        if let Some(recovered) = recovery.recovered {
-            self.store
-                .project_recovered_vault_file(recovered)
+        let mut repair_attempted = false;
+        let mut source_diagnostic = None;
+        let recovery = loop {
+            let mut recovery = self
+                .recover_vault_file_from_couch(couch, file_id, target.as_ref())
                 .await
-                .map_err(ServiceError::Write)?;
-            if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
-                info!(
-                    lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
-                    "refreshed policy-visible vault file from CouchDB"
-                );
-                return Ok(file);
+                .map_err(ServiceError::VaultFileRepair)?;
+            if let Some(recovered) = recovery.recovered.take() {
+                self.store
+                    .project_recovered_vault_file(recovered)
+                    .await
+                    .map_err(ServiceError::Write)?;
+                if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
+                    info!(
+                        lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
+                        "refreshed policy-visible vault file from CouchDB"
+                    );
+                    return Ok(file);
+                }
             }
-        }
+
+            if allow_index_fallback || repair_attempted || !recovery.source_file_seen {
+                break recovery;
+            }
+            repair_attempted = true;
+            match couch
+                .diagnose_note_source(file_id.as_str(), couch.livesync_decryptor())
+                .await
+            {
+                Ok(diagnostic)
+                    if diagnostic.missing_child_count == 0
+                        && diagnostic.tombstoned_child_count == 0
+                        && diagnostic.unknown_child_count == 0 =>
+                {
+                    source_diagnostic = Some(diagnostic);
+                    continue;
+                }
+                Ok(diagnostic)
+                    if diagnostic.tombstoned_child_count > 0
+                        && diagnostic.missing_child_count == 0
+                        && diagnostic.unknown_child_count == 0 =>
+                {
+                    let Some(parent_revision) = diagnostic.file_revision.as_deref() else {
+                        source_diagnostic = Some(diagnostic);
+                        break recovery;
+                    };
+                    match couch
+                        .repair_tombstoned_note_children(
+                            file_id.as_str(),
+                            parent_revision,
+                            couch.livesync_decryptor(),
+                        )
+                        .await
+                    {
+                        Ok(result)
+                            if !result.parent_revision_changed
+                                && result.diagnostic.missing_child_count == 0
+                                && result.diagnostic.tombstoned_child_count == 0
+                                && result.diagnostic.unknown_child_count == 0 =>
+                        {
+                            info!(
+                                lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()),
+                                repaired_child_count = result.repaired_child_count,
+                                "confirmed referenced LiveSync leaves before write reconciliation"
+                            );
+                            source_diagnostic = Some(result.diagnostic);
+                            continue;
+                        }
+                        Ok(result) => source_diagnostic = Some(result.diagnostic),
+                        Err(error) => warn!(
+                            lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()),
+                            error = %error,
+                            "referenced LiveSync leaf repair failed during write reconciliation"
+                        ),
+                    }
+                }
+                Ok(diagnostic) => source_diagnostic = Some(diagnostic),
+                Err(error) => warn!(
+                    lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()),
+                    error = %error,
+                    "source diagnosis failed during write reconciliation"
+                ),
+            }
+            break recovery;
+        };
 
         let deletion_lookup = target
             .as_ref()
@@ -538,19 +607,83 @@ impl VaultBridgeService {
             }
         }
 
+        if !allow_index_fallback && recovery.source_file_seen && source_diagnostic.is_none() {
+            source_diagnostic = couch
+                .diagnose_note_source(file_id.as_str(), couch.livesync_decryptor())
+                .await
+                .ok();
+        }
+        let mut recovery_state = "not_requested";
+        if !allow_index_fallback
+            && let Some(diagnostic) = source_diagnostic.as_ref()
+            && let (Some(parent_id), Some(parent_revision)) = (
+                diagnostic.file_document_id.as_deref(),
+                diagnostic.file_revision.as_deref(),
+            )
+        {
+            let recovery_target_id = target
+                .as_ref()
+                .map(|target| target.file_doc_id.as_str())
+                .unwrap_or(parent_id);
+            recovery_state = match self
+                .store
+                .reactivate_sync_recovery(
+                    RECOVERY_KIND_FILE_ALIAS,
+                    recovery_target_id,
+                    parent_revision,
+                    300,
+                )
+                .await
+            {
+                Ok(true) => "reactivated",
+                Ok(false) => "queued_or_cooldown",
+                Err(error) => {
+                    warn!(
+                        lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()),
+                        error = %error,
+                        "failed to reactivate source recovery after write reconciliation"
+                    );
+                    "reactivation_failed"
+                }
+            };
+        }
+
         let target_hash = lookup_fingerprint("vault_file", file_id.as_str());
         let source_state = if recovery.source_file_seen {
             "incomplete_live_source"
         } else {
             "source_missing"
         };
+        let expected_child_count = source_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.expected_child_count);
+        let live_child_count = source_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.live_child_count);
+        let missing_child_count = source_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.missing_child_count);
+        let tombstoned_child_count = source_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.tombstoned_child_count);
         warn!(
             lookup_hash = target_hash,
-            source_state, "policy-visible vault file could not be reconstructed from CouchDB"
+            source_state,
+            recovery_state,
+            expected_child_count,
+            live_child_count,
+            missing_child_count,
+            tombstoned_child_count,
+            "policy-visible vault file could not be reconstructed from CouchDB"
         );
         Err(ServiceError::VaultFileTemporarilyUnavailable {
             target_hash,
             source_state,
+            recovery_state,
+            expected_child_count,
+            live_child_count,
+            missing_child_count,
+            tombstoned_child_count,
         })
     }
 
@@ -786,6 +919,11 @@ pub enum ServiceError {
     VaultFileTemporarilyUnavailable {
         target_hash: String,
         source_state: &'static str,
+        recovery_state: &'static str,
+        expected_child_count: Option<usize>,
+        live_child_count: Option<usize>,
+        missing_child_count: Option<usize>,
+        tombstoned_child_count: Option<usize>,
     },
 }
 

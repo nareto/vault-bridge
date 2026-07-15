@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::{CouchDbConfig, FeedMode};
 use crate::encryption::{Decryptor, EncryptionError};
@@ -93,6 +93,16 @@ pub struct LiveSyncSourceDiagnostic {
     pub tombstoned_child_count: usize,
     pub unknown_child_count: usize,
     pub children: Vec<SourceChildState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TombstonedChildRepairResult {
+    pub expected_parent_revision: String,
+    pub parent_revision_changed: bool,
+    pub attempted_child_count: usize,
+    pub repaired_child_count: usize,
+    pub unrecoverable_child_count: usize,
+    pub diagnostic: LiveSyncSourceDiagnostic,
 }
 
 impl LiveSyncSourceDiagnostic {
@@ -415,6 +425,40 @@ impl CouchDbClient {
         Ok(Some(document))
     }
 
+    async fn get_document_revision(
+        &self,
+        document_id: &str,
+        revision: &str,
+        include_revision_history: bool,
+    ) -> Result<Option<Value>, CouchDbError> {
+        let encoded_id = urlencoding::encode(document_id);
+        let encoded_revision = urlencoding::encode(revision);
+        let url = format!(
+            "{}/{}?rev={}&revs={}",
+            self.db_base_url(),
+            encoded_id,
+            encoded_revision,
+            include_revision_history
+        );
+        let response = self
+            .send_request_with_timeout(
+                self.http
+                    .get(url)
+                    .basic_auth(&self.username, Some(&self.password)),
+                COUCHDB_REQUEST_TIMEOUT,
+            )
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let response = response.error_for_status()?;
+        self.read_json_with_timeout(response, COUCHDB_REQUEST_TIMEOUT)
+            .await
+            .map(Some)
+    }
+
     pub async fn fetch_document_revisions(
         &self,
         document_ids: &[String],
@@ -602,6 +646,182 @@ impl CouchDbClient {
         })
     }
 
+    pub async fn repair_tombstoned_note_children(
+        &self,
+        note_path: &str,
+        expected_parent_revision: &str,
+        decryptor: Option<&Decryptor>,
+    ) -> Result<TombstonedChildRepairResult, CouchDbError> {
+        let initial = self.diagnose_note_source(note_path, decryptor).await?;
+        let Some(parent_id) = initial.file_document_id.as_deref() else {
+            return Ok(TombstonedChildRepairResult {
+                expected_parent_revision: expected_parent_revision.to_string(),
+                parent_revision_changed: true,
+                attempted_child_count: 0,
+                repaired_child_count: 0,
+                unrecoverable_child_count: 0,
+                diagnostic: initial,
+            });
+        };
+        if initial.file_revision.as_deref() != Some(expected_parent_revision) {
+            return Ok(TombstonedChildRepairResult {
+                expected_parent_revision: expected_parent_revision.to_string(),
+                parent_revision_changed: true,
+                attempted_child_count: 0,
+                repaired_child_count: 0,
+                unrecoverable_child_count: 0,
+                diagnostic: initial,
+            });
+        }
+
+        let tombstoned_ids = initial
+            .children
+            .iter()
+            .filter(|child| child.state == SourceDocumentState::Tombstoned)
+            .map(|child| child.document_id.clone())
+            .collect::<Vec<_>>();
+        let mut repaired_child_count = 0usize;
+        let mut unrecoverable_child_count = 0usize;
+        let mut parent_revision_changed = false;
+
+        for child_id in &tombstoned_ids {
+            let Some(parent_doc) = self.get_document(parent_id).await? else {
+                parent_revision_changed = true;
+                break;
+            };
+            let Ok(LivesyncDocument::File(mut parent)) = LivesyncDocument::try_from(parent_doc)
+            else {
+                return Err(CouchDbError::InvalidResponse(format!(
+                    "document {parent_id} no longer decodes as a LiveSync file"
+                )));
+            };
+            hydrate_file_from_encrypted_metadata(&mut parent, decryptor)?;
+            if parent.rev != expected_parent_revision
+                || !parent
+                    .children
+                    .iter()
+                    .filter_map(child_doc_id)
+                    .any(|current_id| current_id == *child_id)
+            {
+                parent_revision_changed = true;
+                break;
+            }
+
+            let current_state = self
+                .classify_document_states(std::slice::from_ref(child_id))
+                .await?
+                .into_iter()
+                .next()
+                .map(|child| child.state)
+                .unwrap_or(SourceDocumentState::Unknown);
+            if current_state == SourceDocumentState::Live {
+                continue;
+            }
+            if current_state != SourceDocumentState::Tombstoned {
+                unrecoverable_child_count += 1;
+                continue;
+            }
+
+            let Some(tombstone_revision) = self
+                .fetch_document_revisions(std::slice::from_ref(child_id))
+                .await?
+                .remove(child_id)
+            else {
+                unrecoverable_child_count += 1;
+                continue;
+            };
+            let Some(mut recovered) = self
+                .recover_live_leaf_revision(child_id, &tombstone_revision, decryptor)
+                .await?
+            else {
+                unrecoverable_child_count += 1;
+                continue;
+            };
+            let Some(object) = recovered.as_object_mut() else {
+                unrecoverable_child_count += 1;
+                continue;
+            };
+            object.remove("_deleted");
+            object.remove("deleted");
+            object.remove("_revisions");
+            object.remove("_revs_info");
+            object.remove("_conflicts");
+            object.remove("_rev");
+            match self.put_document(child_id, &recovered).await {
+                Ok(_) => repaired_child_count += 1,
+                Err(CouchDbError::Conflict { .. }) => {
+                    let state = self
+                        .classify_document_states(std::slice::from_ref(child_id))
+                        .await?
+                        .into_iter()
+                        .next()
+                        .map(|child| child.state)
+                        .unwrap_or(SourceDocumentState::Unknown);
+                    if state != SourceDocumentState::Live {
+                        return Err(CouchDbError::Conflict {
+                            document_id: child_id.clone(),
+                        });
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let diagnostic = self.diagnose_note_source(note_path, decryptor).await?;
+        parent_revision_changed |=
+            diagnostic.file_revision.as_deref() != Some(expected_parent_revision);
+        Ok(TombstonedChildRepairResult {
+            expected_parent_revision: expected_parent_revision.to_string(),
+            parent_revision_changed,
+            attempted_child_count: tombstoned_ids.len(),
+            repaired_child_count,
+            unrecoverable_child_count,
+            diagnostic,
+        })
+    }
+
+    async fn recover_live_leaf_revision(
+        &self,
+        document_id: &str,
+        tombstone_revision: &str,
+        decryptor: Option<&Decryptor>,
+    ) -> Result<Option<Value>, CouchDbError> {
+        let Some(tombstone) = self
+            .get_document_revision(document_id, tombstone_revision, true)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(revisions) = tombstone.get("_revisions") else {
+            return Ok(None);
+        };
+        let Some(start) = revisions.get("start").and_then(Value::as_u64) else {
+            return Ok(None);
+        };
+        let Some(revision_ids) = revisions.get("ids").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+
+        let Some(revision_id) = revision_ids.get(1).and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(generation) = start.checked_sub(1) else {
+            return Ok(None);
+        };
+        let revision = format!("{generation}-{revision_id}");
+        let Some(document) = self
+            .get_document_revision(document_id, &revision, false)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if recoverable_leaf_document(document_id, &document, decryptor) {
+            Ok(Some(document))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn find_file_document_by_note_path(
         &self,
         note_path: &str,
@@ -698,10 +918,9 @@ impl CouchDbClient {
         }
     }
 
-    pub async fn delete_note_documents_by_note_path(
+    pub async fn delete_note_file_document_by_note_path(
         &self,
         note_path: &str,
-        delete_leaf: bool,
         decryptor: Option<&Decryptor>,
     ) -> Result<Vec<String>, CouchDbError> {
         let Some(file_doc) = self
@@ -711,32 +930,16 @@ impl CouchDbClient {
             return Ok(Vec::new());
         };
 
-        let Ok(LivesyncDocument::File(mut file)) = LivesyncDocument::try_from(file_doc) else {
+        let Ok(LivesyncDocument::File(file)) = LivesyncDocument::try_from(file_doc) else {
             return Err(CouchDbError::InvalidResponse(
                 "matched note path did not decode as a LiveSync file document".to_string(),
             ));
         };
-        hydrate_file_from_encrypted_metadata(&mut file, decryptor)?;
 
-        let mut doc_ids = Vec::new();
-        if delete_leaf {
-            for child in &file.children {
-                if let Some(child_id) = child_doc_id(child) {
-                    doc_ids.push(child_id);
-                }
-            }
+        if self.delete_document(&file.id).await? {
+            return Ok(vec![file.id]);
         }
-        doc_ids.push(file.id.clone());
-        doc_ids.sort();
-        doc_ids.dedup();
-
-        let mut deleted = Vec::new();
-        for doc_id in doc_ids {
-            if self.delete_document(&doc_id).await? {
-                deleted.push(doc_id);
-            }
-        }
-        Ok(deleted)
+        Ok(Vec::new())
     }
 
     /// Fetch the PBKDF2 salt from the LiveSync sync parameters document.
@@ -815,9 +1018,9 @@ impl CouchDbClient {
     /// Update an existing markdown note in CouchDB.
     ///
     /// Fetches the current file document and its leaf children, rebuilds
-    /// them with the new markdown content, merges `_rev` values so CouchDB
-    /// accepts the updates, and cleans up any stale leaves when the chunk
-    /// count changes.
+    /// them with the new markdown content, and merges `_rev` values so CouchDB
+    /// accepts the updates. Superseded content-addressed leaves are retained
+    /// because they may be shared or reused by concurrent LiveSync writers.
     pub async fn update_livesync_note(
         &self,
         note_path: &str,
@@ -902,17 +1105,9 @@ impl CouchDbClient {
         let file_response = self.put_document(&new_docs.file_id, &file_doc).await?;
         let couchdb_rev = write_response_revision(&file_response, &new_docs.file_id)?;
 
-        // Delete stale old leaves that are no longer needed.
-        for old_leaf_id in &old_leaf_ids {
-            if !new_leaf_ids.contains(old_leaf_id)
-                && let Err(error) = self.delete_document(old_leaf_id).await
-            {
-                warn!(
-                    error = %error,
-                    "source committed; stale LiveSync leaf cleanup was deferred"
-                );
-            }
-        }
+        // LiveSync leaves are content-addressed and may be shared by other
+        // parents or reused by a newer revision. Online deletion cannot be
+        // made race-free while external LiveSync writers are active.
 
         info!(
             note_path,
@@ -1466,6 +1661,38 @@ fn hydrate_file_from_encrypted_metadata(
     Ok(())
 }
 
+fn recoverable_leaf_document(
+    document_id: &str,
+    document: &Value,
+    decryptor: Option<&Decryptor>,
+) -> bool {
+    if document
+        .get("_deleted")
+        .or_else(|| document.get("deleted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(LivesyncDocument::Leaf(mut leaf)) = LivesyncDocument::try_from(document.clone()) else {
+        return false;
+    };
+    if leaf.id != document_id {
+        return false;
+    }
+    if leaf.e_ && crate::encryption::is_hkdf_encrypted(&leaf.data) {
+        let Some(decryptor) = decryptor else {
+            return false;
+        };
+        let Ok(decrypted) = decryptor.decrypt(&leaf.data) else {
+            return false;
+        };
+        leaf.data = decrypted;
+        leaf.e_ = false;
+    }
+    decode_leaf_chunk(&leaf, Utc::now()).is_ok()
+}
+
 fn recovery_candidate_doc_ids(parent_id: &str, livesync_passphrase: Option<&str>) -> Vec<String> {
     let normalized = normalize_note_path(parent_id);
     let mut ids = Vec::new();
@@ -1643,8 +1870,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockCouchState {
         docs: Arc<Mutex<HashMap<String, Value>>>,
+        revisions: Arc<Mutex<HashMap<(String, String), Value>>>,
         requested: Arc<Mutex<Vec<String>>>,
         operations: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct MockGetParams {
+        rev: Option<String>,
+        #[allow(dead_code)]
+        revs: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1655,9 +1890,32 @@ mod tests {
     async fn mock_get_document(
         State(state): State<MockCouchState>,
         Path((_db, doc_id)): Path<(String, String)>,
+        Query(params): Query<MockGetParams>,
     ) -> (StatusCode, Json<Value>) {
         state.requested.lock().await.push(doc_id.clone());
-        if let Some(doc) = state.docs.lock().await.get(&doc_id).cloned() {
+        if let Some(revision) = params.rev.as_deref() {
+            if let Some(doc) = state
+                .revisions
+                .lock()
+                .await
+                .get(&(doc_id.clone(), revision.to_string()))
+                .cloned()
+            {
+                return (StatusCode::OK, Json(doc));
+            }
+            if let Some(doc) = state.docs.lock().await.get(&doc_id).cloned()
+                && doc.get("_rev").and_then(Value::as_str) == Some(revision)
+            {
+                return (StatusCode::OK, Json(doc));
+            }
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not_found" })),
+            );
+        }
+        if let Some(doc) = state.docs.lock().await.get(&doc_id).cloned()
+            && doc.get("_deleted").and_then(Value::as_bool) != Some(true)
+        {
             return (StatusCode::OK, Json(doc));
         }
         (
@@ -1669,11 +1927,44 @@ mod tests {
     async fn mock_put_document(
         State(state): State<MockCouchState>,
         Path((_db, doc_id)): Path<(String, String)>,
-        Json(doc): Json<Value>,
-    ) -> Json<Value> {
+        Json(mut doc): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let current = state.docs.lock().await.get(&doc_id).cloned();
+        if let Some(current) = current.as_ref() {
+            let current_deleted = current
+                .get("_deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let current_revision = current.get("_rev").and_then(Value::as_str);
+            let supplied_revision = doc.get("_rev").and_then(Value::as_str);
+            let accepted = if current_deleted {
+                supplied_revision.is_none()
+            } else {
+                supplied_revision.is_some() && supplied_revision == current_revision
+            };
+            if !accepted {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "conflict" })),
+                );
+            }
+        }
+
+        let next_generation = current
+            .as_ref()
+            .and_then(|current| current.get("_rev").and_then(Value::as_str))
+            .and_then(|revision| revision.split_once('-'))
+            .and_then(|(generation, _)| generation.parse::<u64>().ok())
+            .unwrap_or(0)
+            + 1;
+        let next_revision = format!("{next_generation}-mock");
+        doc["_rev"] = Value::String(next_revision.clone());
         state.operations.lock().await.push(format!("put:{doc_id}"));
         state.docs.lock().await.insert(doc_id, doc);
-        Json(serde_json::json!({ "ok": true, "rev": "2-mock" }))
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "ok": true, "rev": next_revision })),
+        )
     }
 
     async fn mock_delete_document(
@@ -1789,8 +2080,16 @@ mod tests {
     }
 
     fn spawn_mock_couchdb(docs: HashMap<String, Value>) -> (String, MockCouchState) {
+        spawn_mock_couchdb_with_revisions(docs, HashMap::new())
+    }
+
+    fn spawn_mock_couchdb_with_revisions(
+        docs: HashMap<String, Value>,
+        revisions: HashMap<(String, String), Value>,
+    ) -> (String, MockCouchState) {
         let state = MockCouchState {
             docs: Arc::new(Mutex::new(docs)),
+            revisions: Arc::new(Mutex::new(revisions)),
             requested: Arc::new(Mutex::new(Vec::new())),
             operations: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1896,6 +2195,140 @@ mod tests {
         let safe_output = serde_json::to_string(&diagnostic).expect("serialize diagnostic");
         assert!(!safe_output.contains("secret"));
         assert!(!safe_output.contains("data"));
+    }
+
+    #[tokio::test]
+    async fn repairs_referenced_tombstone_from_available_leaf_revision() {
+        let note_path = "Notes/repair.md";
+        let built = build_livesync_note_documents(note_path, "# Repair\n\nRecovered body");
+        let mut file_doc = built.file_doc.clone();
+        file_doc["_rev"] = Value::String("7-file".to_string());
+        let mut live_leaf = built.leaf_doc.clone();
+        live_leaf["_rev"] = Value::String("1-live".to_string());
+        let tombstone = serde_json::json!({
+            "_id": built.leaf_id,
+            "_rev": "2-deleted",
+            "_deleted": true,
+            "_revisions": {
+                "start": 2,
+                "ids": ["deleted", "live"]
+            }
+        });
+        let docs = HashMap::from([
+            (built.file_id.clone(), file_doc),
+            (built.leaf_id.clone(), tombstone),
+        ]);
+        let revisions = HashMap::from([((built.leaf_id.clone(), "1-live".to_string()), live_leaf)]);
+        let (url, state) = spawn_mock_couchdb_with_revisions(docs, revisions);
+
+        let result = client_for(url)
+            .repair_tombstoned_note_children(note_path, "7-file", None)
+            .await
+            .expect("repair tombstoned child");
+
+        assert!(!result.parent_revision_changed);
+        assert_eq!(result.attempted_child_count, 1);
+        assert_eq!(result.repaired_child_count, 1);
+        assert_eq!(result.unrecoverable_child_count, 0);
+        assert_eq!(result.diagnostic.live_child_count, 1);
+        assert_eq!(result.diagnostic.tombstoned_child_count, 0);
+        let repaired = state
+            .docs
+            .lock()
+            .await
+            .get(&built.leaf_id)
+            .cloned()
+            .expect("repaired leaf");
+        assert_ne!(repaired.get("_deleted"), Some(&Value::Bool(true)));
+        assert_eq!(repaired["_rev"], "3-mock");
+        assert!(
+            state
+                .operations
+                .lock()
+                .await
+                .contains(&format!("put:{}", built.leaf_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_compacted_tombstone_unresolved_without_writing() {
+        let note_path = "Notes/compacted.md";
+        let built = build_livesync_note_documents(note_path, "# Compacted");
+        let mut file_doc = built.file_doc.clone();
+        file_doc["_rev"] = Value::String("4-file".to_string());
+        let tombstone = serde_json::json!({
+            "_id": built.leaf_id,
+            "_rev": "2-deleted",
+            "_deleted": true,
+            "_revisions": {
+                "start": 2,
+                "ids": ["deleted", "live"]
+            }
+        });
+        let docs = HashMap::from([
+            (built.file_id, file_doc),
+            (built.leaf_id.clone(), tombstone),
+        ]);
+        let (url, state) = spawn_mock_couchdb(docs);
+
+        let result = client_for(url)
+            .repair_tombstoned_note_children(note_path, "4-file", None)
+            .await
+            .expect("classify compacted child");
+
+        assert_eq!(result.repaired_child_count, 0);
+        assert_eq!(result.unrecoverable_child_count, 1);
+        assert_eq!(result.diagnostic.tombstoned_child_count, 1);
+        assert!(state.operations.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refuses_older_leaf_when_immediate_predecessor_is_invalid() {
+        let note_path = "Notes/ambiguous-history.md";
+        let built = build_livesync_note_documents(note_path, "# Historical body");
+        let mut file_doc = built.file_doc.clone();
+        file_doc["_rev"] = Value::String("8-file".to_string());
+        let tombstone = serde_json::json!({
+            "_id": built.leaf_id,
+            "_rev": "3-deleted",
+            "_deleted": true,
+            "_revisions": {
+                "start": 3,
+                "ids": ["deleted", "invalid", "live"]
+            }
+        });
+        let mut older_live_leaf = built.leaf_doc.clone();
+        older_live_leaf["_rev"] = Value::String("1-live".to_string());
+        let docs = HashMap::from([
+            (built.file_id, file_doc),
+            (built.leaf_id.clone(), tombstone),
+        ]);
+        let revisions = HashMap::from([
+            (
+                (built.leaf_id.clone(), "2-invalid".to_string()),
+                serde_json::json!({
+                    "_id": built.leaf_id,
+                    "_rev": "2-invalid",
+                    "type": "unsupported",
+                    "data": "not a leaf"
+                }),
+            ),
+            (
+                (built.leaf_id.clone(), "1-live".to_string()),
+                older_live_leaf,
+            ),
+        ]);
+        let (url, state) = spawn_mock_couchdb_with_revisions(docs, revisions);
+
+        let result = client_for(url)
+            .repair_tombstoned_note_children(note_path, "8-file", None)
+            .await
+            .expect("classify invalid immediate predecessor");
+
+        assert_eq!(result.repaired_child_count, 0);
+        assert_eq!(result.unrecoverable_child_count, 1);
+        assert_eq!(result.diagnostic.tombstoned_child_count, 1);
+        assert!(state.operations.lock().await.is_empty());
     }
 
     fn client_for(base_url: String) -> CouchDbClient {
@@ -2362,8 +2795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_livesync_note_reads_encrypted_children_from_metadata_and_deletes_stale_leaves()
-    {
+    async fn update_livesync_note_keeps_content_addressed_stale_leaves() {
         let note_path = "00New/2026-02-26-update-regression.md";
         let passphrase = "test-passphrase";
         let decryptor = Arc::new(Decryptor::new(passphrase, &[0x42u8; 32]));
@@ -2430,8 +2862,8 @@ mod tests {
         let docs = state.docs.lock().await.clone();
         for old_leaf_id in &original_leaf_ids {
             assert!(
-                !docs.contains_key(old_leaf_id),
-                "stale encrypted leaf {old_leaf_id} should be deleted after update"
+                docs.contains_key(old_leaf_id),
+                "content-addressed leaf {old_leaf_id} must remain available for other parents"
             );
         }
         for new_leaf_id in &updated_leaf_ids {
@@ -2454,20 +2886,18 @@ mod tests {
         assert_eq!(stored_meta["children"], expected_meta["children"]);
 
         let operations = state.operations.lock().await.clone();
-        let file_put_index = operations
-            .iter()
-            .position(|operation| operation == &format!("put:{}", updated.file_id))
-            .expect("file put operation should be recorded");
-        for old_leaf_id in &original_leaf_ids {
-            let delete_index = operations
+        assert!(
+            operations
                 .iter()
-                .position(|operation| operation == &format!("delete:{old_leaf_id}"))
-                .expect("stale delete operation should be recorded");
-            assert!(
-                file_put_index < delete_index,
-                "file metadata should be updated before stale leaf deletion"
-            );
-        }
+                .any(|operation| operation == &format!("put:{}", updated.file_id)),
+            "file put operation should be recorded"
+        );
+        assert!(
+            operations
+                .iter()
+                .all(|operation| !operation.starts_with("delete:h:")),
+            "online writes must never delete reusable LiveSync leaves"
+        );
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use crate::config::{AppConfig, EmbeddingConfig, EmbeddingMode};
 use crate::couchdb::{CouchDbClient, CouchDbError};
 use crate::encryption::Decryptor;
 use crate::livesync::{ChangeEvent, LivesyncDocument, is_deletion};
-use crate::persistence::RecoveryChildDiagnosis;
+use crate::persistence::{RECOVERY_KIND_FILE_ALIAS, RecoveryChildDiagnosis};
 use crate::store::{StaleFileRecoveryTarget, SyncBatchResult, VaultStore};
 
 const LOCALAI_HEALTH_PROBE_INPUT: &str = "vault bridge embedding health probe";
@@ -26,7 +26,6 @@ const STALE_FILE_RECOVERY_TARGET_LIMIT: usize = 16;
 const STALE_FILE_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const REMOTE_DRIFT_RECOVERY_INTERVAL: Duration = Duration::from_secs(300);
 const RECOVERY_KIND_CHUNK_PARENT: &str = "chunk_parent";
-const RECOVERY_KIND_FILE_ALIAS: &str = "file_alias";
 const RECOVERY_KIND_REMOTE_DRIFT: &str = "remote_drift";
 
 static DATA_URI_RE: Lazy<Regex> =
@@ -656,6 +655,52 @@ async fn run_bounded_sync_recovery(
         } else {
             None
         };
+        if let Some(alias) = stale_alias_target.as_ref() {
+            match couch
+                .diagnose_note_source(&alias.note_path, decryptor)
+                .await
+            {
+                Ok(diagnostic)
+                    if diagnostic.tombstoned_child_count > 0
+                        && diagnostic.missing_child_count == 0
+                        && diagnostic.unknown_child_count == 0 =>
+                {
+                    if let Some(parent_revision) = diagnostic.file_revision.as_deref() {
+                        match couch
+                            .repair_tombstoned_note_children(
+                                &alias.note_path,
+                                parent_revision,
+                                decryptor,
+                            )
+                            .await
+                        {
+                            Ok(result) if result.repaired_child_count > 0 => info!(
+                                recovery_target_hash =
+                                    recovery_lookup_fingerprint(&target.target_id),
+                                repaired_child_count = result.repaired_child_count,
+                                remaining_tombstoned_child_count =
+                                    result.diagnostic.tombstoned_child_count,
+                                parent_revision_changed = result.parent_revision_changed,
+                                "sync worker: restored referenced LiveSync leaves from revision history"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => warn!(
+                                recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
+                                error = %error,
+                                "sync worker: referenced LiveSync leaf repair failed"
+                            ),
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => debug!(
+                    recovery_target_hash = recovery_lookup_fingerprint(&target.target_id),
+                    error = %error,
+                    "sync worker: pre-replay source diagnosis failed"
+                ),
+            }
+        }
+
         let recovered = if target.recovery_kind == RECOVERY_KIND_FILE_ALIAS {
             fetch_stale_file_alias_recovery_changes(store, couch, &target.target_id, decryptor)
                 .await

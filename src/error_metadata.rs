@@ -134,6 +134,11 @@ pub(crate) fn service_error_metadata(
         ServiceError::VaultFileTemporarilyUnavailable {
             target_hash,
             source_state,
+            recovery_state,
+            expected_child_count,
+            live_child_count,
+            missing_child_count,
+            tombstoned_child_count,
         } => ErrorMetadata::new(
             ErrorCategory::Transient,
             true,
@@ -146,7 +151,12 @@ pub(crate) fn service_error_metadata(
             "phase": "source_reconciliation",
             "sourceState": source_state,
             "targetHash": target_hash,
-            "action": "inspect the source diagnostic and restore missing LiveSync documents"
+            "recoveryState": recovery_state,
+            "expectedChildCount": expected_child_count,
+            "liveChildCount": live_child_count,
+            "missingChildCount": missing_child_count,
+            "tombstonedChildCount": tombstoned_child_count,
+            "action": "retry after source recovery; if recovery remains quarantined, inspect the content-free note source diagnostic"
         })),
     };
     if let Some(tool_name) = tool_name {
@@ -295,5 +305,29 @@ mod tests {
         assert_eq!(value["details"]["failureKind"], "insufficient_storage");
         assert_eq!(value["details"]["sourceCommitted"], false);
         assert_ne!(value["details"]["action"], json!(null));
+    }
+
+    #[test]
+    fn incomplete_source_reports_recovery_transition_and_child_counts() {
+        let metadata = service_error_metadata(
+            &ServiceError::VaultFileTemporarilyUnavailable {
+                target_hash: "safe-target".to_string(),
+                source_state: "incomplete_live_source",
+                recovery_state: "reactivated",
+                expected_child_count: Some(83),
+                live_child_count: Some(31),
+                missing_child_count: Some(0),
+                tombstoned_child_count: Some(52),
+            },
+            None,
+        );
+        let value = serde_json::to_value(metadata).expect("serialize metadata");
+
+        assert_eq!(value["httpStatus"], 503);
+        assert_eq!(value["isRetryable"], true);
+        assert_eq!(value["details"]["sourceState"], "incomplete_live_source");
+        assert_eq!(value["details"]["recoveryState"], "reactivated");
+        assert_eq!(value["details"]["expectedChildCount"], 83);
+        assert_eq!(value["details"]["tombstonedChildCount"], 52);
     }
 }
