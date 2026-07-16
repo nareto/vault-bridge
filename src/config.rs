@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::authorization::{AccessPolicy, AccessRule};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -29,24 +29,6 @@ pub struct AppConfig {
 pub struct LoadedAppConfig {
     pub config: AppConfig,
     pub source_path: Option<PathBuf>,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            couchdb: CouchDbConfig::default(),
-            database: DatabaseConfig::default(),
-            api_tokens: BTreeMap::new(),
-            mcp_tokens: BTreeMap::new(),
-            contexts: BTreeMap::new(),
-            indexer: IndexerConfig::default(),
-            embedding: EmbeddingConfig::default(),
-            context_assembly: ContextAssemblyConfig::default(),
-            new_note: NewNoteConfig::default(),
-            audit: AuditConfig::default(),
-        }
-    }
 }
 
 impl AppConfig {
@@ -180,18 +162,10 @@ impl Default for CouchDbConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct EncryptionConfig {
     pub passphrase: String,
-}
-
-impl Default for EncryptionConfig {
-    fn default() -> Self {
-        Self {
-            passphrase: String::new(),
-        }
-    }
 }
 
 impl EncryptionConfig {
@@ -252,32 +226,16 @@ impl DatabaseConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct ApiTokenConfig {
     pub context: String,
 }
 
-impl Default for ApiTokenConfig {
-    fn default() -> Self {
-        Self {
-            context: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct McpTokenConfig {
     pub context: String,
-}
-
-impl Default for McpTokenConfig {
-    fn default() -> Self {
-        Self {
-            context: String::new(),
-        }
-    }
 }
 
 impl ApiTokenConfig {

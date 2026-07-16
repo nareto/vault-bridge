@@ -178,7 +178,7 @@ impl RuntimeConfigState {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Default)]
 pub struct ConfigReloadStatus {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,24 +197,6 @@ pub struct ConfigReloadStatus {
     pub last_error: Option<String>,
     pub success_count: u64,
     pub failure_count: u64,
-}
-
-impl Default for ConfigReloadStatus {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            path: None,
-            generation: 0,
-            poll_interval_seconds: None,
-            sighup_enabled: false,
-            last_attempt_at: None,
-            last_success_at: None,
-            last_failure_at: None,
-            last_error: None,
-            success_count: 0,
-            failure_count: 0,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

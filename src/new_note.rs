@@ -37,17 +37,12 @@ impl From<&NewNoteConfig> for NewNotePathSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum NewNoteFileType {
+    #[default]
     Md,
     Base,
-}
-
-impl Default for NewNoteFileType {
-    fn default() -> Self {
-        Self::Md
-    }
 }
 
 impl NewNoteFileType {
@@ -298,14 +293,14 @@ impl UpdateNoteRequest {
         }
 
         // Apply metadata overrides if provided.
-        if let Some(metadata) = &self.metadata {
-            if let Some(metadata_obj) = metadata.as_object() {
-                for (k, v) in metadata_obj {
-                    if matches!(k.as_str(), "tags" | "updated") {
-                        continue;
-                    }
-                    fm.insert(k.clone(), v.clone());
+        if let Some(metadata) = &self.metadata
+            && let Some(metadata_obj) = metadata.as_object()
+        {
+            for (k, v) in metadata_obj {
+                if matches!(k.as_str(), "tags" | "updated") {
+                    continue;
                 }
+                fm.insert(k.clone(), v.clone());
             }
         }
 

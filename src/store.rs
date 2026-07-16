@@ -2550,10 +2550,9 @@ impl VaultStore {
             if notes.len() < limit {
                 if ranked_hit.is_some()
                     && let Some(query) = text_query
+                    && summary.search_snippet.is_none()
                 {
-                    if summary.search_snippet.is_none() {
-                        summary.search_snippet = Some(snippet_for(&note.content, query));
-                    }
+                    summary.search_snippet = Some(snippet_for(&note.content, query));
                 }
                 notes.push(summary);
             }
@@ -3700,14 +3699,14 @@ impl VaultStore {
 
     /// Record an embedding failure for a note (increments failure counter).
     pub async fn record_embedding_failure(&self, note_id: &NoteId) {
-        if let Some(persistence) = self.persistence.as_ref() {
-            if let Err(error) = persistence.record_embedding_failure(note_id.as_str()).await {
-                warn!(
-                    error = %error,
-                    note_id = note_id.as_str(),
-                    "failed to record embedding failure in postgres"
-                );
-            }
+        if let Some(persistence) = self.persistence.as_ref()
+            && let Err(error) = persistence.record_embedding_failure(note_id.as_str()).await
+        {
+            warn!(
+                error = %error,
+                note_id = note_id.as_str(),
+                "failed to record embedding failure in postgres"
+            );
         }
     }
 
@@ -3906,7 +3905,7 @@ impl VaultStore {
         let orphan_leaf_staging_count = persistence
             .orphan_leaf_staging_parent_count()
             .await
-            .unwrap_or_else(|_| 0);
+            .unwrap_or(0);
         let stale_file_aliases = persistence.stale_file_alias_count().await.unwrap_or(0);
         let recovery_queue_stats = persistence.recovery_queue_stats().await.unwrap_or_default();
         let max_failures = self.settings.read().await.max_embedding_failures;
@@ -5227,15 +5226,13 @@ fn backlinks_from_inner(
     let backlinks = graph
         .get_backlinks(target)
         .into_iter()
-        .filter_map(|source_id| {
-            Some(
-                UnscopedBacklinkEntry {
-                    title: title_from_note_id(source_id.as_str()),
-                    context: link_context_between(guard, &source_id, target).unwrap_or_default(),
-                    id: source_id,
-                }
-                .into_entry(),
-            )
+        .map(|source_id| {
+            UnscopedBacklinkEntry {
+                title: title_from_note_id(source_id.as_str()),
+                context: link_context_between(guard, &source_id, target).unwrap_or_default(),
+                id: source_id,
+            }
+            .into_entry()
         })
         .collect::<Vec<_>>();
 
@@ -5658,6 +5655,7 @@ fn context_stats_from_inner(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn embedding_status_from_inner(
     guard: &StoreInner,
     pending_notes: usize,
@@ -6234,6 +6232,7 @@ fn index_reassembled_note_locked(
     deleted_note_ids.remove(&note_id);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rehome_staged_chunks_locked(
     guard: &mut StoreInner,
     note_path: &str,

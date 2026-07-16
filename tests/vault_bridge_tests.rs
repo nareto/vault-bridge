@@ -349,11 +349,13 @@ async fn custom_context_names_are_first_class() {
             context: "research".to_string(),
         },
     );
-    let mut policy = AccessPolicy::default();
-    policy.read = vec![AccessRule::allow(AccessMatcher {
-        path_prefix: Some("03Concepts/".to_string()),
+    let policy = AccessPolicy {
+        read: vec![AccessRule::allow(AccessMatcher {
+            path_prefix: Some("03Concepts/".to_string()),
+            ..Default::default()
+        })],
         ..Default::default()
-    })];
+    };
     config.contexts.insert("research".to_string(), policy);
 
     let app = test_app(config).await;

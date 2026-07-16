@@ -1148,7 +1148,7 @@ fn json_error_with_data(id: Option<Value>, code: i64, message: &str, data: Value
 }
 
 fn json_error_with_metadata(id: Option<Value>, code: i64, metadata: &ErrorMetadata) -> Response {
-    let data = serde_json::to_value(metadata).unwrap_or_else(|_| Value::Null);
+    let data = serde_json::to_value(metadata).unwrap_or(Value::Null);
     json_error_with_data(id, code, metadata.message(), data)
 }
 
@@ -1179,7 +1179,7 @@ fn tool_success_response(
 }
 
 fn tool_error_response(id: Option<Value>, metadata: ErrorMetadata) -> Response {
-    let structured = serde_json::to_value(&metadata).unwrap_or_else(|_| Value::Null);
+    let structured = serde_json::to_value(&metadata).unwrap_or(Value::Null);
     json_result(
         id,
         json!({

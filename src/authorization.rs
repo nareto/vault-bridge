@@ -43,7 +43,7 @@ impl From<String> for ContextName {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AccessPolicy {
     pub read: Vec<AccessRule>,
@@ -97,16 +97,6 @@ impl AccessPolicy {
                 preserve_tags: Vec::new(),
             }],
             edit: vec![AccessRule::allow(AccessMatcher::allow_all())],
-        }
-    }
-}
-
-impl Default for AccessPolicy {
-    fn default() -> Self {
-        Self {
-            read: Vec::new(),
-            create: Vec::new(),
-            edit: Vec::new(),
         }
     }
 }

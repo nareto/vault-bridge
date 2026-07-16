@@ -259,7 +259,7 @@ mod tests {
     fn too_short_payload_error() {
         let (d, _) = test_decryptor();
         // Valid prefix but only a few bytes after base64 decode.
-        let short = format!("%={}", BASE64.encode(&[0u8; 10]));
+        let short = format!("%={}", BASE64.encode([0u8; 10]));
         let err = d.decrypt(&short).unwrap_err();
         assert!(matches!(err, DecryptionError::TooShort { .. }));
     }

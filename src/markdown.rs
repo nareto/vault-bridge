@@ -341,12 +341,12 @@ fn line_column_to_offset(
         return line_start;
     }
 
-    let mut char_count = 1usize;
-    for (byte_index, _) in content[line_start..line_end].char_indices() {
+    for (char_count, (byte_index, _)) in
+        (1usize..).zip(content[line_start..line_end].char_indices())
+    {
         if char_count == column {
             return line_start + byte_index;
         }
-        char_count += 1;
     }
 
     line_end
@@ -476,12 +476,12 @@ pub fn split_into_blocks(body: &str, min_chars: usize) -> Vec<MarkdownBlock> {
     // Merge short blocks into their predecessor.
     let mut merged: Vec<RawBlock> = Vec::new();
     for block in raw_blocks {
-        if block.content.len() < min_chars {
-            if let Some(prev) = merged.last_mut() {
-                prev.content.push('\n');
-                prev.content.push_str(&block.content);
-                continue;
-            }
+        if block.content.len() < min_chars
+            && let Some(prev) = merged.last_mut()
+        {
+            prev.content.push('\n');
+            prev.content.push_str(&block.content);
+            continue;
         }
         merged.push(block);
     }

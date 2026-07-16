@@ -363,14 +363,12 @@ fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
         anyhow::bail!("--workers-only cannot be combined with a different --mode value");
     }
 
-    Ok(explicit_mode.unwrap_or_else(|| {
-        if api_only {
-            RunMode::Api
-        } else if workers_only {
-            RunMode::Workers
-        } else {
-            RunMode::All
-        }
+    Ok(explicit_mode.unwrap_or(if api_only {
+        RunMode::Api
+    } else if workers_only {
+        RunMode::Workers
+    } else {
+        RunMode::All
     }))
 }
 

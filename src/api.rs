@@ -514,7 +514,7 @@ async fn get_note(
         &auth,
         "/api/v1/notes/{id}",
         &json!({"id": note_id}),
-        &[note.id.clone()],
+        std::slice::from_ref(&note.id),
     )
     .await;
     Ok(Json(note))
@@ -552,7 +552,7 @@ async fn get_note_lookup(
         &auth,
         "/api/v1/notes/get",
         &json!({"id": note.id}),
-        &[note.id.clone()],
+        std::slice::from_ref(&note.id),
     )
     .await;
     Ok(Json(note))
@@ -798,7 +798,7 @@ async fn create_note(
         &auth,
         "/api/v1/notes",
         &json!({"id": response.id}),
-        &[response.id.clone()],
+        std::slice::from_ref(&response.id),
     )
     .await;
     Ok(write_response(response.local_projection, response))
@@ -823,7 +823,7 @@ async fn update_note(
         &auth,
         "/api/v1/notes/{id}",
         &json!({"id": response.id, "action": "update"}),
-        &[response.id.clone()],
+        std::slice::from_ref(&response.id),
     )
     .await;
     Ok(write_response(response.local_projection, response))
@@ -846,7 +846,7 @@ async fn create_vault_file_endpoint(
         &auth,
         "/api/v1/vault-files",
         &json!({"id": response.id}),
-        &[response.id.clone()],
+        std::slice::from_ref(&response.id),
     )
     .await;
     Ok(write_response(response.local_projection, response))
@@ -869,7 +869,7 @@ async fn get_vault_file_endpoint(
         &auth,
         "/api/v1/vault-files/{id}",
         &json!({"id": file_id}),
-        &[file.id.clone()],
+        std::slice::from_ref(&file.id),
     )
     .await;
     Ok(Json(file))
@@ -894,7 +894,7 @@ async fn edit_vault_file_endpoint(
         &auth,
         "/api/v1/vault-files/{id}",
         &json!({"id": response.id, "action": "edit"}),
-        &[response.id.clone()],
+        std::slice::from_ref(&response.id),
     )
     .await;
     Ok(write_response(response.local_projection, response))
@@ -1240,7 +1240,7 @@ fn render_prometheus_metrics(status: &StatusResponse) -> String {
     ];
 
     let mut contexts = status.context_stats.iter().collect::<Vec<_>>();
-    contexts.sort_by(|(a, _), (b, _)| a.cmp(b));
+    contexts.sort_by_key(|(context, _)| *context);
     for (context, stats) in contexts {
         lines.push(format!(
             "vault_bridge_accessible_notes{{context=\"{}\"}} {}",

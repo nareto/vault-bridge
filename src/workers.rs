@@ -886,6 +886,7 @@ async fn fetch_stale_file_alias_recovery_changes(
     recovered
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ingest_changes_cooperatively(
     store: &VaultStore,
     couch: &CouchDbClient,
@@ -1032,6 +1033,7 @@ async fn recover_stale_chunk_staging_cooperatively(
     aggregate
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recover_stale_file_aliases_cooperatively(
     store: &VaultStore,
     couch: &CouchDbClient,
@@ -1551,7 +1553,7 @@ async fn embed_note_with_chunks(
 
             match client.embed_batch(&batch).await {
                 Ok(batch_vectors) if batch_vectors.len() == batch.len() => {
-                    vectors.extend(batch.into_iter().zip(batch_vectors.into_iter()));
+                    vectors.extend(batch.into_iter().zip(batch_vectors));
                 }
                 Ok(batch_vectors) => {
                     return Err(WorkerError::LocalAiBatchSizeMismatch {
@@ -1783,7 +1785,7 @@ async fn embed_block_batch_safely(
             Ok(vectors) if vectors.len() == batch.len() => {
                 let updates = batch
                     .into_iter()
-                    .zip(vectors.into_iter())
+                    .zip(vectors)
                     .map(|((id, _), vector)| (id, vector))
                     .collect::<Vec<_>>();
                 outcome.updated += store.set_block_embeddings(updates).await;
@@ -3878,7 +3880,7 @@ mod tests {
         let mut last_event_at = None;
         queue_parent_recovery(
             &couch,
-            &[refreshed_docs.file_id.clone()],
+            std::slice::from_ref(&refreshed_docs.file_id),
             &mut pending,
             &mut pending_seq,
             &mut last_event_at,

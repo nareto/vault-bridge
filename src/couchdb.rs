@@ -1397,11 +1397,13 @@ pub fn build_livesync_note_documents(note_path: &str, markdown: &str) -> Livesyn
         .expect("plaintext Livesync document generation should not fail")
 }
 
+type LeafDocumentParts = (String, Value, Vec<(String, Value)>, Vec<Value>);
+
 fn build_leaf_documents<FId, FPayload>(
     markdown: &str,
     mut leaf_id_for_chunk: FId,
     mut encode_chunk: FPayload,
-) -> Result<(String, Value, Vec<(String, Value)>, Vec<Value>), EncryptionError>
+) -> Result<LeafDocumentParts, EncryptionError>
 where
     FId: FnMut(&str) -> String,
     FPayload: FnMut(&str) -> Result<String, EncryptionError>,
