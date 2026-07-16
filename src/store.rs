@@ -5388,7 +5388,10 @@ fn validate_markdown_content_against_template(
                 reason: format!("content is missing template frontmatter key '{key}'"),
             });
         };
-        if json_type_name(template_value) != json_type_name(content_value) {
+        // Null is an unset default; it still requires the key without constraining its type.
+        if !template_value.is_null()
+            && json_type_name(template_value) != json_type_name(content_value)
+        {
             return Err(WriteError::InvalidCreate {
                 reason: format!(
                     "content frontmatter key '{key}' has type {}, expected {} from template",

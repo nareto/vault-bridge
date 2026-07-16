@@ -59,6 +59,26 @@ async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&body).expect("json")
 }
 
+async fn create_template(app: &axum::Router, title: &str, content: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/notes",
+            "external-dev-token",
+            json!({
+                "title": title,
+                "content": content
+            }),
+        ))
+        .await
+        .expect("template create response");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_json(response).await["id"]
+        .as_str()
+        .expect("template id")
+        .to_string()
+}
+
 fn assert_structured_error(
     body: &Value,
     category: &str,
@@ -396,6 +416,126 @@ async fn create_note_with_template_id_rejects_missing_template_frontmatter() {
             .unwrap_or_default()
             .contains("status"),
         "template validation should report the missing key: {body}"
+    );
+}
+
+#[tokio::test]
+async fn create_note_with_template_id_accepts_populated_null_defaults() {
+    let app = test_app(test_config()).await;
+    let template_id = create_template(
+        &app,
+        "Nullable Template",
+        "---\napplied_date: null\ncompany: null\nsource_ids: []\nstatus: prospect\n---\n\n# Nullable Template",
+    )
+    .await;
+
+    let create = app
+        .oneshot(post(
+            "/api/v1/notes",
+            "external-dev-token",
+            json!({
+                "title": "Populated Nullable Fields",
+                "template_id": template_id,
+                "content": "---\napplied_date: 2026-07-16\ncompany: Example Co\nsource_ids:\n  - listing_url:https://example.com/jobs/123\nstatus: applied\n---\n\n# Populated Nullable Fields"
+            }),
+        ))
+        .await
+        .expect("create response");
+
+    assert_eq!(create.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn create_note_with_template_id_accepts_null_for_null_defaults() {
+    let app = test_app(test_config()).await;
+    let template_id = create_template(
+        &app,
+        "Nullable Template",
+        "---\napplied_date: null\ncompany: null\n---\n\n# Nullable Template",
+    )
+    .await;
+
+    let create = app
+        .oneshot(post(
+            "/api/v1/notes",
+            "external-dev-token",
+            json!({
+                "title": "Unpopulated Nullable Fields",
+                "template_id": template_id,
+                "content": "---\napplied_date: null\ncompany: null\n---\n\n# Unpopulated Nullable Fields"
+            }),
+        ))
+        .await
+        .expect("create response");
+
+    assert_eq!(create.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn create_note_with_template_id_requires_null_default_keys() {
+    let app = test_app(test_config()).await;
+    let template_id = create_template(
+        &app,
+        "Nullable Template",
+        "---\ncompany: null\nstatus: prospect\n---\n\n# Nullable Template",
+    )
+    .await;
+
+    let create = app
+        .oneshot(post(
+            "/api/v1/notes",
+            "external-dev-token",
+            json!({
+                "title": "Missing Nullable Field",
+                "template_id": template_id,
+                "content": "---\nstatus: applied\n---\n\n# Missing Nullable Field"
+            }),
+        ))
+        .await
+        .expect("create response");
+
+    assert_eq!(create.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(create).await;
+    assert!(
+        body["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("content is missing template frontmatter key 'company'"),
+        "template validation should still require null-default keys: {body}"
+    );
+}
+
+#[tokio::test]
+async fn create_note_with_template_id_rejects_non_null_type_mismatch() {
+    let app = test_app(test_config()).await;
+    let template_id = create_template(
+        &app,
+        "Typed Template",
+        "---\nsource_ids: []\n---\n\n# Typed Template",
+    )
+    .await;
+
+    let create = app
+        .oneshot(post(
+            "/api/v1/notes",
+            "external-dev-token",
+            json!({
+                "title": "Invalid Typed Field",
+                "template_id": template_id,
+                "content": "---\nsource_ids: listing_url:https://example.com/jobs/123\n---\n\n# Invalid Typed Field"
+            }),
+        ))
+        .await
+        .expect("create response");
+
+    assert_eq!(create.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(create).await;
+    assert!(
+        body["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("type string, expected array from template"),
+        "template validation should retain non-null type constraints: {body}"
     );
 }
 
