@@ -17,3 +17,4 @@ __pycache__/
 .chief/todos.example.yaml
 
 .serena
+/.pi-subagents/

@@ -11,6 +11,10 @@ a guarded write path.
 
 **Scoped memory in. Reviewable note out.**
 
+See the permission boundary and write-back loop in the
+[62-second demo](https://youtu.be/tP8HKOpDYNU), then read the
+[technical write-up](https://renatobudinich.com/vault-bridge-a-permissioned-mcp-middleware-for-agentic-workflows/).
+
 ## Why This Exists
 
 AI chat works well when the relevant context fits in the conversation. It works
